@@ -1,0 +1,34 @@
+{
+  "_why": [
+    "The disposition each seed role receives, transcribed from the contract table in",
+    "skills/dev-manager/SKILL.md section 3.4. It lives here as DATA rather than inside",
+    "check.py on purpose: F2 and F3 assert that the intake MECHANISM turns a disposition",
+    "into the right end state, and an assertion that also chose the disposition would be",
+    "asserting its own script.",
+    "",
+    "WHAT THIS FILE DOES NOT SUPPLY, and no fixture could. The table names its decider",
+    "outright - 'dev-manager (delegated)', 'bug-vs-epic is spec-interpretation' - and there",
+    "is no triage or carve function anywhere in issue_intake.py. So the judgement that #901",
+    "is a bug and #902 is epic-sized is not reconstructable, in CI or anywhere else. F2/F3",
+    "cover everything downstream of that judgement and say so in their own PASS text.",
+    "",
+    "Keyed by seed ROLE, never by issue number: check.py classifies the three seeds by their",
+    "seeded labels (_scenario_f_seed), so a tracker handing out different numbers does not",
+    "silently invalidate this file."
+  ],
+  "bug": {
+    "add_labels": ["triaged", "bug"],
+    "carves_spec": false,
+    "table_row": "bounded defect, known repair, one component -> label triaged (+ bug if absent); leave for lead-dev bug-burn; no spec"
+  },
+  "epic": {
+    "add_labels": ["triaged", "epic"],
+    "carves_spec": true,
+    "table_row": "needs design/priority/refinement -> carve design/specs/<date>-<slug>.md at drafted with source gh#N; label triaged + epic"
+  },
+  "pre_triaged": {
+    "add_labels": [],
+    "carves_spec": false,
+    "table_row": "not in the untriaged set at all - untriaged() excludes anything already carrying triaged, so the pass never visits it"
+  }
+}

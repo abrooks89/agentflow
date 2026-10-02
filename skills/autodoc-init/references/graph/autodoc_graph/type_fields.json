@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "Single source of truth for the concept-tier page contract (epic 704).",
+    "Consumed by BOTH runtimes: autodoc_graph.records / autodoc_graph.render_pages",
+    "(Python, via importlib.resources) and inventory/golden-gate.js (Node, via a",
+    "repo-relative path). Editing this file is a taxonomy change, not a call-site",
+    "convenience — keep it in lockstep with references/taxonomy.md.",
+    "folder: the autodoc subdirectory a type's pages live in.",
+    "required: type-specific frontmatter fields that must be PRESENT and non-empty",
+    "on every page of that type (universal fields — type/title/created/updated/",
+    "source_repo/source_paths/status — are stamped or defaulted by the renderer",
+    "and asserted separately). 'endpoint' additionally requires route OR routes",
+    "(route-family rule), special-cased in code because it is a disjunction.",
+    "structural_fields: frontmatter fields the golden gate compares for EXACT",
+    "equality against the baseline (prose fields may differ)."
+  ],
+  "types": {
+    "endpoint": { "folder": "endpoints", "required": ["method", "aliases", "auth", "handler"] },
+    "page": { "folder": "pages", "required": ["route", "framework"] },
+    "component": { "folder": "components", "required": ["component_kind", "path", "language"] },
+    "service": { "folder": "services", "required": ["service_kind", "path", "language", "entrypoint"] },
+    "process": { "folder": "processes", "required": ["trigger"] },
+    "vendor": { "folder": "vendor", "required": ["vendor_kind"] },
+    "runbook": { "folder": "runbooks", "required": ["operation"] },
+    "data-model": { "folder": "data-models", "required": ["model_kind", "path"] },
+    "decision": { "folder": "decisions", "required": ["adr_id", "decision_status"] },
+    "flow": { "folder": "flows", "required": ["flow_kind"] },
+    "job": { "folder": "jobs", "required": ["job_kind", "schedule", "handler"] },
+    "tour": { "folder": "tours", "required": ["tour_kind", "steps"] }
+  },
+  "meta_files": ["overview.md", "Start Here.md", "Glossary.md"],
+  "structural_fields": ["type", "title", "source_repo", "aliases"]
+}

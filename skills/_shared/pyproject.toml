@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentflow"
+version = "0.3.0"
+description = "Portable SDLC orchestration package (ported from the orchestrator skill)"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agentflow*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# gh#350: every run here is `-q`, which hides skip reasons, so a deliberately loud skip
+# (the AGENTFLOW_LIVE_SAVE opt-in) announced itself into nothing. `-ra`, not `-rs`: `-r`
+# REPLACES pytest's default `fE`, so `-rs` alone would trade the failure summary for skips.
+addopts = "-ra"

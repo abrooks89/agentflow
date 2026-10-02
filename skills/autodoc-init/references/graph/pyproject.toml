@@ -1,0 +1,77 @@
+# autodoc-graph — the storage-agnostic graph core of autodoc (epic 702).
+#
+# Language choice (decision record): the spec left embedder/CLI language open
+# ("Embedding/CLI may be either; match the surrounding code"). Python was
+# chosen because epic 705's query-routing consumers are Python, sqlite-vec
+# ships a pure wheel for Windows (sqlite_vec 0.1.9 py3-none-win_amd64), and a
+# single adapter implementation beats the spec's two-adapter contingency.
+# Extraction stays Node (it extends the existing tree-sitter inventory package);
+# the seam between the two runtimes is deterministic JSONL on disk.
+#
+# Dependency policy: sqlite-vec (storage backend) and networkx (epic 703
+# community detection) are the only third-party runtime deps; everything else
+# is stdlib (sqlite3, urllib, json, argparse). This package deliberately
+# does NOT extend skills/_shared — its PyYAML-only pledge is load-bearing.
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autodoc-graph"
+version = "0.3.0"
+description = "Autodoc graph core: schema + migrations, storage-adapter interface, SQLite+sqlite-vec backend, Ollama embedder, graph CLI"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlite-vec>=0.1.9,<0.2",
+    # Community detection (epic 703): NetworkX Louvain over the symbol graph.
+    # The vault's graph-rag-dreaming plan chose NetworkX 3.x after ruling out
+    # Kuzu; one graph stack across both corpora. GRAPH package dep only —
+    # skills/_shared stays PyYAML-only.
+    "networkx>=3.0,<4",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+graph = "autodoc_graph.cli:main"
+# Epic 705: the query layer ships in the SAME distribution as the store,
+# so the existing provision step needs no new step.
+graph-query = "autodoc_query.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["autodoc_graph*", "autodoc_query*"]
+
+[tool.setuptools.package-data]
+autodoc_graph = ["schema.sql", "migrations/*.sql", "type_fields.json"]
+autodoc_query = ["eval/queries.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+# tests/fixtures/repo is a MULTI-LANGUAGE PARSE FIXTURE: its .py files
+# intentionally reference undefined names (route decorators, unresolved calls)
+# to exercise the extractor's skip-and-count honesty. Never lint it.
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "I", "UP", "SIM", "PL", "RUF"]
+ignore = [
+    "PLR2004",  # magic values are fine in tests/schema constants
+    "PLR0912", "PLR0913", "PLR0915",  # complexity budgets: the adapter is inherently wide
+]
+
+# PLR0917 (too-many-positional-arguments) is deliberately NOT ignored here, though it is the
+# positional sibling of PLR0913 above. Those measure different things: PLR0913 pardons ARITY,
+# which this adapter genuinely has (`query()` takes 19), while PLR0917 measures POSITIONAL-ness,
+# a discipline this subtree already keeps -- 10 of its 12 wide signatures are keyword-only,
+# including `traverse()` twenty-six lines below the one site that is pardoned. Ignoring it
+# subtree-wide would retire the only rule enforcing a convention the code already follows.
+# It was preview-gated at ruff 0.15.10 and stable by 0.16.5, so it began firing on a version
+# bump with no source change (gh#103); the two sites it found are fixed at the source instead --
+# `route()` is keyword-only (all 24 call sites already passed 2 positional args) and
+# `_Node.__init__` carries a line-level noqa.

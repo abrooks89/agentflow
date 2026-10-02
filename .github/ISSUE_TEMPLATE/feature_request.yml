@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest a change or a new capability.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security problems do not go here.** Report them privately, as [SECURITY.md](../blob/HEAD/SECURITY.md) describes.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: The change you would like. Say which loop or skill it touches, if you know.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, including working around it with what exists.
+    validations:
+      required: false

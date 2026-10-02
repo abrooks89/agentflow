@@ -1,0 +1,34 @@
+[
+  {
+    "number": 901,
+    "title": "Export CLI writes an empty manifest when the run directory is missing",
+    "labels": [
+      "bug"
+    ],
+    "body": "**Steps:** run `toy export --run <id>` against a run whose directory was pruned.\n**Expected:** a loud error naming the missing directory.\n**Actual:** exit 0 and a zero-byte manifest.json.\n\nOne function (`export.write_manifest`), known repair: check the directory before opening the manifest for write."
+  },
+  {
+    "number": 902,
+    "title": "Multi-run export bundles with a shared manifest format",
+    "labels": [],
+    "body": "Today each run exports to its own tarball. Operators want to export N runs as one bundle with a single top-level manifest.\n\nOpen questions: should the bundle manifest be a superset of the per-run manifest or a new schema? Is the bundle streamed or materialised? How does this interact with the retention pruner? Needs design and a priority call before anyone builds it."
+  },
+  {
+    "number": 903,
+    "title": "Retention pruner skips runs whose id contains a dash",
+    "labels": [
+      "triaged",
+      "bug"
+    ],
+    "body": "**Steps:** create a run with id `run-abc`, wait past the retention window.\n**Expected:** pruned.\n**Actual:** kept forever; the pruner's id regex is `[a-z0-9]+`.\n\nBounded: one regex in `retention.prune`. Already triaged on a prior pass."
+  },
+  {
+    "number": 904,
+    "title": "Bundle format needs a migration path for pre-2.0 manifests",
+    "labels": [
+      "triaged",
+      "epic"
+    ],
+    "body": "Carved and triaged on a prior pass, then labelled `epic` because it needs a design call before anyone builds it.\n\nSEED ROLE: this issue exists so `builder_selectable`'s `epic` exclusion is DISCRIMINATING. Without it every seed is decided by the `triaged` clause alone, and an implementation that dropped the `epic` check entirely still returned the right answer over this fixture - verified by mutation, which is why it is here."
+  }
+]

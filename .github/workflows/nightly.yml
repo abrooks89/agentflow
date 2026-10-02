@@ -1,0 +1,121 @@
+# agentflow nightly CI
+#
+# On a private repo a push to master runs no ci.yml job (see ci.yml, WHAT RUNS WHERE), and a
+# private PR runs a trimmed matrix. This workflow is what still runs the FULL matrix against
+# master: it calls ci.yml through workflow_call, so the two can never drift apart. Its checks
+# are named `ci / <job name>`, so they never collide with a PR's required contexts.
+#
+# gate   skips the night when master has not moved since the last GREEN nightly. It lives
+#        here and never inside ci.yml: a gate job that ci.yml's jobs `need` would be skipped
+#        on a pull_request event, its dependents would skip with it, and GitHub counts a
+#        skipped required check as passing - PRs would merge untested. It fails OPEN.
+# ci     the full ci.yml matrix.
+# report comments on (or opens) the tracking issue when the ci call fails.
+#
+# No workflow-level `concurrency:` on purpose: a group that could equal ci.yml's would
+# deadlock the call. Every `run:` block reads only environment variables, so
+# skills/_shared/tests/test_ci_workflow_shape.py can drive it under bash with a gh shim.
+name: Nightly CI
+
+on:
+  schedule:
+    - cron: '41 7 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: Skip only if master is exactly the last green nightly's commit
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A dispatch is a human asking for a run: always run.
+          if [ "$GITHUB_EVENT_NAME" != "schedule" ]; then
+            echo "nightly gate: event is $GITHUB_EVENT_NAME, not schedule - running"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Compared against the last GREEN run, so a red nightly on an unchanged master runs
+          # (and reports) again the next night.
+          lookup_rc=0
+          lookup=$(gh run list -R "$GITHUB_REPOSITORY" --workflow nightly.yml --branch master --status success --limit 1 --json headSha) || lookup_rc=$?
+          if [ "$lookup_rc" -ne 0 ]; then
+            # FAIL OPEN: a skipped nightly on a master that moved is the failure this job
+            # exists to prevent, so a lookup that could not answer runs the nightly.
+            echo "::warning::nightly gate: the last-green lookup (gh run list) exited $lookup_rc - running the nightly anyway"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last_sha=$(printf '%s' "$lookup" | tr -d '\r\n' | sed -nE 's/.*"headSha"[[:space:]]*:[[:space:]]*"([0-9a-fA-F]+)".*/\1/p')
+          if [ -z "$last_sha" ]; then
+            echo "::warning::nightly gate: the last-green lookup returned no parseable headSha - running the nightly anyway"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$last_sha" = "$GITHUB_SHA" ]; then
+            echo "::notice::nightly gate: master is still $GITHUB_SHA, which the last green nightly already tested - skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "nightly gate: master is $GITHUB_SHA, the last green nightly tested $last_sha - running"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  ci:
+    needs: gate
+    # Fails open: a gate that errored leaves `run` empty, which is not 'false'.
+    if: ${{ !cancelled() && needs.gate.outputs.run != 'false' }}
+    # The caller must grant what the nested jobs request (pr-provenance-gate asks for
+    # issues/pull-requests read), even though that job skips here; granting less stops the
+    # call before any job starts.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    uses: ./.github/workflows/ci.yml
+
+  report:
+    needs: [gate, ci]
+    if: ${{ always() && needs.ci.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The only write permission in this file.
+    permissions:
+      issues: write
+    steps:
+      - name: Comment on or open the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Unlabelled on purpose, so it lands in the fleet's untriaged intake stream.
+          title="Nightly CI is red on master"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="The nightly full-matrix CI run failed on master.
+
+          Run: $run_url
+          Master SHA: $GITHUB_SHA"
+          listed=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --limit 100 --json number,title) || {
+            echo "::error::nightly report: gh issue list failed - could not look for the tracking issue"
+            exit 1
+          }
+          # The search is fuzzy, so the title is matched EXACTLY here: an issue whose title
+          # only contains this one is not the tracking issue. Split into one object per line
+          # (a title with a brace in it drops out, and cannot be the exact title anyway).
+          number=$(printf '%s' "$listed" | tr -d '\r\n' | grep -oE '\{[^{}]*\}' | grep -E "\"title\"[[:space:]]*:[[:space:]]*\"$title\"[[:space:]]*[,}]" | sed -nE 's/.*"number"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -n 1 || true)
+          if [ -n "$number" ]; then
+            gh issue comment "$number" -R "$GITHUB_REPOSITORY" --body "$body"
+            echo "nightly report: commented on #$number"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+            echo "nightly report: opened a new tracking issue"
+          fi

@@ -1,0 +1,25 @@
+# Lint config for the first-party tree.
+#
+# Two exclusions, both deliberate:
+#
+# - skills/_vendored/** is a third-party closure (the vendored superpowers
+#   skills). Same policy as the CI sanitize gate: we do not edit it, so we do
+#   not lint it.
+#
+# - the inventory fixtures are BROKEN ON PURPOSE. `edges-repo` carries dangling
+#   references (`router`, `unknown_call`, `compute_factory`, `epsilon_helper`)
+#   precisely so extract-edges.test.js and emit-graph.test.js can prove the
+#   graph extractor detects them. F821 there is the fixture working, and
+#   "fixing" it would delete the thing under test.
+
+exclude = [
+    "skills/_vendored",
+    "skills/autodoc-init/references/inventory/fixtures",
+]
+
+line-length = 100
+
+[lint]
+# Default rules (pyflakes + pycodestyle errors). The point of this gate is dead
+# code and real mistakes, not style opinions on a tree written by many hands.
+select = ["E4", "E7", "E9", "F"]

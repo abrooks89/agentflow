@@ -1,0 +1,6 @@
+# Template for spec-doc YAML frontmatter — populated by writing-plans / solution
+# skill or by the lifecycle backfill script.
+slug: ""                               # canonical join key (matches plan + status)
+title: ""                              # display title for the dashboard
+depends_on: []                         # slugs of upstream epics
+current_state: null                    # speccing | planning | running | done | archived

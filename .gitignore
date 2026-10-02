@@ -1,0 +1,44 @@
+harness/toy-repo/
+harness/records/
+harness/BASELINE.md
+harness/POST-PORT-RESULT.md
+harness/harness.config*.json
+!harness/harness.config.example.json
+harness/stubs/schedulewakeup_log.md
+__pycache__/
+.pytest_cache/
+*.egg-info
+node_modules/
+harness/toy-repo-*/
+harness/uc-scenario/_scratch/
+harness/auditor-scenario/_scratch/
+
+# provision.py builds the suite venv at <suite_root>/.venv - i.e. inside this repo -
+# so every installed copy is dirty without this, and one `git add -A` commits a few
+# hundred MB of platform-specific virtualenv.
+.venv/
+.ruff_cache/
+
+# The workflow harness creates its per-agent worktrees under .claude/worktrees/,
+# and each one carries a `.git` FILE rather than a directory. `git add -A` in the
+# repo root therefore records them as GITLINKS - bogus submodule entries no clone
+# can resolve - which is a worse version of the drift-swept-into-a-commit problem,
+# and one that a published copy would hand to every clone.
+#
+# Scoped to worktrees/ rather than all of .claude/ ON PURPOSE (gh#51): a future
+# checked-in .claude/settings.json or project skill stays trackable. Ignoring the
+# whole directory would be easier and would quietly take that option away.
+.claude/worktrees/
+
+# Backups (`agentflow.backups`). The canonical name and every legacy family put text AFTER
+# the `.bak` marker, so `*.bak` alone would miss most of them - hence a pattern per shape
+# rather than the single `*.bak*` that would also swallow an innocent `recipe.baked.md`.
+#
+# READ THIS BEFORE ASSUMING IT DOES MORE THAN IT DOES: `data_root` lives OUTSIDE this repo,
+# so this rule is not what bounds the backup tree - `python -m agentflow.backups reap` is.
+# What this prevents is narrower and still worth having: a stray backup taken while editing
+# the suite tree itself, committed because `git add -A` could not tell it apart from source.
+*.bak
+*.bak.*
+*.bak-*
+*.bak[0-9]*

@@ -1,0 +1,11 @@
+{
+  "name": "autodoc-inventory",
+  "private": true,
+  "type": "module",
+  "version": "0.3.0",
+  "description": "Tree-sitter symbol inventory for the autodoc coverage pre-pass",
+  "dependencies": {
+    "web-tree-sitter": "0.22.6",
+    "tree-sitter-wasms": "0.1.11"
+  }
+}

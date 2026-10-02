@@ -1,0 +1,818 @@
+# agentflow CI
+#
+# The README badge points at this file, because the README ships in the public copy, and there
+# a push and a PR run the full matrix here (WHAT RUNS WHERE, below). On the private working
+# repo a push to master runs no job here, so its master is tracked by nightly.yml, which calls
+# this file. Keep the file names `ci.yml` and `nightly.yml` stable.
+#
+# Python jobs run on ubuntu + windows: the suite is developed and exercised on
+# Windows daily, so CI proving both legs is deliberate. The two Node jobs (inventory and
+# orchestrator) run on both as well — web-tree-sitter is pure wasm and needs no native
+# toolchain, and the orchestrator tests need only node and bash.
+#
+# WHAT RUNS WHERE. Every trim below is keyed on github.event.repository.private,
+# because a private repo pays for every job minute and a public one does not.
+# * Public repo: the full matrix on every PR (20 checks) and every push (19; the
+#   PR provenance gate is PR-only). Nothing is trimmed.
+# * Private repo, PR: the trimmed set (12 checks) - every required context, plus
+#   install's windows leg (it carries the junction and @requires_windows tests),
+#   inventory and orchestrator node --test on ubuntu, the worktree gate and the
+#   provenance gate. The windows legs of graph, inventory, orchestrator and harness
+#   and the four py3.12 legs are dropped.
+# * Private repo, push: every job skips and bills nothing. The PR run already
+#   tested the tree; a merge that breaks master is caught by the next PR run
+#   (which checks out the merge ref) or by the nightly.
+# * Nightly (.github/workflows/nightly.yml calls this file via workflow_call) and
+#   workflow_dispatch: the full matrix (19 checks), on either visibility.
+# The orchestrator node --test layer runs in orchestrator-node-tests (both OSes on the full
+# matrix, ubuntu only on a private PR) AND inside shared-tests, whose README Evidence guard
+# (skills/_shared/tests/test_evidence_table.py) re-counts it - hence setup-node there.
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  # `types` is spelled out ONLY to add `edited`. The GitHub default is
+  # [opened, synchronize, reopened], which excludes it - so before gh#331 a title or
+  # description changed AFTER the last commit was never re-scanned, and the published-text
+  # half of this gate saw only the text that existed when a commit last landed. A
+  # contributor could pass the gate and then paste a home path into the description, and
+  # nothing would look again. Measured instance: PR #346 last ran at 18:20:00Z and its body
+  # was edited at 18:23:56Z with no run after it.
+  #
+  # THE COST IS REAL AND ACCEPTED DELIBERATELY. `types` is workflow-level, not per-job, so
+  # every job a PR runs re-runs on a description edit - on a private repo that is the
+  # trimmed PR set (see WHAT RUNS WHERE above), on a public repo the full matrix, and the
+  # concurrency block below cancels the run the edit superseded. Splitting the cheap scan
+  # into its own workflow would avoid that, and was BUILT AND REJECTED: branch protection
+  # requires the context `sanitize grep gate`, so a separate job is not a required check and the gate would stop
+  # blocking merges. Paying minutes to keep it blocking is the right way round. The cheaper
+  # shape needs the required-contexts list recorded in-repo first; filed as a follow-up.
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
+  # The nightly (nightly.yml) calls this file so both run the same jobs. No inputs, no
+  # secrets: inside a call github.event_name is the CALLER's event (schedule or
+  # workflow_dispatch), so every trim below reads it as a non-PR run and runs the full matrix.
+  # Repository variables need no plumbing either: a called workflow reads the caller
+  # repository's `vars`, so the sanitize gate's SANITIZE_EXTRA_PATTERN reaches the nightly too.
+  workflow_call:
+
+# Cancel a superseded PR run (a new push or a description edit on the same PR). A non-PR
+# run keys on its own run id, so a push, the nightly or a dispatch never cancels another
+# run and never queues behind one. github.workflow is in the key so this group can never
+# equal another workflow's. Never re-run a CANCELLED run: it re-enters the group and
+# cancels the live one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  graph-tests:
+    # The suffix renders EMPTY on the 3.11 legs, so their names - required status
+    # checks on master - stay byte-identical; only the 3.12 leg gains one.
+    name: graph pytest (${{ matrix.os }}${{ matrix.python != '3.11' && format(', py{0}', matrix.python) || '' }})
+    if: github.event_name != 'push' || !github.event.repository.private
+    strategy:
+      fail-fast: false
+      matrix:
+        # A private PR drops the windows leg (nightly and dispatch keep it).
+        os: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '["ubuntu-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
+        python: ["3.11"]
+        # The 3.12 leg: both packages claim requires-python >= 3.11 and the documented
+        # install's Ubuntu 24.04 system python3 is 3.12, so the leg checks the other
+        # Python minor. It differs from ubuntu-latest ONLY in that minor version -
+        # setup-python installs its own 3.12.x, and ubuntu-latest already runs 24.04.
+        # A private repo runs it nightly and on dispatch, not on PRs (the empty list).
+        include: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '[]' || '[{"os":"ubuntu-24.04","python":"3.12"}]') }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: skills/autodoc-init/references/graph
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: skills/autodoc-init/references/graph/pyproject.toml
+      # The extraction e2e tests (tests/test_end_to_end.py) drive the Node
+      # tree-sitter inventory package through the JSONL seam, so the graph job
+      # needs node + the inventory deps installed too.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: skills/autodoc-init/references/inventory/package-lock.json
+      - name: Install inventory package (extraction e2e dependency)
+        run: npm ci
+        working-directory: skills/autodoc-init/references/inventory
+      # Pulls networkx + sqlite-vec (runtime deps) and pytest (test extra).
+      - name: Install autodoc-graph package
+        run: python -m pip install -e ".[test]"
+      - name: Run graph + query tests
+        run: python -m pytest -q
+
+  shared-tests:
+    # The suffix renders EMPTY on the 3.11 legs, so their names - required status
+    # checks on master - stay byte-identical; only the 3.12 leg gains one.
+    name: _shared pytest (${{ matrix.os }}${{ matrix.python != '3.11' && format(', py{0}', matrix.python) || '' }})
+    if: github.event_name != 'push' || !github.event.repository.private
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11"]
+        # The 3.12 leg: both packages claim requires-python >= 3.11 and the documented
+        # install's Ubuntu 24.04 system python3 is 3.12, so the leg checks the other
+        # Python minor. It differs from ubuntu-latest ONLY in that minor version -
+        # setup-python installs its own 3.12.x, and ubuntu-latest already runs 24.04.
+        # A private repo runs it nightly and on dispatch, not on PRs (the empty list).
+        include: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '[]' || '[{"os":"ubuntu-24.04","python":"3.12"}]') }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: skills/_shared
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: skills/_shared/pyproject.toml
+      # For the README Evidence guard's orchestrator row (node --test, no npm install). The
+      # guard fails under CI if node is missing, so dropping this step turns the job red.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Install agentflow package
+        run: python -m pip install -e ".[test]"
+      - name: Run _shared tests
+        # Run under bash on the Windows runner too: pwsh delivers a console-group Ctrl
+        # event to pytest at teardown when the suite's git-subprocess tests spawn children,
+        # failing the job on a trailing KeyboardInterrupt even though every test passes.
+        shell: bash
+        env:
+          # The exempt words test_skill_call_sites.py guards (E-0380) belong to the
+          # install-specific alternatives, which live in this variable and not in the
+          # sanitize gate's shipped pattern (see that job). Empty - a public copy - the
+          # tests that derive from them skip and say why.
+          SANITIZE_EXTRA_PATTERN: ${{ vars.SANITIZE_EXTRA_PATTERN }}
+        run: python -m pytest -q
+      - name: Registry validate gate (seeded template must be schema-valid)
+        shell: bash
+        run: |
+          python -m agentflow.registry init --file "$RUNNER_TEMP/reg.md" --lock-dir "$RUNNER_TEMP" --project citest
+          python -m agentflow.registry validate --file "$RUNNER_TEMP/reg.md" --lock-dir "$RUNNER_TEMP" --project citest
+
+  install-tests:
+    # The suffix renders EMPTY on the 3.11 legs, so their names - required status
+    # checks on master - stay byte-identical; only the 3.12 leg gains one.
+    name: install pytest (${{ matrix.os }}${{ matrix.python != '3.11' && format(', py{0}', matrix.python) || '' }})
+    if: github.event_name != 'push' || !github.event.repository.private
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11"]
+        # The 3.12 leg: both packages claim requires-python >= 3.11 and the documented
+        # install's Ubuntu 24.04 system python3 is 3.12, so the leg checks the other
+        # Python minor. It differs from ubuntu-latest ONLY in that minor version -
+        # setup-python installs its own 3.12.x, and ubuntu-latest already runs 24.04.
+        # A private repo runs it nightly and on dispatch, not on PRs (the empty list).
+        include: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '[]' || '[{"os":"ubuntu-24.04","python":"3.12"}]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: skills/_shared/pyproject.toml
+      # The scaffold tests import the agentflow package (registry seeding),
+      # so the _shared package is a test dependency here.
+      - name: Install agentflow package + pytest
+        run: python -m pip install -e skills/_shared pytest
+      - name: Run provision tests
+        run: python -m pytest install -q
+
+  inventory-tests:
+    name: inventory node --test (${{ matrix.os }})
+    if: github.event_name != 'push' || !github.event.repository.private
+    strategy:
+      fail-fast: false
+      matrix:
+        # A private PR drops the windows leg (nightly and dispatch keep it).
+        os: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '["ubuntu-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: skills/autodoc-init/references/inventory
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: skills/autodoc-init/references/inventory/package-lock.json
+      - name: Install inventory package
+        run: npm ci
+      - name: Run tree-sitter inventory tests
+        run: node --test
+
+  orchestrator-node-tests:
+    # wave_group.js emits the shell commands its agents run; these tests execute them in a
+    # real bash on both OSes, because the commands run in Git Bash on Windows and bash on Linux.
+    name: orchestrator node --test (${{ matrix.os }})
+    if: github.event_name != 'push' || !github.event.repository.private
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '["ubuntu-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Run wave_group.js tests
+        shell: bash
+        run: node --test skills/orchestrator/tests/wave_group.test.mjs
+
+  harness-self-test:
+    # The suffix renders EMPTY on the 3.11 legs, so their names - required status
+    # checks on master - stay byte-identical; only the 3.12 leg gains one.
+    name: harness check.py (${{ matrix.os }}${{ matrix.python != '3.11' && format(', py{0}', matrix.python) || '' }})
+    if: github.event_name != 'push' || !github.event.repository.private
+    strategy:
+      fail-fast: false
+      matrix:
+        # A private PR drops the windows leg (nightly and dispatch keep it).
+        os: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '["ubuntu-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
+        python: ["3.11"]
+        # The 3.12 leg: both packages claim requires-python >= 3.11 and the documented
+        # install's Ubuntu 24.04 system python3 is 3.12, so the leg checks the other
+        # Python minor. It differs from ubuntu-latest ONLY in that minor version -
+        # setup-python installs its own 3.12.x, and ubuntu-latest already runs 24.04.
+        # A private repo runs it nightly and on dispatch, not on PRs (the empty list).
+        include: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '[]' || '[{"os":"ubuntu-24.04","python":"3.12"}]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: skills/_shared/pyproject.toml
+      # check.py resolves parse_plan from the installed agentflow package;
+      # pytest drives the reconstructed toy-repo suite below.
+      - name: Install agentflow package + pytest
+        run: python -m pip install -e skills/_shared pytest
+      # --self-test always grades the tracked example config (gh#340); the
+      # machine-local harness.config.json is never read, so the local config does
+      # not move the verdict. Step 4d SKIPs here: CI holds no recordings.
+      - name: Harness self-test (assertion registry wired)
+        run: python harness/check.py --self-test
+      # gh-55: the count was stated as 39 in four files while the registry
+      # had grown to 42, with README.md printing the stale number beside the
+      # command that disproves it. This ties the prose to check.EXPECTED_IDS
+      # so the number cannot rot again, and flags any NEW doc that states it.
+      - name: Docs state the wired assertion count check.py actually wires
+        run: python harness/assert_doc_counts.py
+      # C, F and G reconstruct from tracked fixtures (no live recordings
+      # needed), so CI exercises real assertions beyond --self-test. Two rows
+      # are honestly out of reach here and report SKIP rather than passing on
+      # an input they never examined (gh#139): C4 reads
+      # stubs/schedulewakeup_log.md, which only a live recording writes, and C7
+      # greps for preport_ip_literals, which the tracked example config ships
+      # empty on purpose. SKIP does not fail the exit code.
+      # F and G joined C here in E-0360: they used to read records/scenarioF|G,
+      # which are gitignored, so they were permanently red on any fresh clone.
+      # They now replay the intake against fixtures/scenarioF-issues-before.json
+      # through issue_intake's injected Runner - no account, no network.
+      - name: Scenarios C, F and G against tracked fixtures
+        run: python harness/check.py harness/harness.config.example.json --only C,F,G
+      # Prove the toy-repo fixture reconstructs deterministically and its
+      # suite is green (harness/README.md "fresh clone" contract).
+      - name: Reconstruct toy-repo fixture
+        run: python harness/seed_toy_repo.py
+      # Run from inside toy-repo: `python -m pytest` puts the cwd on sys.path,
+      # which is how `import calc` resolves (matches harness/README.md usage).
+      - name: Toy-repo suite green
+        run: python -m pytest tests -q
+        working-directory: harness/toy-repo
+
+  lint:
+    name: ruff (first-party tree)
+    if: github.event_name != 'push' || !github.event.repository.private
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        # Pinned to the version the sweep was verified against: rule behaviour
+        # moves between releases, and an unpinned gate would drift into finding
+        # things nobody has looked at.
+        run: python -m pip install "ruff==0.15.10"
+      # Config (rule set + the two deliberate exclusions) lives in ruff.toml at the
+      # repo root, so this runs identically here and on a contributor's machine.
+      # Scope is dead code and real mistakes (pyflakes + pycodestyle errors), not
+      # style opinions on a tree written by many hands.
+      - name: Run ruff
+        run: python -m ruff check .
+
+  sanitize-gate:
+    name: sanitize grep gate
+    if: github.event_name != 'push' || !github.event.repository.private
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      # NFR-1 release gate: zero personal/product literals in first-party
+      # files. Vendored third-party skills (skills/_vendored) and machine-local
+      # harness records (gitignored, but belt and braces) are out of scope.
+      #
+      # TWO SOURCES, ONE SCAN (gh#821). This file ships in every public cut, so
+      # the pattern written below carries GENERIC shapes only - the mangled
+      # session-directory name and absolute home-directory paths - which name
+      # nobody. An alternative specific to one install (another product's name, a
+      # host alias, an address range) would be published by the very file meant
+      # to keep it out, so it is never written here. It lives in the repository's
+      # Actions variable SANITIZE_EXTRA_PATTERN: extra grep -P alternatives,
+      # joined with "|", mirrored from the local-only file
+      # <data_root>/projects/<project>/publish/sanitize-extra-pattern.txt that
+      # agentflow.publish and agentflow.pillar_residue read. When the variable is
+      # set, the step appends it to the pattern before the first scan, so the
+      # tree, the PR title and the PR body all run the one combined pattern
+      # through the same fail-closed grep, and an extra pattern grep cannot parse
+      # fails all three like any other grep error. When it is empty - a public
+      # copy, or a repo that never set it - the step says so in one notice line
+      # and scans the generic shapes alone.
+      #
+      # The mangled-home-path term is a generic shape rather than any one
+      # person's username, so it needs no shell '' split to keep this file from
+      # matching itself: the character class cannot match its own source text,
+      # which has "[" where a username would be.
+      #
+      # gh#247: that mangled shape was for a long time the ONLY personal-path
+      # term, so an ordinary absolute home path read clean. That is not an
+      # exotic input. Every lane is required to prove which tree its suite
+      # imported by printing agentflow.__file__, and that output is an absolute
+      # home path by construction - so the discipline that makes a run
+      # trustworthy is the same discipline that produces the literal, and it
+      # will keep arriving. The plain forms are terms now: drive-letter home on
+      # either separator, the MSYS /c/ mount, Linux /home/, and macOS /Users/.
+      # The macOS one carries two lookbehinds so it stands on its own instead of
+      # only ever re-matching the tail of the two forms above it - a term that
+      # can only fire as a duplicate is dead weight nobody can reason about.
+      #
+      # The account segment is shaped to leave PLACEHOLDER prose alone, because
+      # this tree legitimately writes home paths it does not own - install docs,
+      # a fixture, an elided example. It must START alphanumeric (so an elided
+      # "C:/Users/..." is not a finding), run at least two characters (so a
+      # single-letter fixture account is not), and not be one of the placeholder
+      # words listed in the pattern (so "/home/you" in the install guide is
+      # not). Each placeholder word is followed by (?![A-Za-z0-9._-]), which is
+      # what keeps a REAL account that merely begins with one - "yousef" - a
+      # finding; the guard sits after the alternation and reaches every branch
+      # by backtracking. Like the mangled term these need no shell split: the
+      # source text has "(" where an account name would be.
+      #
+      # WHAT THIS DOES NOT COVER, so nobody reads more protection into it than
+      # is here: UNC paths, a home directory that lives under neither Users nor
+      # home, and an account named exactly like one of the placeholder words.
+      # The account shape is a heuristic that trades those three away for prose
+      # that is allowed to say "/home/you".
+      #
+      # And one trade in the other direction, named here so the next reader is
+      # not surprised by a red: the /home/ term is UNANCHORED, so a URL path
+      # segment - a docs link ending "/home/<page>" - would be a finding. It
+      # is unanchored on purpose, because that is what catches /export/home/ and
+      # other non-root home mounts. Measured the day it was written: all 13
+      # occurrences of /home/ in this tree are home paths, so the class is real
+      # but empty. If it ever bites, the fix is to anchor this one term, not to
+      # add the word to the placeholder list - a placeholder word is exempt
+      # EVERYWHERE, and buying one docs link would cost that account name.
+      #
+      # The two --exclude flags are not redundant. In a normal checkout .git is
+      # a directory and --exclude-dir handles it; in a git WORKTREE it is a FILE
+      # holding a gitdir: pointer to an absolute home path, which --exclude-dir
+      # cannot touch. CI only ever sees the first shape, but the repo tells
+      # contributors to run this gate locally before pushing, and a lane that
+      # builds in a worktree would get a hit on an untracked pointer file every
+      # time. No tracked file can be named .git, so the flag costs nothing.
+      #
+      # NOTE: this gate must be green on every PR and on the commit a publish
+      # cuts; it is the permanent catch-net that keeps the tree clean.
+      #
+      # WHAT THIS GATE CANNOT REACH, AND WHAT DOES REACH IT (E-0771). The `wiki/`
+      # pillar is out of scope here BY CONSTRUCTION, not by omission. This job
+      # does actions/checkout@v4 and greps '.'; the pillar lives under the data
+      # root, which is not in the checkout and is not a git repository at all --
+      # the same fact the pr-provenance-gate states further down when it says CI
+      # has nothing to resolve a spec slug against. So "extend this gate to walk
+      # the data root" is unbuildable; nobody should spend another afternoon on
+      # it. Measured 2026-09-22 over 507 live pages: 48 carry a term this gate
+      # covers and would be findings if it could see them.
+      #
+      # What covers them instead is `agentflow.pillar_residue`, run on the machine
+      # that owns the data root:
+      #
+      #     python -m agentflow.wiki residue --project <name>
+      #
+      # It does NOT keep a second copy of the pattern below -- it parses this very
+      # line out of this file at run time and unions the same local extra file,
+      # and `tests/test_pillar_residue.py` pins that parse, so editing the pattern
+      # here moves the pillar check with it. It is a RATCHET against a recorded
+      # baseline rather than a gate, because 71 of those 507 pages were already
+      # dirty when it shipped.
+      #
+      # DO NOT ADD THE BARE PERSONAL NAME TO THIS PATTERN as part of that work. It
+      # is deliberately absent, and the pillar check counts it as its own class so
+      # it stays visible (decided at registry Q-10079).
+      - name: Grep for personal/product literals
+        env:
+          # gh#247's live instance was a PR BODY, which nothing scanned, so the
+          # tree half reported clean on text published beside it. The body is
+          # read through env and never interpolated into the script: a PR body
+          # is text an outside contributor writes, and ${{ }} splices it into
+          # shell SOURCE before bash ever sees a quote.
+          #
+          # The event name is passed the same way and branched on INSIDE the
+          # step rather than gating the job: the tree half must keep running
+          # where there is no body to read - on a public repo's push, and on the
+          # nightly and workflow_dispatch everywhere. (On a private repo a push
+          # runs no job at all; there the tree half runs on PRs, the nightly and
+          # dispatch.)
+          #
+          # The TITLE is read too, though gh#247 only measured a body. It is the
+          # same defect in the same seam - a title is published on the PR list,
+          # in notification mail and in `gh pr list`, so a home path there is at
+          # least as visible as one in the description - and pr-provenance-gate
+          # already reads both. Scanning one and not the other would be an
+          # arbitrary line that the next reader files a near-duplicate issue
+          # about. They are scanned SEPARATELY so the failure can say which.
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          EVENT_NAME: ${{ github.event_name }}
+          # The install-specific alternatives (see the comment above this step),
+          # read through env like the PR text and never spliced into the script.
+          # Empty when the variable is unset.
+          EXTRA_PATTERN: ${{ vars.SANITIZE_EXTRA_PATTERN }}
+        run: |
+          set -euo pipefail
+          # grep -P requires a unibyte/UTF-8 locale
+          export LC_ALL=C.UTF-8
+          pattern='C--Users-[A-Za-z0-9]+|(?:[A-Za-z]:[\\/]Users[\\/]|/c/Users/|(?<![A-Za-z]:)(?<!/c)/Users/|/home/)(?!(?:you|user|username|name|me|example|someone|yourname)(?![A-Za-z0-9._-]))[A-Za-z0-9][A-Za-z0-9._-]+'
+          # Appended to the one pattern, never a second one, so every scan below runs
+          # the same rule. This script never echoes the value, but GitHub lists a step's
+          # env, values included, at the top of its log and does not mask repository
+          # variables, so this step's log and the `_shared pytest` step's carry it
+          # wherever the variable is set. Set it on the working repo only, never on a
+          # public copy.
+          # `:-` because a contributor running this step locally has no such variable.
+          if [ -n "${EXTRA_PATTERN:-}" ]; then
+            pattern+="|$EXTRA_PATTERN"
+            echo "sanitize gate: extra pattern from repository variable SANITIZE_EXTRA_PATTERN applied to every scan"
+          else
+            echo "::notice::sanitize gate: no extra pattern configured (repository variable SANITIZE_EXTRA_PATTERN is empty) - scanning the generic shapes only"
+          fi
+          rc=0
+          # gh#447: each scan branches on grep's EXIT CODE, never on whether it printed.
+          # 0 = a match, 1 = no match, anything else = grep errored (bad pattern, locale,
+          # unreadable file). An errored grep prints nothing, so an emptiness test - and
+          # the `|| true` it needs - read "could not scan" as "clean" and passed the job.
+          # `x=$(cmd) || x_rc=$?` keeps the code without tripping `set -e`; under
+          # pipefail a `printf | grep` pipeline carries grep's code.
+          scan_failed() {  # $1 = what was scanned, $2 = grep's exit code, $3 = any output it gave
+            if [ -n "$3" ]; then
+              echo "$3"
+              echo "::error::sanitize gate: $1 scan: grep exited $2 - the scan errored part-way and ALSO found the literals above. Failing closed."
+            else
+              echo "::error::sanitize gate: $1 scan: grep exited $2 - the scan did not run. Failing closed."
+            fi
+          }
+          hits_rc=0
+          hits=$(grep -rniP --binary-files=without-match \
+            --exclude-dir=.git \
+            --exclude=.git \
+            --exclude-dir=node_modules \
+            --exclude-dir=_vendored \
+            --exclude-dir=records \
+            --exclude-dir=__pycache__ \
+            --exclude-dir=toy-repo \
+            -e "$pattern" .) || hits_rc=$?
+          if [ "$hits_rc" -eq 0 ]; then
+            echo "$hits"
+            echo "::error::sanitize gate: personal/product literals found in tracked files (see log above)"
+            rc=1
+          elif [ "$hits_rc" -eq 1 ]; then
+            echo "sanitize gate clean: no personal/product literals in first-party files"
+          else
+            scan_failed "tree" "$hits_rc" "$hits"
+            rc=1
+          fi
+          # Both halves report before either fails the job, so someone who has
+          # tripped both learns it in one run rather than two.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            title_hits_rc=0
+            title_hits=$(printf '%s' "$PR_TITLE" | grep -niP -e "$pattern") || title_hits_rc=$?
+            if [ "$title_hits_rc" -eq 0 ]; then
+              echo "$title_hits"
+              echo "::error::sanitize gate: personal/product literals in the PULL REQUEST TITLE. The checkout is clean; edit the PR title. Grepping the tree for these will find nothing."
+              rc=1
+            elif [ "$title_hits_rc" -eq 1 ]; then
+              echo "sanitize gate clean: no personal/product literals in the PR title"
+            else
+              scan_failed "PR title" "$title_hits_rc" "$title_hits"
+              rc=1
+            fi
+            body_hits_rc=0
+            body_hits=$(printf '%s' "$PR_BODY" | grep -niP -e "$pattern") || body_hits_rc=$?
+            if [ "$body_hits_rc" -eq 0 ]; then
+              echo "$body_hits"
+              echo "::error::sanitize gate: personal/product literals in the PULL REQUEST BODY - the numbers above are line numbers WITHIN THE BODY, not a file. The checkout is clean; edit the PR description. Grepping the tree for these will find nothing."
+              rc=1
+            elif [ "$body_hits_rc" -eq 1 ]; then
+              echo "sanitize gate clean: no personal/product literals in the PR body"
+            else
+              scan_failed "PR body" "$body_hits_rc" "$body_hits"
+              rc=1
+            fi
+          else
+            echo "sanitize gate: event is $EVENT_NAME, which carries no PR title or body - that half of this gate did not run"
+          fi
+          exit $rc
+      # A step in this job, not a job of its own, because this job's name is the required status
+      # context. `!cancelled()` keeps it reporting when the literal scan above failed, so someone
+      # who trips both learns it in one run. What it guards and refuses: the script's docstring
+      # and CONTRIBUTING's "Instruction-prose history gate".
+      - name: Instruction prose carries no history
+        if: ${{ !cancelled() }}
+        run: python3 .github/scripts/prose_history_gate.py
+
+  worktree-tool-gate:
+    name: worktree tool/flag gate
+    if: github.event_name != 'push' || !github.event.repository.private
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      # The launch directory is the harness home, so a lane's working directory is
+      # deliberately not inside any repo. Both banned patterns bind git to whatever
+      # repo the working directory happens to sit in — from the launch directory
+      # that is no repo at all, so a lane using either one silently operates on
+      # nothing. Every git action carries an explicit path instead, built from
+      # <worktree_root> and <canonical_repo.local_checkout>.
+      #
+      # This gate is creep-prevention and is expected to sit at zero hits: the
+      # native-tool name is already absent from the first-party tree. Keeping the
+      # gate at zero is the point — it stops the pattern reappearing the next time
+      # a lane skill is rewritten from an older one, or from upstream's vendored
+      # advice, which still recommends the native tool.
+      #
+      # Scope is the ENTIRE first-party skills tree, scanned recursively, with
+      # `_vendored` excluded — the same shape the sanitize gate above already uses.
+      # It is deliberately NOT an enumerated list of globs. A fixed list only ever
+      # guards the directory names that existed the day it was written: a prompt
+      # sitting in a skill root (`critic-prompt.md`, `spec-document-reviewer-prompt.md`),
+      # a renamed subdirectory, or a `workflows/*.js` that COMPOSES dispatch prompts
+      # as code rather than prose all drop out of scope silently, and the gate keeps
+      # reporting clean over the files it can no longer see.
+      #
+      # That is not hypothetical — it is this gate's own history. It began as
+      # `skills/*/SKILL.md`, was widened to three `.md` subdirectories to catch the
+      # orchestrator's dispatched briefs, and review then found it STILL missed
+      # `workflows/wave_group.js` (where wave prompts are actually built) and two
+      # first-party prompts sitting one level up. Each widening answered the
+      # instance; recursion answers the class.
+      #
+      # `_vendored` stays out because that tree is re-vendored rather than patched
+      # and one of its files legitimately names the banned tool.
+      - name: Grep for native worktree tool / per-subagent isolation flag
+        run: |
+          set -euo pipefail
+          pattern="EnterWorktree|isolation['\"]?[[:space:]]*[:=][[:space:]]*['\"]?worktree"
+          # A gate that scanned nothing reports the same "clean" as a gate that
+          # scanned everything, so scanning zero files is a failure, not a pass.
+          # Counted with the same flags and the same path as the grep below. The two are
+          # separate invocations, so the count is a close proxy rather than a proof: `-l`
+          # short-circuits at the first line while the pattern grep reads the whole file, so a
+          # file whose NUL byte sits after line 1 can be counted and then skipped as binary.
+          # gh#509: both scans branch on grep's EXIT CODE, never on what it printed, the same
+          # shape gh#447 gave the sanitize gate. 0 = a match, 1 = no match, anything else =
+          # grep errored. An errored grep prints nothing (or, part-way, only some of what it
+          # should), so the old `|| true` read "could not scan" as "clean". `x=$(cmd) || x_rc=$?`
+          # keeps the code without tripping `set -e`. A skills/ tree that is present but holds
+          # no text files exits 1 and reaches the "scanned no files" diagnostic; a skills/ tree
+          # that is gone makes grep exit 2 and fails at the file-count error branch instead.
+          # The file list is captured on its own, not piped to `wc -l`, because a pipeline's
+          # status would be wc's and a grep that errored on some files would still count > 0.
+          files_rc=0
+          files=$(grep -rIl --exclude-dir=_vendored --exclude-dir=__pycache__ -e '' skills/) || files_rc=$?
+          if [ "$files_rc" -ge 2 ]; then
+            echo "::error::worktree gate: file-count grep exited $files_rc - the scan did not run. Failing closed."
+            exit 1
+          fi
+          if [ -z "$files" ]; then
+            scanned=0
+          else
+            scanned=$(printf '%s\n' "$files" | wc -l)
+          fi
+          if [ "$scanned" -eq 0 ]; then
+            echo "::error::worktree gate: scanned no files — the skills tree moved and this gate is guarding nothing"
+            exit 1
+          fi
+          echo "worktree gate scanning $scanned file(s) under skills/ (excluding _vendored)"
+          # Case-INsensitive as well as extended: the tool name is CamelCase in the
+          # harness, but a skill rewritten from prose lower- or title-cases it as often
+          # as not, and a gate that only catches one spelling of a name reads green by
+          # luck rather than by being clean.
+          hits_rc=0
+          hits=$(grep -rniE -I --exclude-dir=_vendored --exclude-dir=__pycache__ -- "$pattern" skills/) || hits_rc=$?
+          if [ "$hits_rc" -ge 2 ]; then
+            if [ -n "$hits" ]; then
+              echo "$hits"
+              echo "::error::worktree gate: grep exited $hits_rc - the scan errored part-way and ALSO found the hits above. Failing closed."
+            else
+              echo "::error::worktree gate: grep exited $hits_rc - the scan did not run. Failing closed."
+            fi
+            exit 1
+          fi
+          if [ "$hits_rc" -eq 0 ]; then
+            echo "$hits"
+            echo "Use an explicit git -C form instead, e.g."
+            echo "  git -C \"<canonical_repo.local_checkout>\" worktree add \"<worktree_root>/<project>/<epic-slug>\" <branch>"
+            echo "  git -C \"<worktree_root>/<project>/<epic-slug>\" <subcommand>"
+            echo "::error::worktree gate: a first-party skill file still names the native worktree-entering tool or the per-subagent worktree-isolation flag (file:line above); lanes launch from the machine launch directory, where neither resolves to a repo"
+            exit 1
+          fi
+          echo "worktree gate clean: no native worktree tool or isolation flag in the first-party skills tree"
+
+  pr-provenance-gate:
+    name: PR provenance gate
+    # Only a pull_request event has a body to read. A push to master is not gated:
+    # the PR that produced it already was.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Every PR cites an issue, an epic, or a declared escape, and points at its review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          # Empty when the head repo is gone (a deleted fork); that PR is treated as a fork's.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+          text="$PR_TITLE
+          $PR_BODY"
+
+          # Three independent checks, ALL reported before the exit: a contributor who
+          # fails both reads both messages from one run instead of discovering the
+          # second after fixing the first.
+          fail=0
+
+          # ---- A. Provenance: where the work came from -------------------------------
+          provenance=""
+
+          # 1. Declared escape. Deliberate: a gate with no escape is a gate people route
+          #    around, which loses the signal and keeps the friction.
+          if printf '%s' "$text" | grep -qiE '^[[:space:]]*(\*\*)?Source:(\*\*)?[[:space:]]*(direct instruction|trivial)'; then
+            provenance="declared escape present"
+
+          # 2. An epic: a registry id, or a slug named on an Epic: line.
+          #    Shape only - specs live in the data_root, so CI has nothing to resolve a
+          #    slug against. Stated rather than implied.
+          elif printf '%s' "$text" | grep -qE '\bE-[0-9]{4}\b'; then
+            provenance="epic id cited"
+          elif printf '%s' "$text" | grep -qiE '^[[:space:]]*(\*\*)?Epic:(\*\*)?[[:space:]]*[a-z0-9]+(-[a-z0-9]+){2,}'; then
+            provenance="epic slug cited (shape checked; existence is not verifiable in CI)"
+
+          # 3. An issue. `#N` alone is NOT enough: /issues/N also returns pull requests,
+          #    and only a PR carries a `pull_request` key. Citing a PR number where an
+          #    issue was meant is the exact inverse of the mistake this gate was measured
+          #    against, so it is checked rather than assumed.
+          else
+            nums=$(printf '%s' "$text" | grep -oE '#[0-9]+' | tr -d '#' | sort -un || true)
+            for n in $nums; do
+              # Branch on the EXIT CODE, not on stdout: a 404 still prints an error JSON
+              # body to stdout, and folding that into $kind would put raw JSON into the
+              # contributor-facing message below - which is the line they act on.
+              # No line continuation here on purpose: a trailing backslash is only a
+              # continuation before LF, and this file is edited on Windows.
+              if resp=$(gh api "repos/$REPO/issues/$n" --jq 'if .pull_request then "pr" else "issue" end' 2>/dev/null); then
+                kind="$resp"
+              else
+                kind="missing"
+              fi
+              if [ "$kind" = "issue" ]; then
+                provenance="issue #$n cited"
+                break
+              fi
+              echo "note: #$n is a $kind, not an issue - not provenance on its own"
+            done
+          fi
+
+          if [ -n "$provenance" ]; then
+            echo "provenance: $provenance"
+          else
+            fail=1
+            echo "::error::PR provenance gate: this PR cites no issue, no epic, and no declared escape."
+            echo "Add ONE of:"
+            echo "  Source: gh#<n>              an ISSUE in this repo, for a loop or any same-repo branch"
+            echo "  Closes #<n>                 an ISSUE, for outside contributors (a PR from a fork) only"
+            echo "  Epic: <id-or-slug>          a registry queue id or spec slug (maintainers)"
+            echo "  Source: direct instruction  asked for directly, no ticket"
+            echo "  Source: trivial             typo / indent / comment-only"
+          fi
+
+          # ---- B. Review pointer: where the review went (gh#312, registry Q-10063) ----
+          # Rule and reason: skills/_shared/PR-PROSE.md, "Review pointer". Body only, because
+          # the body is what this event carries and `edited` (see `on:` above) re-runs the
+          # gate; EXACTLY one line, because two pointers give an inheriting seat two answers.
+          #   Review: <URL>    the comment carrying this PR's review verdicts
+          #   Review: none     no separate review record exists for this PR
+          # WHAT the URL points at is deliberately not checked here.
+          pointers=$(printf '%s' "$PR_BODY" | grep -ciE '^[[:space:]]*(\*\*)?Review:(\*\*)?[[:space:]]*(https?://[^[:space:]]+|none)[[:space:]]*$' || true)
+          if [ "$pointers" -eq 1 ]; then
+            echo "review: pointer present"
+          elif [ "$pointers" -gt 1 ]; then
+            fail=1
+            echo "::error::PR provenance gate: this PR body carries $pointers 'Review:' pointers; exactly one (gh#312)."
+          else
+            fail=1
+            echo "::error::PR provenance gate: this PR body carries no 'Review:' pointer (gh#312)."
+            echo "Add ONE line to the PR BODY (not the title):"
+            echo "  Review: https://github.com/<owner>/<repo>/pull/<n>#issuecomment-<id>   the comment carrying this PR's review verdicts"
+            echo "  Review: none                                                          no separate review record exists for this PR"
+            echo "An unfilled template line (Review: followed by a comment) does not pass; fill it or write none."
+          fi
+
+          # ---- C. No closing keyword on a same-repo PR --------------------------------
+          # Rule and reason: skills/_shared/PR-PROSE.md, "Citing an issue". A fixed issue is
+          # closed by the auditor after an ask-by-ask check, never by the PR that fixed it, so
+          # a PR from a branch in this repo (every fleet branch is) must not carry a GitHub
+          # closing keyword before an issue reference in its title, its body or any commit
+          # message: each one closes the issue on merge. GitHub's nine keywords only, and
+          # `gh#N` is not a reference it closes on, so a keyword before `gh#N` passes. A PR
+          # from a fork is an outside contributor's and keeps `Closes #N`; a body opening
+          # with the attribution line is checked wherever it comes from.
+          # Quoted hits are PR author text: each line is echoed behind "  > " so a line such as
+          # "::warning::closes #12" never reaches the runner as a workflow command (the runner
+          # trims leading whitespace before it looks for "::", so an indent alone is not enough).
+          kw='(^|[^[:alnum:]_])(close[sd]?|fix(e[sd])?|resolve[sd]?):?[[:space:]]*(#[0-9]+|[[:alnum:]_.-]+/[[:alnum:]_.-]+#[0-9]+|https?://[^[:space:]]+/issues/[0-9]+)'
+          first_line=$(printf '%s\n' "$PR_BODY" | tr -d '\r' | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}')
+          same_repo=0
+          if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" = "$REPO" ]; then
+            same_repo=1
+          fi
+          case "$first_line" in
+            "Agentflow ["*) same_repo=1 ;;
+          esac
+          if [ "$same_repo" -eq 1 ]; then
+            kw_fail=0
+            title_hits=$(printf '%s\n' "$PR_TITLE" | grep -iE "$kw" || true)
+            if [ -n "$title_hits" ]; then
+              kw_fail=1
+              echo "::error::PR provenance gate: the PR TITLE carries a closing keyword before an issue reference:"
+              printf '%s\n' "$title_hits" | sed 's/^/  > /'
+              echo "A same-repo PR never closes an issue on merge. Cite it as Source: gh#<n>; one gh pr edit of the title fixes it."
+            fi
+            body_hits=$(printf '%s\n' "$PR_BODY" | tr -d '\r' | grep -iE "$kw" || true)
+            if [ -n "$body_hits" ]; then
+              kw_fail=1
+              echo "::error::PR provenance gate: the PR BODY carries a closing keyword before an issue reference:"
+              printf '%s\n' "$body_hits" | sed 's/^/  > /'
+              echo "A same-repo PR never closes an issue on merge. Cite it as Source: gh#<n>; one gh pr edit of the body fixes it."
+            fi
+            # One output line per commit-message line: the commit's short sha, a tab, the line.
+            if commit_lines=$(gh api "repos/$REPO/pulls/$PR_NUMBER/commits" --paginate --jq '.[] | .sha[0:7] as $s | (.commit.message | split("\n")[]) | $s + "\t" + .' 2>/dev/null); then
+              commit_hits=$(printf '%s\n' "$commit_lines" | tr -d '\r' | grep -iE "$kw" || true)
+              if [ -n "$commit_hits" ]; then
+                kw_fail=1
+                echo "::error::PR provenance gate: a COMMIT MESSAGE carries a closing keyword before an issue reference (short sha, then the line):"
+                printf '%s\n' "$commit_hits" | sed 's/^/  > /'
+                echo "The squash merge copies commit messages onto the base branch, where the keyword closes the issue. An edit of the PR cannot reach a commit: reword the commit to cite Source: gh#<n>, then push the branch with --force-with-lease."
+              fi
+            else
+              kw_fail=1
+              echo "::error::PR provenance gate: could not read the PR's commit messages (gh api repos/$REPO/pulls/$PR_NUMBER/commits), so the closing-keyword check did not run. Failing closed."
+            fi
+            if [ "$kw_fail" -eq 0 ]; then
+              echo "closing keywords: none in the title, body or commit messages"
+            else
+              fail=1
+            fi
+          else
+            echo "closing keywords: not checked - a PR from a fork (head repo '$HEAD_REPO') is an outside contributor's, and Closes #<n> stays its provenance"
+          fi
+
+          exit "$fail"
