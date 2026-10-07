@@ -33,6 +33,7 @@ from agentflow.issue_intake import (
     unlabel_issue,
     untriaged,
 )
+from agentflow.config import WorkSource
 
 HOST_REF = "owner/repo"
 
@@ -100,6 +101,8 @@ def test_the_module_docstring_enumerates_every_label_and_admits_nothing_writes_t
     for label in (TRIAGED_LABEL, EPIC_LABEL, IN_PROGRESS_LABEL, NEEDS_DECISION_LABEL):
         assert f"``{label}``" in doc, f"module docstring does not name {label}"
     assert "NOTHING IN THIS REPOSITORY WRITES ``in-progress`` ON ITS OWN YET." in doc
+    # The marker is unwired, so the docstring must name the gate that does fire.
+    assert "``held_issue_numbers``" in doc
 
 
 def test_issue_is_frozen_with_defaults() -> None:
@@ -359,6 +362,25 @@ def test_spec_linked_issue_numbers_unparseable_yaml_falls_back(tmp_path: Path) -
 
 def test_spec_linked_issue_numbers_missing_dir_is_empty(tmp_path: Path) -> None:
     assert spec_linked_issue_numbers(tmp_path / "nope") == set()
+
+
+def test_a_bom_prefixed_spec_is_still_cross_linked(tmp_path: Path) -> None:
+    """gh#1000: PowerShell's Out-File writes a UTF-8 BOM, which sat in front of `---` and hid
+    the frontmatter. b.md is the BOM-less control."""
+    refine = tmp_path / "specs"
+    refine.mkdir()
+    (refine / "a.md").write_bytes(b"\xef\xbb\xbf---\nstatus: speccing\nsource: gh#30\n---\n# A\n")
+    (refine / "b.md").write_bytes(b"---\nstatus: speccing\nsource: gh#31\n---\n# B\n")
+    assert spec_linked_issue_numbers(refine) == {30, 31}
+
+
+def test_a_bom_prefixed_done_spec_is_still_a_fix_claimant(tmp_path: Path) -> None:
+    (tmp_path / "2026-09-01-bom.md").write_bytes(
+        b"\xef\xbb\xbf---\ncurrent_state: done\nsource: gh#30\n---\n# A\n")
+    (tmp_path / "2026-09-02-plain.md").write_bytes(
+        b"---\ncurrent_state: done\nsource: gh#31\n---\n# B\n")
+    links = ii.done_spec_links(tmp_path)
+    assert sorted((ln.slug, sorted(ln.issues)) for ln in links) == [("bom", [30]), ("plain", [31])]
 
 
 # --------------------------------------------------------------------------- #
@@ -736,17 +758,14 @@ class _Env:
 
 
 class _Proj:
-    def __init__(self, host_ref: str, ws_kind: str):
+    def __init__(self, host_ref: str, ws_kind: str, open_issue_page: int = ii.OPEN_ISSUE_PAGE):
         class _CR:
-            pass
-
-        class _WS:
             pass
 
         self.canonical_repo = _CR()
         self.canonical_repo.host_ref = host_ref
-        self.work_source = _WS()
-        self.work_source.kind = ws_kind
+        # the real dataclass, so a field intake starts reading cannot be missing from the fake
+        self.work_source = WorkSource(kind=ws_kind, open_issue_page=open_issue_page)
 
 
 @pytest.fixture
@@ -756,6 +775,7 @@ def cli_env(monkeypatch, tmp_path: Path):
 
     refine = tmp_path / "projects" / "demo" / "design" / "specs"
     _write(refine / "carved.md", "---\nsource: gh#902\n---\n")
+    _write(tmp_path / "projects" / "demo" / "status" / "registry.md", _held_registry())
     monkeypatch.setattr(_config, "load_environment", lambda: _Env("github", "gh", str(tmp_path)))
     monkeypatch.setattr(_config, "load_project", lambda name: _Proj(HOST_REF, "github-issues"))
     runner = FakeRunner(stdout=json.dumps(_RAW))
@@ -768,6 +788,249 @@ def test_cli_untriaged_text(cli_env, capsys) -> None:
     out = capsys.readouterr().out.splitlines()
     assert out == ["#901  Bounded bug  [bug]"]
     assert cli_env.calls[0][:5] == ["gh", "issue", "list", "--repo", HOST_REF]
+
+
+# --------------------------------------------------------------------------- #
+# The held set: an issue already on the board is not offered again
+# --------------------------------------------------------------------------- #
+def _held_registry(queue: str = "", agents: str = "", notes: str = "") -> str:
+    """A fake board in the registry's own shape; only the cells under test vary."""
+    return (
+        "# Fleet Registry - demo\n\n"
+        "## Agents\n\n"
+        "| agent | status | work | phase | heartbeat | eta | waiting_on |\n"
+        "|---|---|---|---|---|---|---|\n" + agents + "\n"
+        "## Queue\n\n"
+        "- **Deploy lock** - holder: none, taken-at: -\n"
+        "- **Notes** - (none)\n" + notes + "\n"
+        "| id | work item | lane | claimed_by | state | waiting_on | notes |\n"
+        "|---|---|---|---|---|---|---|\n" + queue + "\n"
+        "## Questions\n\n"
+        "## Blockers\n\n"
+        "| id | raised_by | owner | work | state | description |\n"
+        "|---|---|---|---|---|---|\n\n"
+        "## Directives\n\n"
+    )
+
+
+def _held(tmp_path: Path, **cells) -> frozenset:
+    path = tmp_path / "registry.md"
+    _write(path, _held_registry(**cells))
+    return ii.read_held_set(path)
+
+
+_BUGS = [_issue(n, "triaged", "bug") for n in (44, 446, 447)]
+
+
+@pytest.mark.parametrize("row", [
+    "| E-0001 | BUG gh#446 - fix | jr-dev-1 | jr-dev-1 | building | - | - |\n",
+    "| E-0001 | BUG gh#446 - fix | jr-dev-1 | - | ready | - | - |\n",
+], ids=["claimed", "unclaimed-ready"])
+def test_a_live_queue_row_citing_an_issue_keeps_it_out_of_selectable(tmp_path, row) -> None:
+    """A published row has already handed its issue out, claimed or not. gh#44 is the control
+    for exact matching: it is a prefix of gh#446 and must stay selectable."""
+    held = _held(tmp_path, queue=row)
+    assert held == {446}
+    assert [i.number for i in builder_selectable(_BUGS, held)] == [44, 447]
+
+
+@pytest.mark.parametrize("status", ["building", "waiting", "halted"])
+def test_an_agents_row_citing_an_issue_keeps_it_out_of_selectable(tmp_path, status) -> None:
+    agents = f"| lead-dev | {status} | E-0001 | fixing gh#447 | - | - | - |\n"
+    assert [i.number for i in builder_selectable(_BUGS, _held(tmp_path, agents=agents))] == [44, 446]
+
+
+def test_an_idle_agents_row_citing_an_issue_does_not_hold_it(tmp_path) -> None:
+    """An idle row's phase records finished work, e.g. the completion phase of a lane that
+    published an issue; it must not keep that issue held until the next status write."""
+    agents = "| lead-dev | idle | - | no spec: issue-published, Source: gh#447 | - | - | - |\n"
+    held = _held(tmp_path, agents=agents)
+    assert 447 not in held
+    assert [i.number for i in builder_selectable(_BUGS, held)] == [44, 446, 447]
+
+
+@pytest.mark.parametrize("status, holds", [
+    ("`building`", True),
+    ("Building", True),
+    ("stalled", True),
+    ("`idle`", False),
+    ("IDLE", False),
+], ids=["backticked-building", "capitalised-building", "off-enum", "backticked-idle", "upper-idle"])
+def test_an_off_enum_status_cell_never_shrinks_the_held_set(tmp_path, status, holds) -> None:
+    """Only an idle row stops holding; a damaged or off-enum status cell keeps holding, so a
+    malformed board can never offer held work as free."""
+    agents = f"| lead-dev | {status} | E-0001 | fixing gh#447 | - | - | - |\n"
+    assert (447 in _held(tmp_path, agents=agents)) is holds
+
+
+@pytest.mark.parametrize("cells", [
+    {"queue": "| E-0001 | BUG gh#446 - fix | jr-dev-1 | jr-dev-1 | done | - | - |\n"},
+    {"queue": "| E-0001 | BUG gh#446 - fix | jr-dev-1 | - | withdrawn | - | - |\n"},
+    {"notes": "- lead-dev: gh#446 came up while reviewing something else\n"},
+    {"queue": "| E-0001 | BUG gh#447 - fix | jr-dev-1 | jr-dev-1 | building | - | see gh#446 |\n"},
+], ids=["done-row", "withdrawn-row", "coordination-note", "notes-cell"])
+def test_a_finished_row_or_a_note_citing_an_issue_does_not_hold_it(tmp_path, cells) -> None:
+    held = _held(tmp_path, **cells)
+    assert 446 not in held
+    assert 446 in {i.number for i in builder_selectable(_BUGS, held)}
+
+
+@pytest.mark.parametrize("ref", ["gh#446", "GH#446", "Gh#446", "#446", "(#446)"],
+                         ids=["canonical", "upper", "mixed", "bare", "bare-in-parens"])
+@pytest.mark.parametrize("where", ["queue", "agents"])
+def test_an_issue_cited_in_any_case_or_bare_is_held(tmp_path, ref, where) -> None:
+    """gh#909: the held predicate matched only lowercase ``gh#N``, so a row citing ``GH#14`` or
+    ``#12`` left the issue selectable while a lane built it. gh#44 stays the prefix control."""
+    cells = {
+        "queue": {"queue": f"| E-0001 | BUG {ref} - fix | jr-dev-1 | - | ready | - | - |\n"},
+        "agents": {"agents": f"| lead-dev | building | E-0001 | fixing {ref} | - | - | - |\n"},
+    }[where]
+    held = _held(tmp_path, **cells)
+    assert held == {446}
+    assert [i.number for i in builder_selectable(_BUGS, held)] == [44, 447]
+
+
+@pytest.mark.parametrize("state", ["done", "withdrawn"])
+@pytest.mark.parametrize("ref", ["#446", "GH#446"])
+def test_a_finished_row_citing_an_issue_bare_or_upper_does_not_hold_it(tmp_path, ref, state) -> None:
+    held = _held(tmp_path, queue=f"| E-0001 | BUG {ref} - fix | jr-dev-1 | - | {state} | - | - |\n")
+    assert 446 not in held
+
+
+@pytest.mark.parametrize("ref", ["PR #446", "pr #446", "PR#446", "pr#446", "x#446", "##446"])
+def test_a_pull_request_or_glued_hash_reference_does_not_hold_an_issue(tmp_path, ref) -> None:
+    """A ``#`` glued to a word, or written ``PR #N``, names a pull request or nothing; only
+    ``gh#N`` in any case and a free-standing ``#N`` hold (``registry.HELD_REF_RE``)."""
+    held = _held(tmp_path, queue=f"| E-0001 | BUG {ref} follow-up | jr-dev-1 | - | ready | - | - |\n")
+    assert held == frozenset()
+
+
+def test_builder_selectable_without_a_held_set_is_label_only() -> None:
+    assert [i.number for i in builder_selectable(_BUGS)] == [44, 446, 447]
+
+
+def test_a_missing_registry_refuses_rather_than_reading_as_a_free_board(tmp_path) -> None:
+    with pytest.raises(IssueIntakeError, match="held work cannot be told from free work"):
+        ii.read_held_set(tmp_path / "absent.md")
+
+
+@pytest.mark.parametrize("text", [
+    "## Agents\n\n| broken",
+    _held_registry().replace("|---|---|---|---|---|---|---|\n\n## Questions",
+                             "\n## Questions"),
+], ids=["no-queue-section", "queue-table-gone"])
+def test_an_unparseable_registry_refuses(tmp_path, text) -> None:
+    path = tmp_path / "registry.md"
+    _write(path, text)
+    with pytest.raises(IssueIntakeError, match="held work cannot be told from free work"):
+        ii.read_held_set(path)
+
+
+_DUP_BUILDING = "| E-0100 | gh#5 fix thing | jr-dev-1 | jr-dev-1 | building | - | - |\n"
+_DUP_DONE = "| E-0100 | gh#7 other | jr-dev-2 | jr-dev-2 | done | - | - |\n"
+
+
+@pytest.mark.parametrize("queue, problem", [
+    (_DUP_BUILDING + _DUP_DONE, "appears on 2 rows"),
+    (_DUP_DONE + _DUP_BUILDING, "appears on 2 rows"),
+    ("| E-0101 | gh#6 fix | jr-dev-1 | jr-dev-1 | building | - |\n", "row has 6 cells, expected 7"),
+], ids=["a-dup-id-building-first", "a2-dup-id-done-first", "b-short-row"])
+def test_a_board_whose_queue_rows_the_parser_would_drop_refuses(tmp_path, queue, problem) -> None:
+    """gh#1000: the parser keeps the last of a duplicated id and drops a short row, so the held
+    row vanished and selectable offered the issue with exit 0. Same defects `validate` names."""
+    path = tmp_path / "registry.md"
+    _write(path, _held_registry(queue=queue))
+    with pytest.raises(IssueIntakeError, match="held work cannot be told from free work") as exc:
+        ii.read_held_set(path)
+    assert problem in str(exc.value)
+
+
+def test_a_board_whose_agents_rows_the_parser_would_drop_refuses(tmp_path) -> None:
+    """The held set reads Agents work cells too, so a duplicated lane row drops one of them."""
+    agents = (
+        "| jr-dev-1 | building | E-0100 | fixing gh#5 | - | - | - |\n"
+        "| jr-dev-1 | idle | - | - | - | - | - |\n"
+    )
+    path = tmp_path / "registry.md"
+    _write(path, _held_registry(agents=agents))
+    with pytest.raises(IssueIntakeError, match="held work cannot be told from free work") as exc:
+        ii.read_held_set(path)
+    assert "appears on 2 rows" in str(exc.value)
+
+
+def test_a_well_formed_ready_row_still_reads_as_held(tmp_path) -> None:
+    """The control for the refusals above: a valid board still reads."""
+    assert _held(tmp_path, queue="| E-0103 | gh#9 fix | jr-dev-1 | | ready | - | - |\n") == {9}
+
+
+def test_cli_selectable_refuses_on_a_duplicate_queue_id(cli_env, capsys) -> None:
+    from agentflow import config as _config
+
+    reg = Path(_config.load_environment().data_root) / "projects" / "demo" / "status" / "registry.md"
+    _write(reg, _held_registry(queue=_DUP_BUILDING.replace("gh#5 ", "gh#903 ") + _DUP_DONE))
+    assert main(["selectable", "--project", "demo", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "appears on 2 rows" in captured.err
+
+
+def _mirror_index(cli_env) -> str:
+    from agentflow import config as _config
+
+    root = Path(_config.load_environment().data_root) / "projects" / "demo"
+    assert main(["mirror", "--project", "demo"]) == 0
+    return (root / "design" / "bugs" / "index.md").read_text(encoding="utf-8")
+
+
+_NOT_ON_BOARD = "not on the board"
+
+
+@pytest.mark.parametrize("damage", ["separator-removed", "registry-missing"])
+def test_mirror_on_an_unreadable_board_says_so_in_the_index(cli_env, capsys, damage) -> None:
+    """gh#1000: the index asserted `In flight (0)` and glossed selectable bugs as "not on the
+    board" when the board was never read - indistinguishable from an idle fleet."""
+    from agentflow import config as _config
+
+    reg = Path(_config.load_environment().data_root) / "projects" / "demo" / "status" / "registry.md"
+    if damage == "registry-missing":
+        reg.unlink()
+    else:
+        header = "| id | work item | lane | claimed_by | state | waiting_on | notes |\n"
+        _write(reg, _held_registry().replace(header + "|---|---|---|---|---|---|---|\n", header))
+    text = _mirror_index(cli_env)
+    assert _NOT_ON_BOARD not in text
+    assert ii.BOARD_UNREADABLE_BANNER in text
+    assert "**#903**" in text  # still listed, just no longer vouched for
+    assert "in-flight grouping skipped" in capsys.readouterr().err
+
+
+def test_mirror_on_a_readable_board_carries_no_banner(cli_env, capsys) -> None:
+    """The control: a readable board renders exactly what it rendered before gh#1000."""
+    text = _mirror_index(cli_env)
+    assert "Board unreadable" not in text
+    assert _NOT_ON_BOARD in text
+    expected = ii.render_open_index([ii._parse_issue(r) for r in _RAW], {902}, "x")
+    assert ii._body_without_stamp(text) == ii._body_without_stamp(expected)
+
+
+def test_cli_selectable_subtracts_the_held_set(cli_env, capsys) -> None:
+    from agentflow import config as _config
+
+    reg = Path(_config.load_environment().data_root) / "projects" / "demo" / "status" / "registry.md"
+    _write(reg, _held_registry(queue="| E-0001 | BUG gh#903 - fix | jr-dev-1 | - | ready | - | - |\n"))
+    assert main(["selectable", "--project", "demo", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_cli_selectable_refuses_when_the_registry_is_missing(cli_env, capsys) -> None:
+    from agentflow import config as _config
+
+    reg = Path(_config.load_environment().data_root) / "projects" / "demo" / "status" / "registry.md"
+    reg.unlink()
+    assert main(["selectable", "--project", "demo", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "held work cannot be told from free work" in captured.err
 
 
 def test_cli_selectable_json(cli_env, capsys) -> None:
@@ -890,6 +1153,67 @@ def test_cli_list_modes_ask_the_tracker_for_one_row_past_the_page(cli_env, capsy
 
 
 # --------------------------------------------------------------------------- #
+# work_source.open_issue_page: the refusal's way out is a profile key, not a flag
+# --------------------------------------------------------------------------- #
+def test_cli_refusal_at_the_default_page_names_the_key_and_the_profile(
+        monkeypatch, cli_env, capsys) -> None:
+    """Absent key: the page is still 200 and 201 open still refuses, but the refusal now says
+    how to get out - which key, in which file - instead of leaving 'retry next wake'."""
+    from agentflow import config as _config
+
+    monkeypatch.setattr(ii, "_subprocess_runner", FakeRunner(stdout=_untriaged_page(201)))
+    assert main(["untriaged", "--project", "demo"]) == 1
+    err = capsys.readouterr().err
+    assert "first 200 open issues" in err
+    assert "raise work_source.open_issue_page (now 200)" in err
+    assert str(_config.config_home() / "projects" / "demo.md") in err
+
+
+def test_cli_list_mode_reads_the_configured_page(monkeypatch, cli_env, capsys) -> None:
+    """With the key at 300, 201 open issues is a complete read: it lists, oldest included,
+    and the tracker is asked for 301 rows so the guard keeps its proof row at the new size."""
+    from agentflow import config as _config
+
+    monkeypatch.setattr(_config, "load_project",
+                        lambda name: _Proj(HOST_REF, "github-issues", open_issue_page=300))
+    runner = FakeRunner(stdout=_untriaged_page(201))
+    monkeypatch.setattr(ii, "_subprocess_runner", runner)
+    assert main(["untriaged", "--project", "demo", "--json"]) == 0
+    listed = [d["number"] for d in json.loads(capsys.readouterr().out)]
+    assert len(listed) == 201 and 1 in listed
+    argv = runner.calls[0]
+    assert argv[argv.index("--limit") + 1] == "301"
+
+
+def test_cli_configured_page_still_refuses_past_itself(monkeypatch, cli_env, capsys) -> None:
+    """Raising the key moves the guard; it does not remove it."""
+    from agentflow import config as _config
+
+    monkeypatch.setattr(_config, "load_project",
+                        lambda name: _Proj(HOST_REF, "github-issues", open_issue_page=300))
+    monkeypatch.setattr(ii, "_subprocess_runner", FakeRunner(stdout=_untriaged_page(301)))
+    assert main(["selectable", "--project", "demo"]) == 1
+    err = capsys.readouterr().err
+    assert "first 300 open issues" in err and "(now 300)" in err
+
+
+def test_cli_claim_reads_the_configured_page(monkeypatch, cli_env, capsys) -> None:
+    """claim/release share the guard, so they must share the page: with the key at 300 the
+    claim asks for 301 rows, not the 201 the old constant fixed."""
+    from agentflow import config as _config
+
+    monkeypatch.setattr(_config, "load_project",
+                        lambda name: _Proj(HOST_REF, "github-issues", open_issue_page=300))
+    rows = [{"number": n, "title": f"issue {n}", "labels": [{"name": "triaged"}]}
+            for n in range(201, 0, -1)]
+    runner = FakeRunner(stdout=json.dumps(rows))
+    monkeypatch.setattr(ii, "_subprocess_runner", runner)
+    assert main(["claim", "--project", "demo", "--issue", "1"]) == 0
+    argv = runner.calls[0]
+    assert argv[argv.index("--limit") + 1] == "301"
+
+
+# --------------------------------------------------------------------------- #
 # CLI: claim / release
 # --------------------------------------------------------------------------- #
 def test_cli_claim_then_reclaim_says_which_one_wrote(monkeypatch, cli_env, capsys) -> None:
@@ -1008,3 +1332,79 @@ def test_cli_untriaged_gitea_project_with_cli_none_prints_nothing(
     assert main(["untriaged", "--project", "demo"]) == 0
     assert capsys.readouterr().out == ""
     assert cli_env.calls == []
+
+
+# --- gh#1123: refs and epic ids are ASCII-digit only, Queue keys use the shared predicate -----
+
+
+def _arabic(digits: str) -> str:
+    """`digits` spelled in Arabic-Indic digits: `\\d` matches these and `int()` reads them."""
+    return "".join(chr(0x0660 + int(c)) for c in digits)
+
+
+def _fullwidth(digits: str) -> str:
+    return "".join(chr(0xFF10 + int(c)) for c in digits)
+
+
+@pytest.mark.parametrize("spell", [_arabic, _fullwidth])
+def test_a_source_ref_in_NON_ASCII_digits_names_no_issue(spell):
+    assert ii._SOURCE_REF_RE.findall(f"gh#{spell('123')}") == []
+    assert ii._SOURCE_REF_RE.findall(f"gh#12{spell('3')}") == [], "run-on cut short to gh#12"
+    assert ii._SOURCE_REF_RE.findall("gh#123") == ["123"], "control"
+
+
+@pytest.mark.parametrize("spell", [_arabic, _fullwidth])
+def test_a_merged_PR_naming_its_issue_in_NON_ASCII_digits_claims_nothing(spell):
+    for body in (f"Fixes #{spell('123')}", f"Fixes #12{spell('3')}",
+                 f"Source: gh#{spell('123')}", f"Also addresses gh#{spell('123')}"):
+        assert ii._pr_claimed_numbers({"title": "x", "body": body}) == set(), body
+    assert ii._pr_claimed_numbers({"title": f"gh#{spell('123')} fix", "body": ""}) == set()
+    assert ii._pr_claimed_numbers({"title": "gh#7 x", "body": "Fixes #123"}) == {7, 123}, (
+        "control"
+    )
+
+
+@pytest.mark.parametrize("spell", [_arabic, _fullwidth])
+def test_epic_numbers_in_NON_ASCII_digits_match_no_branch_and_no_row(spell):
+    assert ii._EPIC_NUM_RE.findall(f"e{spell('1234')}-x") == []
+    assert ii._EPIC_NUM_RE.findall(f"e123{spell('4')}-x") == [], "run-on cut short to e123"
+    assert ii._ROW_EPIC_RE.match(f"E-{spell('1234')}-x") is None
+    assert ii._ROW_EPIC_RE.match(f"E-123{spell('4')}") is None
+    assert ii._EPIC_NUM_RE.findall("e1234-x") == ["1234"], "control"
+    assert ii._ROW_EPIC_RE.match("E-1234-x").group(1) == "1234", "control"
+
+
+def test_a_PR_and_a_row_both_spelling_the_epic_in_NON_ASCII_digits_name_no_fixer():
+    """Both sides used to agree on the same non-ASCII digits, so the row's seat was credited."""
+    row = ii._registry.QueueRow(f"E-{_arabic('1234')}-x", "other", "lead", "lead-dev",
+                                "done", "-", "")
+    pr = {"headRefName": f"e{_arabic('1234')}-x", "body": ""}
+    assert ii.fixers(pr, [row]) == frozenset()
+
+
+def test_the_log_row_read_rejects_exactly_what_the_shared_Queue_predicate_rejects(
+    tmp_path, monkeypatch,
+):
+    (tmp_path / "registry-log.md").write_text(
+        "| E-0768 | toy | lead | lead-dev | done | - | |\n"
+        "| E-0769 | toy | lead | jr-dev-1 | done | - | |\n",
+        encoding="utf-8",
+    )
+    rows, _ = ii.read_queue_rows(tmp_path)
+    assert {r.id for r in rows} == {"E-0768", "E-0769"}, "control: the predicate accepts both"
+
+    rule = ii._registry._ROW_KEY_RULES["Queue"]
+    monkeypatch.setitem(ii._registry._ROW_KEY_RULES, "Queue",
+                        (lambda key: key != "E-0768" and rule[0](key), *rule[1:]))
+    rows, _ = ii.read_queue_rows(tmp_path)
+    assert {r.id for r in rows} == {"E-0769"}, "a Queue key check bypassed registry._row_key_ok"
+
+
+@pytest.mark.parametrize("number", ["\u0661\u0662", "\uff11\uff12", "\xb2"],
+                         ids=["arabic-indic", "fullwidth", "superscript"])
+def test_an_issue_number_in_NON_ASCII_digits_is_refused_not_coerced(number):
+    """`str.isdigit` took these: `int()` read the first two as 12 and raised a bare ValueError
+    on the superscript, which no caller catches as a refusal (gh#1123)."""
+    with pytest.raises(IssueIntakeError):
+        ii._parse_issue({"number": number, "title": "x", "labels": []})
+    assert ii._parse_issue({"number": "12", "title": "x", "labels": []}).number == 12, "control"

@@ -23,8 +23,8 @@ Four labels drive the fleet (exact, case-sensitive matches):
                          whose frontmatter ``source:`` names ``gh#N``
                          (dev-manager §3.4 reads these)
     builder_selectable — ``triaged`` AND NOT ``epic`` AND NOT ``in-progress``
-                         AND NOT ``needs-decision`` (lead-dev section 2 steps
-                         3.5 and 4 build only these)
+                         AND NOT ``needs-decision`` AND NOT held on the board
+                         (lead-dev section 2 steps 3.5 and 4 build only these)
     label_claimed      — ``triaged`` AND NOT ``epic`` AND ``in-progress``:
                          held work, kept visible so a claimed bug never falls
                          out of every view at once
@@ -32,16 +32,26 @@ Four labels drive the fleet (exact, case-sensitive matches):
                          AND NOT ``in-progress``: waiting on a human's product
                          call, not on a builder (gh#446)
 
-The last three partition bug work (``triaged`` AND NOT ``epic``) exactly: every
-such issue is in one of builder_selectable, label_claimed or awaiting_decision,
-and in only one. Claimed wins over awaiting, because held work is live work.
+Over the labels alone (no held set), the last three partition bug work
+(``triaged`` AND NOT ``epic``) exactly: every such issue is in one of
+builder_selectable, label_claimed or awaiting_decision, and in only one. Claimed
+wins over awaiting, because held work is live work.
 
-NOTHING IN THIS REPOSITORY WRITES ``in-progress`` ON ITS OWN YET. The ``claim``
-and ``release`` subcommands below are the mechanism, but no loop's ``SKILL.md``
-is instructed to run either, so on today's tree the exclusion is inert and
-``builder_selectable`` returns exactly what it returned before. Deciding WHICH
-lane runs ``claim`` — the builder at branch creation, or the foreman when it
-hands the issue out — is gh#56's follow-up and is a prose change, not this one.
+The board is the gate; the marker is a second, optional one. An issue is HELD when
+its ``gh#N`` (any case, or a bare ``#N`` not written as a PR) appears in the work item of a ``## Queue`` row that is not terminal
+(``done``/``withdrawn``) or in an ``## Agents`` row that is not ``idle`` - published to a
+lane or being built. ``held_issue_numbers`` is that predicate, defined once here, and every view
+reads it: the ``selectable`` CLI subtracts it before printing, the bug mirror's In
+flight group shows it, and ``fleet_report`` WORK's bug columns split on it. A
+registry that is missing or will not parse makes ``selectable`` refuse rather than
+offer held work. Notes do not count: a ``gh#N`` in a note says nothing about who is
+building it.
+
+NOTHING IN THIS REPOSITORY WRITES ``in-progress`` ON ITS OWN YET. The label stays
+honoured as above, and the ``claim`` and ``release`` subcommands below are its
+mechanism, but no loop's ``SKILL.md`` is instructed to run either. Because the held
+set is read from the registry, lead-dev's own publish is what takes an issue off the
+list, and no lane has to write a label for that to happen.
 
 Every process boundary is loud: a non-zero exit, a missing binary or malformed
 JSON raises ``IssueIntakeError``. Tests inject ``runner``; the default shells
@@ -66,6 +76,7 @@ from typing import Callable, Iterable, Optional
 
 import yaml
 
+from agentflow import registry as _registry
 from agentflow.stream_report import describe_streams
 
 TRIAGED_LABEL = "triaged"
@@ -82,6 +93,16 @@ IN_PROGRESS_LABEL = "in-progress"
 #: whoever files or triages the issue, removed at disposition once the call is made (gh#446).
 NEEDS_DECISION_LABEL = "needs-decision"
 
+#: The one Agents status whose row does NOT hold the issues it cites. Everything else holds,
+#: including a state added to the registry later and a status cell written off-enum: a
+#: damaged cell must never shrink the held set.
+_NON_HOLDING_AGENT_STATE = "idle"
+
+
+def _agent_row_holds(status: str) -> bool:
+    """True unless the row is idle, read the way worktree_remove reads a status cell."""
+    return status.strip().strip("`").strip().lower() != _NON_HOLDING_AGENT_STATE
+
 _TRACKER_KINDS = {"github-issues", "gitea"}
 _TRACKER_CLIS = {"gh", "glab"}
 _LIST_FIELDS = "number,title,labels,body,url"
@@ -89,12 +110,20 @@ _CLI_TIMEOUT = 60  # seconds; a wedged tracker CLI must never hang a wake
 
 #: How many open issues one read may answer for. Readers that must be complete ask the tracker
 #: for ONE MORE row than this and refuse when it comes back (gh#714): exactly this many open
-#: issues is a complete read, and only the extra row proves some are past the page. Raise it
-#: when the tracker legitimately outgrows it. `fleet_report`'s own `issue_limit` is a separate
-#: knob: that reader reports saturation beside its counts rather than refusing.
+#: issues is a complete read, and only the extra row proves some are past the page. This is
+#: the DEFAULT: the CLI reads the project's ``work_source.open_issue_page``, so a tracker that
+#: legitimately outgrows it is a profile edit and never a flag a seat could pass on its own.
+#: `fleet_report`'s own `issue_limit` is a separate knob: that reader reports saturation
+#: beside its counts rather than refusing.
 OPEN_ISSUE_PAGE = 200
+#: The profile key that sets the page; named in every refusal so the way out is on screen.
+OPEN_ISSUE_PAGE_KEY = "work_source.open_issue_page"
 
-_SOURCE_REF_RE = re.compile(r"gh#(\d{1,9})(?!\d)")  # bounded: int() refuses >4300-digit strings
+#: Every id and ref pattern in this module takes ASCII digits only (`[0-9]`, never `\d`;
+#: gh#1123): `\d` takes any Unicode decimal digit and `int()` reads those too, so `gh#` followed
+#: by Arabic-Indic digits named a real issue. A trailing `(?!\d)` or Unicode `\b` stays, so a
+#: non-ASCII run-on refuses the whole ref instead of yielding its ASCII prefix.
+_SOURCE_REF_RE = re.compile(r"gh#([0-9]{1,9})(?!\d)")  # bounded: int() refuses >4300-digit strings
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.DOTALL)
 _SOURCE_KEY_RE = re.compile(r"^source:(.*)$")
 
@@ -183,9 +212,13 @@ def _issue_number(value) -> int:
     would silently truncate to the WRONG issue — either would send a label to the
     wrong row. ``int(float("inf"))`` raises OverflowError, which is neither
     TypeError nor ValueError, so coercion cannot be the guard.
+
+    A string counts only when it is ASCII digits (gh#1123): ``str.isdigit`` also accepts
+    Arabic-Indic digits, which ``int()`` reads, and superscripts like ``'\u00b2'``, on which
+    ``int()`` raises a bare ValueError instead of this module's refusal.
     """
     if isinstance(value, bool) or not isinstance(value, int):
-        if isinstance(value, str) and value.strip().isdigit():
+        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
             value = int(value)
         else:
             raise IssueIntakeError(f"issue row has a non-integer 'number': {value!r}")
@@ -320,6 +353,7 @@ def _find_open_issue(
     cli: str,
     runner: Optional[Runner] = None,
     limit: int = OPEN_ISSUE_PAGE,
+    profile: str = "the project profile",
 ) -> Issue:
     """The one open issue numbered ``number``, or a loud refusal naming WHY it was not found.
 
@@ -334,11 +368,12 @@ def _find_open_issue(
     for issue in issues:
         if issue.number == number:
             return issue
-    _refuse_past_the_page(issues, limit, host_ref, f"issue #{number} is not among")
+    _refuse_past_the_page(issues, limit, host_ref, f"issue #{number} is not among", profile)
     raise IssueIntakeError(f"no open issue #{number} on {host_ref}")
 
 
-def _refuse_past_the_page(issues: list, page: int, host_ref: str, lead: str) -> None:
+def _refuse_past_the_page(issues: list, page: int, host_ref: str, lead: str,
+                          profile: str = "the project profile") -> None:
     """Raise when ``issues`` holds more than ``page`` rows: some open issues are past the page.
 
     The caller asks the tracker for ``page + 1`` rows, so the extra row is PROOF of
@@ -350,11 +385,16 @@ def _refuse_past_the_page(issues: list, page: int, host_ref: str, lead: str) -> 
     issues, and a list mode that printed the page anyway would drop exactly the issues that
     have waited longest, with exit 0 (gh#714). ``fleet_report`` is deliberately not a caller:
     it renders the saturation next to the counts instead of refusing.
+
+    The refusal names its own way out: the page is ``work_source.open_issue_page`` in
+    ``profile``. Without that, the only visible move is retrying a read that cannot succeed.
     """
     if len(issues) > page:
         raise IssueIntakeError(
             f"{lead} the first {page} open issues on {host_ref}; more are open than that, "
-            "so the page came back full and 'absent' and 'past the page' are indistinguishable"
+            "so the page came back full and 'absent' and 'past the page' are indistinguishable. "
+            f"If that many are legitimately open, raise {OPEN_ISSUE_PAGE_KEY} (now {page}) "
+            f"in {profile}; retrying will not help"
         )
 
 
@@ -492,7 +532,8 @@ def spec_linked_issue_numbers(refine_dir) -> set[int]:
         if not spec.is_file():
             continue
         try:
-            text = spec.read_text(encoding="utf-8", errors="replace")
+            # utf-8-sig, like plan_parser: a BOM before `---` hides the frontmatter (gh#1000).
+            text = spec.read_text(encoding="utf-8-sig", errors="replace")
         except OSError as e:
             raise IssueIntakeError(f"could not read {spec}: {type(e).__name__}: {e}") from e
         m = _FRONTMATTER_RE.match(text)
@@ -526,28 +567,93 @@ def _triaged_bug_work(issues: Iterable[Issue]) -> list[Issue]:
     return [i for i in issues if TRIAGED_LABEL in i.labels and EPIC_LABEL not in i.labels]
 
 
-def builder_selectable(issues: Iterable[Issue]) -> list[Issue]:
-    """Issues a builder may pick up: ``triaged``, not ``epic``, not awaiting a decision, and
-    not already claimed.
+def held_refs(reg) -> list[str]:
+    """The registry cells that put an issue on the board: THE held predicate's surfaces.
 
-    Four exclusions, four different reasons:
+    The work and phase of every live ``## Agents`` row (``building``, ``waiting`` or
+    ``halted``), and the id and work item of every ``## Queue`` row whose state is not
+    terminal. An unclaimed ``ready`` row counts: publishing a row is what hands its work out,
+    so an issue waiting in a lane is as taken as one being built. An ``idle`` Agents row does
+    not: its phase records the work it finished, so counting it kept a shipped issue held
+    until the next unrelated status write. A ``done`` or ``withdrawn`` row does not, whoever
+    claimed it, and neither does the row's notes cell or a coordination Note - a ``gh#N``
+    there says nothing about who is building it.
+
+    Every view reads this one list, so the selector, the mirror and the report cannot disagree
+    about which issues are held.
+    """
+    refs = [f"{r.work} {r.phase}" for r in reg.agents.values()
+            if _agent_row_holds(r.status)]
+    refs += [f"{r.id} {r.work_item}" for r in reg.queue.values()
+             if r.state not in _registry.TERMINAL_QUEUE_STATES]
+    return refs
+
+
+def ref_numbers(refs: Iterable[str]) -> set[int]:
+    """Every issue reference in ``refs`` - ``gh#N`` in any case, or a bare ``#N`` - matched
+    whole: a number never matches as the prefix of a longer one. ``PR#N`` / ``PR #N`` do not
+    count (``registry.HELD_REF_RE``). Spec ``source:`` parsing keeps the strict
+    ``_SOURCE_REF_RE``: this wider read is for the held predicate only."""
+    return {int(m) for raw in refs for m in _registry.HELD_REF_RE.findall(raw or "")}
+
+
+def held_issue_numbers(reg) -> frozenset[int]:
+    """Issue numbers held on the parsed board ``reg``: published to a lane or being built."""
+    return frozenset(ref_numbers(held_refs(reg)))
+
+
+def read_board(registry_path):
+    """The parsed registry at ``registry_path`` for a held-set reader, or ``IssueIntakeError``.
+
+    Refuses on a missing file, an unreadable one, or one whose Agents or Queue table is gone.
+    An empty held set is what a free board looks like, so a board that could not be read must
+    never produce one: the selector would then offer every held issue as free. Every held-set
+    reader goes through here, so the selector and the mirror cannot read one board two ways.
+
+    Also refuses when an Agents or Queue row fails validate's row-shape checks (wrong cell
+    count, key on more than one row): the parser drops the first and keeps only the last of
+    the second, so a held row would vanish from the held set without a trace (gh#1000).
+    """
+    path = Path(registry_path)
+    try:
+        return _registry.read_registry_checked(path, rows=("Agents", "Queue"))
+    except _registry.RegistryError as e:
+        raise IssueIntakeError(
+            f"registry at {path} could not be read, so held work cannot be told from free "
+            f"work: {e}"
+        ) from e
+
+
+def read_held_set(registry_path) -> frozenset[int]:
+    """``held_issue_numbers`` of the registry at ``registry_path``, or ``IssueIntakeError``."""
+    return held_issue_numbers(read_board(registry_path))
+
+
+def builder_selectable(issues: Iterable[Issue], held: Iterable[int] = frozenset()) -> list[Issue]:
+    """Issues a builder may pick up: ``triaged``, not ``epic``, not awaiting a decision, not
+    carrying the claim marker, and not held on the board.
+
+    Five exclusions, five different reasons:
 
         not ``triaged``      — nobody has dispositioned it yet (dev-manager §3.4)
         ``epic``             — promotion to an epic is a human gate, not build work
         ``needs-decision``   — a product call must come first - a human gate, not build
                                work, like epic (gh#446)
-        ``in-progress``      — a lane already holds it (gh#56)
+        ``in-progress``      — a lane holds it by label
+        in ``held``          — its ``gh#N`` is on the board: published to a lane or being
+                               built (``held_issue_numbers``)
 
-    The ``in-progress`` clause had no expression here at all until gh#56. On 2026-08-31 a lane was mid-build
-    on an issue with a live worktree and ten modified files and this function still offered
-    it; the only mitigation available was stripping ``triaged`` by hand, which overloads a
-    triage-state label to mean availability and destroys the record that the issue was ever
-    triaged. NOTE, and this is the honest limit of the change: no loop skill is instructed to
-    run ``claim``/``release`` yet, so nothing writes the marker and this clause is inert on
-    today's tree. Wiring it is gh#56's follow-up (see the module docstring).
+    ``held`` is the gate that actually fires. The ``in-progress`` marker is honoured, but no
+    loop skill runs ``claim``/``release``, so nothing writes it; the board is written by every
+    publish and claim, so reading it is what keeps an issue that is already handed out from
+    being offered a second time. ``held`` defaults to empty so a caller that passes only
+    issues gets the label-only answer it always got; the ``selectable`` CLI passes the
+    project's board.
     """
+    held = frozenset(held)
     return [i for i in _triaged_bug_work(issues)
-            if IN_PROGRESS_LABEL not in i.labels and NEEDS_DECISION_LABEL not in i.labels]
+            if IN_PROGRESS_LABEL not in i.labels and NEEDS_DECISION_LABEL not in i.labels
+            and i.number not in held]
 
 
 def label_claimed(issues: Iterable[Issue]) -> list[Issue]:
@@ -597,7 +703,8 @@ _UNWIRED_NOTE = (
 )
 
 
-def _run_claim(mode: str, number: int, host_ref: str, *, kind: str, cli: str, as_json: bool) -> int:
+def _run_claim(mode: str, number: int, host_ref: str, *, kind: str, cli: str, as_json: bool,
+               limit: int = OPEN_ISSUE_PAGE) -> int:
     """The claim/release CLI path. A run that wrote nothing SAYS it wrote nothing.
 
     Four outcomes, four distinct lines. Rendering "claimed" for a claim that was already held
@@ -606,7 +713,7 @@ def _run_claim(mode: str, number: int, host_ref: str, *, kind: str, cli: str, as
     merely found it already taken.
     """
     fn = claim_issue if mode == "claim" else release_issue
-    issue, wrote = fn(number, host_ref, kind=kind, cli=cli)
+    issue, wrote = fn(number, host_ref, kind=kind, cli=cli, limit=limit)
     if mode == "claim":
         verb, change = ("claimed", f"{IN_PROGRESS_LABEL} added") if wrote else \
             ("already claimed", "nothing written")
@@ -681,18 +788,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             return _run_close(env, proj, args.project, project_dir / "design" / "specs",
                               project_dir / "status", actor=args.actor, number=args.issue,
                               comment_file=args.comment_file, dry_run=args.dry_run)
+        page = proj.work_source.open_issue_page
         if args.mode in _CLAIM_MODES:
             return _run_claim(
                 args.mode, args.issue, proj.canonical_repo.host_ref,
-                kind=proj.work_source.kind, cli=env.git_host.cli, as_json=args.json,
+                kind=proj.work_source.kind, cli=env.git_host.cli, as_json=args.json, limit=page,
             )
         host_ref = proj.canonical_repo.host_ref
         issues = list_open_issues(host_ref, kind=proj.work_source.kind, cli=env.git_host.cli,
-                                  limit=OPEN_ISSUE_PAGE + 1)
+                                  limit=page + 1)
         # Every list mode answers "which open issues are X", and a truncated page answers it
         # wrongly for the oldest ones. Refuse rather than print a list that looks complete.
-        _refuse_past_the_page(issues, OPEN_ISSUE_PAGE, host_ref,
-                              f"refusing `{args.mode}`: it would see only")
+        _refuse_past_the_page(
+            issues, page, host_ref, f"refusing `{args.mode}`: it would see only",
+            f"the project profile {_config.config_home() / 'projects' / (args.project + '.md')}")
         specs_dir = Path(env.data_root) / "projects" / args.project / "design" / "specs"
         if args.mode == "mirror":
             return _run_mirror(env, proj, args.project, issues, specs_dir)
@@ -701,7 +810,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif args.mode == "awaiting":
             selected = awaiting_decision(issues)
         else:
-            selected = builder_selectable(issues)
+            selected = builder_selectable(
+                issues, read_held_set(project_dir / "status" / "registry.md"))
     except (_config.ConfigError, IssueIntakeError) as e:
         print(f"issue_intake: {e}", file=sys.stderr)
         return 1
@@ -763,31 +873,28 @@ def _month_of(closed_at: str) -> str:
 
 
 def in_flight(issues: Iterable[Issue], claimed_refs: Iterable[str]) -> list:
-    """Bug work a lane is currently building, by EITHER claim route.
+    """Bug work that is held: published to a lane or being built, by either route.
 
-    Two routes, and honouring both is what stops them competing:
-
-      * a ``gh#N`` appearing in a claimed registry row — E-0212's route, and still the one
-        with a liveness regime behind it: the registry is reaped, so this route cannot rot;
-      * the ``in-progress`` marker on the issue itself — gh#56's route, and the only one
-        ``builder_selectable`` can see, because that function is handed issues and nothing else.
-
-    The original wording here — *derived from the registry rather than from a label, because a
-    label is a second place to update and the copy is what goes stale* — was widened, not
-    overturned, and the reason it had to be is worth keeping: the registry claim is the RECORD
-    of who is building what; the marker is the GATE that stops a selector offering the issue.
-    They are written at different moments by different mechanisms, so they are not two copies
-    of one fact. Reading only one of them is what would make them disagree in the rendered
-    view, because ``builder_selectable`` already excludes the marker either way.
+    ``claimed_refs`` is ``held_refs`` of the board (or text cut the same way): every ``gh#N``
+    (any case, or a bare ``#N`` not written as a PR) in it is held. The ``in-progress`` marker on the issue is honoured beside it, so a hand
+    ``claim`` still shows here, but nothing writes the marker on its own, and the board is the
+    route that fires. Both views of bug work - the mirror and ``fleet_report`` WORK - build
+    their in-flight column from this, over the same refs, and subtract it from what they offer
+    as selectable, so neither can show an issue as both held and free.
     """
-    refs = set()
-    for raw in claimed_refs:
-        refs.update(int(m) for m in _SOURCE_REF_RE.findall(raw or ""))
+    refs = ref_numbers(claimed_refs)
     return sorted(
         (i for i in _triaged_bug_work(issues)
          if i.number in refs or IN_PROGRESS_LABEL in i.labels),
         key=lambda i: i.number,
     )
+
+
+#: Written at the top of index.md when the mirror could not read the board.
+BOARD_UNREADABLE_BANNER = (
+    "> **Board unreadable - in-flight grouping skipped; the selectable group may include"
+    " held work.** See the mirror's stderr note for why."
+)
 
 
 def render_open_index(
@@ -796,19 +903,32 @@ def render_open_index(
     generated_at: str,
     *,
     claimed_refs: Iterable[str] = (),
+    board_readable: bool = True,
 ) -> str:
-    """The open-bug index, grouped by the states a bug actually moves through."""
+    """The open-bug index, grouped by the states a bug actually moves through.
+
+    ``board_readable=False`` says the board could not be read, so ``claimed_refs`` is empty
+    for want of a board rather than because nothing is held. The index then carries a banner
+    and stops asserting "not on the board": an unread board and an idle fleet render the same
+    groups, and only the banner tells them apart (gh#1000).
+    """
     issues = list(issues)
     flying = in_flight(issues, claimed_refs)
     flying_nums = {i.number for i in flying}
+    if board_readable:
+        flying_gloss = "published to a lane or being built"
+        selectable_gloss = ("`triaged`, not `epic`, not `needs-decision`, not held (no `in-progress`"
+                            " marker and not on the board); lead-dev may claim it")
+    else:
+        flying_gloss = "carrying the `in-progress` marker only - the board was not read"
+        selectable_gloss = ("`triaged`, not `epic`, not `needs-decision`, no `in-progress` marker;"
+                            " the board was not read, so this may include held work - check the"
+                            " board before claiming")
     groups = [
-        ("In flight", "a lane is building it now", flying),
-        ("Triaged - selectable",
-         "`triaged`, not `epic`, not `needs-decision`, not claimed (no `in-progress` marker"
-         " and no registry claim); lead-dev may claim it",
-         [i for i in builder_selectable(issues) if i.number not in flying_nums]),
-        # Registry-claimed rows are filtered here as in selectable: in_flight honours both
-        # claim routes, awaiting_decision can only see the marker.
+        ("In flight", flying_gloss, flying),
+        ("Triaged - selectable", selectable_gloss, builder_selectable(issues, flying_nums)),
+        # Held rows are filtered here as in selectable: in_flight reads the board and the
+        # marker, awaiting_decision can only see the marker.
         ("Awaiting a decision",
          "`triaged` and `needs-decision`, not claimed; a human must make the product call"
          " and record it on the issue - not build work until then",
@@ -817,6 +937,8 @@ def render_open_index(
     ]
 
     out = ["# Open bugs", "", _DO_NOT_EDIT, "", f"{GENERATED_AT_PREFIX}{generated_at} -->", ""]
+    if not board_readable:
+        out += [BOARD_UNREADABLE_BANNER, ""]
     for heading, gloss, rows in groups:
         out.append(f"## {heading} ({len(rows)})")
         out.append("")
@@ -904,7 +1026,8 @@ def _run_mirror(env, proj, project: str, issues, specs_dir) -> int:
 
     wrote, left = [], []
     index = bugs_dir / "index.md"
-    body = render_open_index(issues, linked, stamp, claimed_refs=claimed)
+    body = render_open_index(issues, linked, stamp, claimed_refs=claimed,
+                             board_readable=not claim_note)
     (wrote if write_if_changed(index, body) else left).append(index.name)
 
     month = datetime.now(timezone.utc).strftime("%Y-%m")
@@ -934,32 +1057,27 @@ def _run_mirror(env, proj, project: str, issues, specs_dir) -> int:
 
 
 def _claimed_refs(registry_path) -> tuple:
-    """The registry text a bug can be claimed BY - Agents rows and CLAIMED Queue rows only.
+    """``held_refs`` of the board at ``registry_path``, for the mirror's In flight group.
 
-    Deliberately not the whole board. `in_flight` greps for `gh#N`, and a `gh#N` can appear on
-    the registry in half a dozen places that assert nothing about who is building it: a routed
-    Note, an answered Question, a resolved Blocker, a `done` queue row. Feeding it the raw file
-    marks every one of those "in flight", and `fleet_report._attach_bug_work` - the OTHER
-    rendering of this same fact - restricts to exactly these two surfaces. Two views of one
-    fact disagreeing is the drift this whole mirror exists to prevent, so they read the same
-    rows or the mirror is not worth having.
+    The same surfaces ``fleet_report._attach_bug_work`` and the ``selectable`` CLI read, through
+    the same ``read_board`` (the fleet report via ``fleet_report._read_held_board``, which
+    marks its bug side "registry claim check never ran" when the board is refused), so the
+    three cannot disagree about which issues are held. Not the whole board: a ``gh#N`` in a
+    routed Note, an answered Question, a resolved Blocker or a ``done`` row asserts nothing
+    about who is building it.
 
-    Returns (refs, note). A registry that will not parse yields no refs and a NOTE saying so,
-    never silence: with no claims the in-flight group renders empty, which is also what a
-    genuinely idle fleet looks like, and those two must not be indistinguishable.
+    Returns (refs, note). Unlike ``selectable``, the mirror degrades rather than refuses: a
+    board that will not read yields no refs and a NOTE saying so, never silence, because with
+    no refs the in-flight group renders empty, which is also what a genuinely idle fleet looks
+    like, and those two must not be indistinguishable.
     """
     if not registry_path.exists():
         return [], f"no registry at {registry_path}; in-flight grouping skipped"
     try:
-        from . import registry as _registry
-        reg = _registry.parse_registry(registry_path.read_text(encoding="utf-8"))
-    except Exception as e:  # noqa: BLE001 - a half-written board must not kill the mirror
-        return [], f"registry unreadable ({e}); in-flight grouping skipped"
-
-    refs = [f"{r.work} {r.phase}" for r in reg.agents.values()]
-    refs += [f"{r.id} {r.work_item} {r.notes}" for r in reg.queue.values()
-             if r.claimed_by not in ("-", "")]
-    return refs, ""
+        reg = read_board(registry_path)
+    except IssueIntakeError as e:
+        return [], f"{e}; in-flight grouping skipped"
+    return held_refs(reg), ""
 
 
 def list_closed_issues(
@@ -1034,19 +1152,22 @@ _REFUSAL_EXIT = 2
 
 #: Epic numbers, spelled as fleet_report's worktree matcher accepts them (``E-0890``,
 #: ``e0890``). Defined here, not imported, because fleet_report imports this module.
-_EPIC_NUM_RE = re.compile(r"(?i)\be-?(\d{3,})")
-_ROW_EPIC_RE = re.compile(r"^E-(\d{3,})")
+_EPIC_NUM_RE = re.compile(r"(?i)\be-?([0-9]{3,})(?!\d)")
+_ROW_EPIC_RE = re.compile(r"^E-([0-9]{3,})(?!\d)")
 #: GitHub's nine closing keywords, and nothing broader: "closing #12" closes nothing.
 _CLOSE_KW = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
 _LINE_SOURCE_RE = re.compile(r"^\W{0,4}source\W{0,4}:\W{0,2}(.*)$", re.I)
 _LINE_EPIC_OR_SOURCE_RE = re.compile(r"^\W{0,4}(?:source|epic)\W{0,4}:\W{0,2}(.*)$", re.I)
+#: A grouped PR names each extra issue on an ``Also addresses gh#N`` line; same lead-in
+#: tolerance as ``_LINE_SOURCE_RE``.
+_LINE_ALSO_ADDRESSES_RE = re.compile(r"^\W{0,4}also\s+addresses\b", re.I)
 _LINE_CLOSE_RE = re.compile(
     r"^\W{0,4}" + _CLOSE_KW + r"\W{0,2}\s*:?[\s*_]*"
-    r"((?:gh)?#\d+(?:\s*(?:,|and)\s*(?:gh)?#\d+)*)",
+    r"((?:gh)?#[0-9]+(?!\d)(?:\s*(?:,|and)\s*(?:gh)?#[0-9]+(?!\d))*)",
     re.I,
 )
-_ANY_REF_RE = re.compile(r"(?:gh)?#(\d{1,6})\b", re.I)
-_TITLE_REF_RE = re.compile(r"gh#(\d{1,6})\b", re.I)
+_ANY_REF_RE = re.compile(r"(?:gh)?#([0-9]{1,6})\b", re.I)
+_TITLE_REF_RE = re.compile(r"gh#([0-9]{1,6})\b", re.I)
 _ATTRIBUTION_RE = re.compile(r"^Agentflow \[([^\]\s]+)\]")
 _SPEC_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-")
 _CHECKED_RE = re.compile(r"^Checked against:(.*)$")
@@ -1118,12 +1239,13 @@ class FixClaim:
 
 
 def _pr_claimed_numbers(pr: dict) -> set:
-    """Issue numbers a merged PR claims to fix: title ``gh#N``, a ``Source:`` line, or a line
-    that STARTS with a closing keyword immediately followed by the reference(s)."""
+    """Issue numbers a merged PR claims to fix: title ``gh#N``, a ``Source:`` or ``Also
+    addresses`` line, or a line that STARTS with a closing keyword immediately followed by the
+    reference(s)."""
     hit = {int(n) for n in _TITLE_REF_RE.findall(str(pr.get("title") or ""))}
     for line in str(pr.get("body") or "").splitlines():
         stripped = line.strip()
-        if _LINE_SOURCE_RE.match(stripped):
+        if _LINE_SOURCE_RE.match(stripped) or _LINE_ALSO_ADDRESSES_RE.match(stripped):
             # The whole line, not the capture: the capture's leading \W{0,2} can eat the `#`
             # of a bare `Source: #N`, and the word "source" itself carries no reference.
             hit |= {int(n) for n in _ANY_REF_RE.findall(stripped)}
@@ -1198,7 +1320,8 @@ def done_spec_links(specs_dir) -> list:
         if not spec.is_file():
             continue
         try:
-            text = spec.read_text(encoding="utf-8", errors="replace")
+            # utf-8-sig, like plan_parser: a BOM before `---` hides the frontmatter (gh#1000).
+            text = spec.read_text(encoding="utf-8-sig", errors="replace")
         except OSError as e:
             raise IssueIntakeError(f"could not read {spec}: {type(e).__name__}: {e}") from e
         m = _FRONTMATTER_RE.match(text)
@@ -1303,7 +1426,7 @@ def read_queue_rows(status_dir) -> tuple:
     else:
         for line in log_text.splitlines():
             cells = _registry._cells(line)
-            if cells and len(cells) >= 7 and _registry._E_ID.match(cells[0]):
+            if cells and len(cells) >= 7 and _registry._row_key_ok("Queue", cells[0]):
                 rows.append(_registry.QueueRow(*cells[:7]))
     return rows, "; ".join(notes)
 
@@ -1451,9 +1574,11 @@ def _run_fix_claims(env, proj, project: str, specs_dir, status_dir, *, as_json: 
     if not _tracker_active(kind, cli):
         print(_no_tracker_line(kind, cli))
         return 0
+    # Same configured page as the list modes, so raising the key widens this read too.
+    page = proj.work_source.open_issue_page
     issues, open_capped = _probe_page(
         list_open_issues(host_ref, kind=kind, cli=cli, runner=runner,
-                         limit=OPEN_ISSUE_PAGE + 1), OPEN_ISSUE_PAGE)
+                         limit=page + 1), page)
     prs, prs_capped = _probe_page(
         list_merged_prs(host_ref, kind=kind, cli=cli, runner=runner,
                         limit=MERGED_PR_LIMIT + 1), MERGED_PR_LIMIT)
@@ -1478,7 +1603,7 @@ def _run_fix_claims(env, proj, project: str, specs_dir, status_dir, *, as_json: 
     summary = (
         f"fix-claims: {len(records)} open issue(s) claimed fixed, {unchecked} unchecked; "
         f"{len(issues)} open issue(s) read"
-        + (f" (capped at {OPEN_ISSUE_PAGE})" if open_capped else "")
+        + (f" (capped at {page})" if open_capped else "")
         + f", {len(prs)} merged PR(s) read"
         + (f" (capped at {MERGED_PR_LIMIT})" if prs_capped else "")
         + (f"; registry: unread ({reg_note})" if reg_note else "")
@@ -1489,7 +1614,7 @@ def _run_fix_claims(env, proj, project: str, specs_dir, status_dir, *, as_json: 
             "summary": {
                 "claimed": len(records), "unchecked": unchecked,
                 "open_read": len(issues), "open_capped": open_capped,
-                "open_limit": OPEN_ISSUE_PAGE,
+                "open_limit": page,
                 "merged_read": len(prs), "merged_capped": prs_capped,
                 "merged_limit": MERGED_PR_LIMIT,
                 "registry_note": reg_note, "line": summary,

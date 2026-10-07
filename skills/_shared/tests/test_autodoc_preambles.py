@@ -81,7 +81,7 @@ def _yaml_path(p: Path) -> str:
 # Everything a preamble reads or emits. Stripped from the inherited environment so the host
 # session's own project, config home or carrier values can never decide a case.
 _SCRUB = ("AUTODOC", "AUTODOC_PROJECT", "AUTODOC_ENV", "PROJECT", "SUITE_ROOT", "REPO", "BRANCH",
-          "REPO_STEM", "RENDER_TARGET", "PYTHONPATH")
+          "REPO_STEM", "RENDER_TARGET", "PYTHONPATH", "GIT_HOST_KIND", "LOCAL_CHECKOUT")
 
 
 def _env(home: Path | None, **extra: str) -> dict[str, str]:
@@ -206,6 +206,20 @@ def test_init_resolves_the_named_projects_own_root_over_the_session_default(box,
     )
     assert got["PROJECT"] == project
     assert got["REPO"] == f"owner/{project}-repo"
+
+
+def test_init_carries_the_git_host_and_local_checkout_step_1_clones_from(box) -> None:
+    """Step 1 picks its clone by host kind and falls back to the local checkout, so the preamble
+    resolves both from config rather than leaving Step 1 to read the session's environment."""
+    tail = 'echo "GIT_HOST_KIND=$GIT_HOST_KIND"; echo "LOCAL_CHECKOUT=$LOCAL_CHECKOUT"\n'
+    r = _run_block(_init_preamble(), box["tmp"], _env(box["home"], AUTODOC_PROJECT="alpha"), tail)
+    assert r.returncode == 0, r.stderr
+    got = _vars(r.stdout)
+    assert got["GIT_HOST_KIND"] == "local"
+    assert got["LOCAL_CHECKOUT"] == box["d"]
+    carrier = Path((box["tmp"] / "tmp" / "autodoc-env.current").read_text(encoding="utf-8").strip())
+    text = carrier.read_text(encoding="utf-8")
+    assert "GIT_HOST_KIND=local" in text and "LOCAL_CHECKOUT=" in text, "not carried to Step 1's block"
 
 
 def test_init_refuses_an_ambiguous_multi_project_box(box) -> None:

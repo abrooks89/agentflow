@@ -375,7 +375,7 @@ def notify(
     task: Optional[int] = None,
     task_total: Optional[int] = None,
     sender: Optional[Sender] = None,
-) -> None:
+) -> bool:
     """POST a minimal notification to ntfy, to the destination the config names.
 
     ``sender`` defaults to the real POST path; inject a fake in tests. Both
@@ -389,8 +389,10 @@ def notify(
     Config supplies the NAMES, the environment supplies the values — nothing here ever
     reads a secret out of a file.
 
-    Returns None either way. A "did it send" return value would be a fourth field
-    nobody reads: every call site in the tree ignores the result.
+    Returns ``True`` when the sender returned without raising (with the default sender,
+    ntfy accepted the POST) and ``False`` when nothing was sent: ``notify.kind: none``, or
+    a missing or empty destination. A raising sender still raises, so ``False`` never
+    means "the POST failed". ``True`` is not a claim that a human read the push.
     """
     resolved = _resolved_notify()
 
@@ -403,13 +405,13 @@ def notify(
     # below the ASCII gate for the same reason the env check does: a bad body must be
     # loud on a box with notifications switched off, not only in production.
     if resolved.kind == "none":
-        return
+        return False
 
     base = _env_value(resolved.url_env)
     topic = _env_value(resolved.topic_env)
     if not base or not topic:
         _warn_not_sent(resolved, trigger, epic, base=base, topic=topic)
-        return
+        return False
 
     # A send is about to happen through names the operator did not choose. Said before
     # the send, not after, so a sender that raises does not take the disclosure with it.
@@ -432,6 +434,7 @@ def notify(
     )
     active = sender if sender is not None else _urlopen_sender
     active(f"{base.rstrip('/')}/{topic}", headers, detail.encode("ascii"))
+    return True
 
 
 def notify_once(
@@ -444,19 +447,19 @@ def notify_once(
     """Send a notification only if the same key has not been sent recently.
 
     Uses ``was_notification_sent_recently`` to gate on ``state.notifications_sent``,
-    then calls ``notify(trigger_type, **kwargs)`` and records the send via
-    ``record_notification_sent``. ``kwargs`` passes straight through, so ``sender=``
-    is injectable here too.
+    then calls ``notify(trigger_type, **kwargs)`` and records the key via
+    ``record_notification_sent`` only when ``notify()`` returned ``True``. ``kwargs``
+    passes straight through, so ``sender=`` is injectable here too.
 
     Returns:
-        True  — not suppressed by dedup, so a send was ATTEMPTED.
+        True  — not suppressed by dedup, so notify() was called.
         False — suppressed because the key was sent within ``dedup_window_seconds``.
 
-    ``True`` is not a delivery receipt and never was: ``notify()`` returns None whether
-    it sent or skipped, so a key is recorded even when the environment named no
-    destination — and, since gh#133, when ``notify.kind: none`` suppressed the send.
-    This function's contract is dedup, not delivery. Making it delivery-aware needs a
-    return value from ``notify()``, which is tracked separately.
+    ``True`` is not a delivery receipt: it means only that dedup did not suppress the
+    call. The KEY, though, is recorded only for a send ``notify()`` reports as made, so a
+    call that found no destination, or ran under ``notify.kind: none``, leaves no record
+    and the next call is attempted again instead of being suppressed for the whole
+    window. A raising sender propagates before the record, so it leaves none either.
 
     Important:
         This function does NOT call ``write_status``. The caller is responsible for
@@ -473,6 +476,6 @@ def notify_once(
     if was_notification_sent_recently(state, key, dedup_window_seconds):
         return False
 
-    notify(trigger_type, **kwargs)
-    record_notification_sent(state, key)
+    if notify(trigger_type, **kwargs):
+        record_notification_sent(state, key)
     return True

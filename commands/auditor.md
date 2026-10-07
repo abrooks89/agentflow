@@ -1,5 +1,5 @@
 ---
-description: Thin wrapper that forwards $ARGUMENTS into the auditor skill. Exists so the self-paced ScheduleWakeup continuation string (`/auditor $ARGUMENTS`) stays a valid slash command — delegated bare skill invocation is unreliable, so each wake re-enters through this command. Both the optional `--project <name>` selector and the pass target (`--once`, `--re-audit <slug>`, or an explicit epic) ride through as `$ARGUMENTS`.
+description: Thin wrapper that forwards $ARGUMENTS into the auditor skill. Exists so the self-paced ScheduleWakeup continuation string (`/auditor --project <name> <target>`, composed from the resolved values) stays a valid slash command — delegated bare skill invocation is unreliable, so each wake re-enters through this command. Both the optional `--project <name>` selector and the pass target (`--once`, `--re-audit <slug>`, or an explicit epic) ride through as `$ARGUMENTS`.
 ---
 
 Invoke the `auditor` skill (the post-build intent-feedback loop), forwarding this wake's arguments verbatim.
@@ -14,7 +14,8 @@ treats only the remainder as the target, so a bare `--project agentflow` means "
 project's normal window" and never becomes a phantom epic slug.
 
 Run: `Skill(auditor, args="$ARGUMENTS")` — carry `$ARGUMENTS` through unchanged so the auditor loop's
-self-paced wake continuation (`ScheduleWakeup(prompt="/auditor $ARGUMENTS")`) re-enters the same
+self-paced wake continuation (`ScheduleWakeup(prompt="/auditor --project <name> <target>")`, written as literal text from
+the values the skill's Step 0 resolved — never the `$ARGUMENTS` token, which does not expand on a self-wake) re-enters the same
 entry with BOTH the project selector and the target intact. A continuation that drops
 `--project <name>` silently reverts to the session's injected default on the very next wake —
 the loop starts auditing a different project's epics. Then follow the skill's procedure to

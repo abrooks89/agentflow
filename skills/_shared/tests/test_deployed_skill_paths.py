@@ -97,7 +97,7 @@ than none, and this repo has a filed issue that is exactly that mistake:
   token needs no file extension, because `scripts/review-package` has none. A PROSE or FENCED
   token must end in an extension the installer actually deploys, because prose is full of
   slash-bearing non-paths (`and/or`, `24h/72h`, `PASS/FAIL`, `pro/con`). The noise it removes is
-  named rather than tallied: `report/ledger`, `solution/plan`, `jr-dev-1/jr-dev-2` — agentflow
+  named rather than tallied: `report/ledger`, `solution/plan` — agentflow
   names skills after ordinary English nouns — and `install/scaffold`, because `install/` is a
   repo-root DIRECTORY, not a skill. Reading source files (gh#171) added
   `report/summarized_at_sha`, two dict keys slash-joined in a code comment: a comment
@@ -633,7 +633,7 @@ def _candidate_paths(
     are alternations (`and/or`, `spec/plan`, `PASS/FAIL`), ratios (`3/3`, `24h/72h`), slash
     commands (`/project`) and XML-ish tags. The filters this module already had take out the rest
     of that noise. What still reaches candidacy does so because agentflow's skills are named after
-    ordinary nouns (`report/ledger`, `solution/plan`, `jr-dev-1/jr-dev-2`) or because a repo-root
+    ordinary nouns (`report/ledger`, `solution/plan`) or because a repo-root
     directory shares a noun's name (`install/scaffold`) — their heads ARE real directory names.
     That surviving set is named and asserted by
     `test_the_extension_rule_costs_what_the_docstring_says`; it is not counted here.
@@ -1609,7 +1609,6 @@ def test_the_extension_rule_costs_what_the_docstring_says() -> None:
     alternations = {
         "report/ledger",
         "solution/plan",
-        "jr-dev-1/jr-dev-2",
         "install/scaffold",
         "report/summarized_at_sha",
         "agentflow/vault",

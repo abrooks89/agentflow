@@ -137,6 +137,14 @@ _SERVICE_PORT_RE = re.compile(r"(localhost:\d+|(?<!\w):\d+)")
 _FILE_ANNOTATION_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
 
+def _read_frontmatter_text(path: Path) -> str:
+    # utf-8-sig, not utf-8: a Windows editor or PowerShell redirect can save the file with a
+    # byte-order mark, which plain utf-8 keeps as a leading U+FEFF. That character sits before
+    # the opening `---`, so the anchored frontmatter match fails and a valid file reads as
+    # having no frontmatter. utf-8-sig drops a leading BOM and decodes BOM-less files unchanged.
+    return path.read_text(encoding="utf-8-sig")
+
+
 def _slug_from_filename(path: Path) -> str:
     """Derive a slug from a filename stem by stripping date prefix and -design suffix."""
     stem = path.stem  # basename without extension
@@ -206,7 +214,7 @@ def extract_external_references(plan: PlanFrontmatter) -> ExternalReferences:
 
 
 def parse_plan(path: Path) -> PlanFrontmatter:
-    text = path.read_text(encoding="utf-8")
+    text = _read_frontmatter_text(path)
     match = _FRONTMATTER_RE.match(text)
     if not match:
         raise DAGError(f"No YAML frontmatter found in {path}")
@@ -361,7 +369,7 @@ def parse_spec_frontmatter(path: Path) -> SpecFrontmatter:
 
     Raises SpecFormatError when no frontmatter block is found.
     """
-    text = path.read_text(encoding="utf-8")
+    text = _read_frontmatter_text(path)
     match = _FRONTMATTER_RE.match(text)
     if not match:
         raise SpecFormatError(f"No YAML frontmatter found in {path}")
@@ -488,6 +496,71 @@ def compute_ready_set(
         if all(dep in done for dep in task.deps):
             ready.append(tid)
     return sorted(ready)
+
+
+# --------------------------------------------------------------------------- #
+# Plan and board task sets: the board follows the plan on every wake
+# --------------------------------------------------------------------------- #
+ORPHAN_ESCALATION_TEMPLATE = (
+    "task {tid} is on the board but no longer in the plan: "
+    "remove it from status.md or restore it to the plan"
+)
+
+
+def orphan_escalation_text(tid: int) -> str:
+    """The escalation for a non-done task that is on the board but not in the plan.
+
+    It names the task and the two edits that clear it. It is never phrased as a dependency
+    deadlock, because no dependency edge is involved.
+    """
+    return ORPHAN_ESCALATION_TEMPLATE.format(tid=tid)
+
+
+@dataclass(frozen=True)
+class BoardReconcile:
+    """What `reconcile_board` changed and what it found but may not change."""
+
+    added: tuple[int, ...] = ()
+    orphaned_open: tuple[int, ...] = ()
+    orphaned_done: tuple[int, ...] = ()
+
+
+def reconcile_board(plan: PlanFrontmatter, state) -> BoardReconcile:
+    """Bring `state.tasks` (a `status_writer.StatusState`) in line with `plan.tasks`.
+
+    The ready set comes from the plan and every state write goes through the board, which
+    bootstrap fills once. A plan edited after bootstrap therefore needs the two sets
+    reconciled before anything computes or writes a ready task:
+
+    - a task only in the plan joins the board as `pending` with its plan phase, and a tier-1
+      decision names it (automatic bookkeeping, the tier the other self-recorded events use);
+    - a task only on the board is reported, never removed: `orphaned_open` when it is not
+      `done` (the caller halts the epic with `orphan_escalation_text`), `orphaned_done`
+      otherwise (the caller logs it and leaves it alone).
+
+    Mutates `state` in memory only; the caller persists it. Identical sets change nothing.
+    """
+    # Imported here, not at module top: status_writer imports this module at load time, so a
+    # top-level import in either direction leaves one of them partially initialised.
+    from agentflow.status_writer import TaskState, append_decision
+
+    added = tuple(sorted(set(plan.tasks) - set(state.tasks)))
+    for tid in added:
+        phase = plan.tasks[tid].phase
+        state.tasks[tid] = TaskState(state="pending", phase=phase)
+        append_decision(
+            state,
+            task=tid,
+            tier=1,
+            summary=f"plan gained task {tid} (phase {phase}); added to the board as pending",
+        )
+
+    board_only = sorted(set(state.tasks) - set(plan.tasks))
+    return BoardReconcile(
+        added=added,
+        orphaned_open=tuple(t for t in board_only if state.tasks[t].state != "done"),
+        orphaned_done=tuple(t for t in board_only if state.tasks[t].state == "done"),
+    )
 
 
 def _validate_dag(plan: PlanFrontmatter) -> None:

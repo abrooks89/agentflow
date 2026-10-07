@@ -14,11 +14,18 @@ It reads the registry birth-cert row for the title/epic header. It is a
 show — the tool never claims completeness. It is strictly ADVISORY:
 
     - NEVER edits any file.
-    - NEVER gates / blocks / raises to the caller.
-    - ALWAYS exits 0, even when config is unresolvable or git is absent.
+    - NEVER gates / blocks; ``find_touchpoints`` never raises to the caller.
+    - The CLI exits 0, even when config is unresolvable or git is absent, with
+      ONE exception: an unusable autodoc root (``config.AutodocRootError``: the
+      resolved root has no ``.manifest.json`` while the legacy root still holds
+      a corpus). The CLI then prints the error and its remediation to stderr,
+      prints no report, and exits 2, because a report from the empty root would
+      be a confident zero. The fix is the autodoc root config: move the corpus
+      to the resolved root before repointing config, or clear the legacy root.
 
 Scanning is plain-Python (portable, no ``grep`` binary dependency); git hops
-shell out to ``git`` and degrade to empty on any failure. The opaque id is
+shell out to ``git``, decode its output as UTF-8 whatever the host locale,
+and degrade to empty on any failure. The opaque id is
 matched literally, so it is inert to graph-check (no wikilinks involved).
 """
 from __future__ import annotations
@@ -34,7 +41,8 @@ from typing import Optional
 # Stages in canonical print order (the spine's hop order).
 STAGES = ("refine", "solution", "commits", "code", "flow")
 
-_UC_ID_RE = re.compile(r"^UC-\d{4,}$")
+#: ASCII digits only (gh#1123): `\d` would accept `UC-` followed by Arabic-Indic digits.
+_UC_ID_RE = re.compile(r"^UC-[0-9]{4,}$")
 _GIT_TIMEOUT = 15  # seconds; a wedged git must never hang the advisory tool
 
 
@@ -135,10 +143,16 @@ def _run_git(repo, args: list) -> Optional[str]:
     if not repo_path.is_dir():
         return None
     try:
+        # UTF-8, never the locale default: one unmapped byte raises outside the handler below
+        # (in subprocess's reader thread on Windows, as an uncaught ValueError on POSIX) and
+        # loses the hop. core.quotePath=false keeps a non-ASCII PATH as text, not as the
+        # octal-escaped, quoted form git prints by default.
         proc = subprocess.run(
-            ["git", "-C", str(repo_path), *args],
+            ["git", "-C", str(repo_path), "-c", "core.quotePath=false", *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_GIT_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError):
@@ -281,7 +295,7 @@ def render(report: ImpactReport) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Config-resolving CLI entrypoint — ALWAYS exits 0
+# Config-resolving CLI entrypoint — exits 0, except 2 for an unusable autodoc root
 # --------------------------------------------------------------------------- #
 def _resolve_project_name(explicit, config_home) -> Optional[str]:
     """Explicit arg wins; else the sole project file under config; else None."""
@@ -297,7 +311,11 @@ def _resolve_project_name(explicit, config_home) -> Optional[str]:
 
 
 def main(argv: Optional[list] = None) -> int:
-    """CLI: ``uc-touchpoints UC-0147 [project]``. Advisory — always returns 0."""
+    """CLI: ``uc-touchpoints UC-0147 [project]``. Advisory — returns 0.
+
+    The single exception: an unusable autodoc root (``AutodocRootError``) returns 2
+    with the error's remediation on stderr and no report.
+    """
     # First, before any output: a legacy cp1252 stdout cannot carry a non-cp1252
     # character a lane wrote (gh#574).
     from agentflow._stdio import utf8_stdio
@@ -340,7 +358,7 @@ def main(argv: Optional[list] = None) -> int:
         try:
             autodoc_root = _config.resolve_autodoc_root(env, proj)
         except _config.AutodocRootError as e:
-            # Captured here and re-raised BELOW, outside the degrade-gracefully arm.
+            # Captured here and refused BELOW (exit 2), outside the degrade-gracefully arm.
             # Every other config problem here degrades to a partial report, which is
             # right; this one must not, because the report it would produce is a
             # confident zero from an empty root, and a zero is read downstream as
@@ -350,7 +368,15 @@ def main(argv: Optional[list] = None) -> int:
         print(f"(environment config unavailable: {e})", file=sys.stderr)
 
     if autodoc_error is not None:
-        raise autodoc_error
+        # A deliberate refusal, not a crash: the message carries its own remediation, and a
+        # traceback would read to a seat as a broken tool to retry rather than config to fix.
+        print(
+            "uc-touchpoints: refusing to report from an unusable autodoc root "
+            "(fix the autodoc root config):",
+            file=sys.stderr,
+        )
+        print(f"  {autodoc_error}", file=sys.stderr)
+        return 2
 
     report = find_touchpoints(
         uc_id,

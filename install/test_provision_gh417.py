@@ -131,11 +131,16 @@ def test_unexpanded_percent_var_lock_dir_is_refused_with_an_actionable_hint(
     opts, _ = fresh_box
     _set_lock_dir(opts, tmp_path, "%TEMP%/scratch_gh417")
 
-    provision._do_config_presence(opts)
+    provision._ensure_required_dirs(opts)
 
     err = capsys.readouterr().err
     assert "not pre-creating lock_dir" in err
     assert "write the expanded absolute path" in err
+
+    # Refused pre-creation leaves the relative path missing, so step 2's resolve now stops
+    # the install on it, with the hard-fail wording.
+    with pytest.raises(RuntimeError, match="hard-fail"):
+        provision._do_config_presence(opts)
 
 
 def test_skill_md_tells_the_interview_to_expand_lock_dir():

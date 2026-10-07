@@ -71,6 +71,7 @@ export const contextSpec = {
   recordsPath: 'string — absolute path the agent writes its records JSON to (its ONLY allowed write)',
   communitiesLine: 'string — id:"label" pairs, comma-joined',
   communities: 'array of {id (number), label, memberCount (number), topPrefixes (string, may be empty), topSymbols (string, may be empty), symbols: [{kind, name, file, line}]}',
+  checkRecordsCmd: 'string (optional) — `graph check-records --db <store> --corpus <id>` as a shell command; the agent appends --records <its file> and must re-run it until it exits 0 (gh#465). Empty/absent omits the step',
 };
 
 export const template = `You are mapping ONE work unit (a group of derived code communities) of a codebase into
@@ -188,7 +189,19 @@ STEP 5 — WRITE the records file, then return a light manifest. Write ONE JSON 
   - "covered": the checklist symbols you documented, as
     {community:"<its community id>",name,line}
   - "excluded": {community,name,line,reason} covering every remaining checklist symbol
-Then RETURN only the manifest (the records stay on disk — never inline the bodies):
+{{#if checkRecordsCmd}}Then CHECK the file you just wrote, before returning:
+    {{checkRecordsCmd}} --records "{{recordsPath}}"
+  Exit 0 means every page record is well-formed and every "documents" citation resolves.
+  A non-zero exit prints one PROBLEM line per defect — a wrong kind (copy the kind the line
+  names), an absent symbol (drop the citation), or a kind that is never indexed at all (no
+  such citation can ever resolve: cite the enclosing symbol or leave the file to
+  source_paths). Fix every one, rewrite the file, and re-run until it exits 0. One
+  unresolvable citation makes 'graph records' refuse the WHOLE run after every agent has
+  finished; this check is where it costs you one edit instead.
+  A non-zero exit that prints NO PROBLEM line is not a defect in your file (a missing store,
+  a wrong corpus, a crash): do NOT re-run it. Stop checking, return the manifest as below, and
+  put "CHECK-RECORDS FAILED: <its error output, verbatim>" first in "notes".
+{{/if}}Then RETURN only the manifest (the records stay on disk — never inline the bodies):
   - "unit": "{{unitKey}}"
   - "path": the records file you wrote ({{recordsPath}})
   - "pagesMeta": one {file, type, title, source_paths} row per page record (no bodies)

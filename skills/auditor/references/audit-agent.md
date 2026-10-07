@@ -30,7 +30,8 @@ Caller-supplied context (paste literal, no summaries):
 - `{slug}` — the completed epic under audit.
 - `{refine_doc_path}` + FULL TEXT of the epic's refine design doc.
 - `{solution_doc_path}` + FULL TEXT of the solution doc-of-record (at minimum its
-  `## Use Cases` section, every referenced `## Task N` verification block, and the plan
+  `## Use Cases` section, every referenced `### Task N` verification block (a legacy
+  `## Task N` heading still parses), and the plan
   frontmatter's per-task `verification.test_commands` and top-level `test_commands`, which
   are where the probe commands live).
 - `{autodoc_root}` — path to the managed code-wiki root, RESOLVED for this project
@@ -46,6 +47,11 @@ Caller-supplied context (paste literal, no summaries):
   config's `[product python]` line), or `null` when the project sets none. Bare `python` in a
   fleet session is the agentflow suite venv, not the product's, so a product probe run with it
   can import the wrong dependencies; Part 2 says what to do when this is `null`.
+- `{declared_deps}` — when `{product_python}` is `null`, the caller's once-per-pass check of
+  whether the product's declared distributions are installed under the default `python`: JSON
+  with `source` (`pyproject.toml [project].dependencies`, `requirements.txt`, or `null` when
+  neither declares any), `declared_count`, `missing`, `evidence` and `blocked_on`. `null` when
+  `{product_python}` is set. Part 2's null rule reads it.
 
 ---
 
@@ -61,7 +67,7 @@ Assemble, per UC the epic claims to deliver:
    `Domain:`. This is what the user was promised.
 2. **Technical story + acceptance (Hop 2)** — from the solution doc's `## Use Cases`
    section: the `### UC-NNNN` block's `Functional summary`, `Technical story`, `Domain`,
-   `Owning tasks`. For each owning task, pull that `## Task N` block's `acceptance_criteria`
+   `Owning tasks`. For each owning task, pull that `### Task N` block's `acceptance_criteria`
    — these are the discrete, testable checks the capability must satisfy.
 3. **Current spine status (Hop 3+)** — run `grep -rn "UC-NNNN" {autodoc_root}` per UC id.
    Record where each id lands (flow pages) and the per-UC `Status:` written there
@@ -103,11 +109,26 @@ do not improvise a different one:
   interpreter: a command starting with `pytest` runs as `{product_python} -m pytest ...`, and
   one starting with `python` runs as `{product_python} ...`, arguments unchanged. That swaps the
   interpreter, it does not invent a command.
-- **When `{product_python}` is `null`**, run the command as written under the session's default
-  `python` and put `product interpreter unset; ran under default python` in the evidence. An
-  unset interpreter is a normal project state, not a blocker, and blocking on it would leave
-  every epic of such a project unjudged. If the probe then fails because the interpreter or a
-  third-party dependency is missing, that is the "probe cannot run" blocker (Part 3).
+- **When `{product_python}` is `null`**, read `{declared_deps}` first. An unset interpreter is
+  a normal project state, not a blocker, and blocking on it would leave every epic of such a
+  project unjudged; what decides is whether the product's declared distributions are here.
+  - `missing` is empty: run the command as written under the session's default `python` and put
+    `{declared_deps}`'s `evidence` in the evidence, verbatim. That is
+    `product interpreter unset; ran under default python (declared deps present)` followed by
+    `; versions are not compared` - the check proves presence, not that the installed versions
+    satisfy the product's specifiers - or, when `source` is `null`, the same prefix followed by
+    `(no dependencies declared in pyproject.toml [project] or requirements.txt)`. That form
+    names what was read: a product declaring its dependencies elsewhere has not been shown to
+    have none.
+  - `missing` names any distribution: every Python probe is the "probe cannot run" blocker
+    (Part 3), never `satisfied`. Do not run it to see; a pass under the suite venv would prove
+    nothing about the product. `blocked_on` is `{declared_deps}`'s `blocked_on`, which names
+    the missing distributions and the remedy `set canonical_repo.python in projects/<name>.md`.
+  - `{declared_deps}` is not that JSON (the caller's check could not read a declaration file):
+    the same blocker, with what was pasted as `tried`.
+
+  If a probe that ran then fails because the interpreter or a third-party dependency is
+  missing, that is also the "probe cannot run" blocker (Part 3).
 - Do not hand-wave — execute the actual command and capture its real stdout/stderr.
 - Evidence = the literal probe command run + its captured output tail.
 
@@ -170,7 +191,10 @@ Return the **blocker shape** (below) instead of any verdicts when one of these h
 - **Spec or plan doc missing** — `{refine_doc_path}` or `{solution_doc_path}` is absent or
   empty, so the intent cannot be reconstructed.
 - **A probe cannot run** — the interpreter, a third-party dependency, a binary or the checkout
-  the probe needs is missing, or the solution doc names no probe command. The product's OWN
+  the probe needs is missing, or the solution doc names no probe command. With
+  `{product_python}` `null`, a `{declared_deps}` whose `missing` is non-empty is this case
+  before any probe runs: `blocked_on` names the missing distributions and the remedy
+  `set canonical_repo.python in projects/<name>.md`. The product's OWN
   modules failing to import or collect is not this case: the product broke, so it is a
   verdict (`regressed` or `missed`), with the import error as evidence.
 

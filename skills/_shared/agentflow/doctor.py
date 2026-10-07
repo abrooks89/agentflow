@@ -71,6 +71,23 @@ class Finding:
     def warned(self) -> bool:
         return self.status == WARN
 
+    @property
+    def spec_corpus(self) -> bool:
+        """A ``survey:<kind>`` warning: the spec corpus has a problem, not the configuration.
+
+        The verdict names these apart, because "NOT everywhere as configured" over a spec
+        with no ``## Files`` section sends the reader to a config home with nothing in it to fix.
+        The bare ``survey`` catch-all is excluded on purpose (fail closed): it collects messages
+        no kind recognised, which can be config-shaped (an unreadable status file, records from
+        another project), so it keeps the louder config verdict.
+        """
+        return self.warned and self.check.startswith("survey:")
+
+
+def spec_note(count: int) -> str:
+    """The one wording for spec-corpus warnings, shared with install/provision.py's verdict."""
+    return f"{count} spec-corpus warning(s) (survey:*)"
+
 
 def _run(check: str, fn: Callable[[], Finding]) -> Finding:
     """Call *fn*, turning any escape into a failing finding rather than a crash."""
@@ -130,27 +147,101 @@ def _warning_check(message: str) -> str:
     return "config"
 
 
+#: Survey warnings another check already names in its own finding, as (pattern, owning check).
+#: Group 1 is the text that check's detail carries; a message is left out of the survey findings
+#: only when that text IS in the owner's detail, so a check that raised, or one that names only
+#: some values, drops nothing it did not itself report.
+_OWNED_SURVEY_WARNINGS = (
+    (re.compile(r"^(done-spec pointer check could not (?:read|parse): .*)$", re.S),
+     "done-spec-pointers"),
+    (re.compile(r"^done spec pointer does not resolve \([^)]*\): (.+?) \("), "done-spec-pointers"),
+    (re.compile(r"^unknown queue_class, not dispatchable: (.+?) \(e\.g\. "), "vocabulary"),
+)
+
+#: Message opening -> finding name. Cosmetic, like `_warning_check`: the whole message is always
+#: the detail, and anything unrecognised still reports as plain ``survey``.
+_SURVEY_KINDS = (
+    ("spec has no `## Files` section", "survey:files-missing"),
+    ("spec `## Files` section declares no path", "survey:files-pathless"),
+    ("unknown queue_class", "survey:queue_class"),
+    ("slug collision", "survey:slug-collision"),
+    ("frontmatter declares", "survey:frontmatter"),
+    ("done-spec pointer check", "survey:done-spec"),
+    ("done spec pointer does not resolve", "survey:done-spec"),
+    # Pass 3 refuses both (neither done nor selectable) rather than guess a run out of the
+    # board, so each is a corpus defect a lane must fix, named after the survey's own state.
+    ("duplicate status boards for", "survey:duplicate-status-boards"),
+    ("unrecognised board status", "survey:unrecognised-board-status"),
+)
+
+
+class _SurveyWarnings(_ResolutionWarnings):
+    """The ``agentflow.epic_survey`` warnings a diagnosis triggers, for the same reason.
+
+    ``_check_vocabulary`` runs the full survey, which warns per spec that a promoting seat
+    must refuse (no ``## Files``, a pathless one, a slug collision, an unreadable file). Those
+    reached stderr only, so ``doctor > report.txt`` kept a verdict of "healthy" next to a
+    corpus the fleet cannot promote.
+    """
+
+    def findings(self, reported: Optional[list[Finding]] = None) -> list[Finding]:
+        """WARN findings for every message no finding in *reported* already names."""
+        by_check = {f.check: f.detail for f in reported or ()}
+        return [Finding(_survey_check(m), WARN, m) for m in self.messages
+                if not _owned_elsewhere(m, by_check)]
+
+
+def _owned_elsewhere(message: str, by_check: dict[str, str]) -> bool:
+    for pattern, owner in _OWNED_SURVEY_WARNINGS:
+        m = pattern.match(message)
+        if m:
+            return m.group(1) in by_check.get(owner, "")
+    return False
+
+
+def _survey_check(message: str) -> str:
+    for opening, check in _SURVEY_KINDS:
+        if message.startswith(opening):
+            return check
+    if ", skipping:" in message:
+        return "survey:skipped"
+    if "depends_on" in message:
+        return "survey:depends_on"
+    return "survey"
+
+
 @contextmanager
-def _collecting_config_warnings():
-    """Attach the collector to the config logger for the duration of one diagnosis.
+def _collecting(logger_name: str, handler: logging.Handler):
+    """Attach *handler* to one logger for the duration of one diagnosis.
 
     Scoped rather than global on purpose: ``diagnose()`` is a library function with two
     callers, and a handler left attached would go on collecting into a dead object for
     whoever imported the module next.
+
+    The level is pinned to WARNING for the same window, as ``fleet_report`` does for this
+    logger: NOTSET inherits, and a host that set the root above WARNING would drop the very
+    records the report exists to carry, putting "healthy" back over an unpromotable corpus.
     """
-    handler = _ResolutionWarnings()
-    logger = logging.getLogger("agentflow.config")
+    logger = logging.getLogger(logger_name)
+    previous_level = logger.level
+    if previous_level > logging.WARNING or previous_level == logging.NOTSET:
+        logger.setLevel(logging.WARNING)
     logger.addHandler(handler)
     try:
         yield handler
     finally:
         logger.removeHandler(handler)
+        logger.setLevel(previous_level)
 
 
-def _check_environment(resolved: dict) -> Finding:
+def _collecting_config_warnings():
+    return _collecting("agentflow.config", _ResolutionWarnings())
+
+
+def _check_environment(resolved: dict, config_home=None) -> Finding:
     from agentflow.config import load_environment
 
-    env = load_environment()
+    env = load_environment(config_home=config_home)
     # Hand the resolved object back to `diagnose` rather than have it resolve again.
     # Every resolution re-emits every warning, so a second one is not merely wasted work.
     resolved["env"] = env
@@ -179,17 +270,17 @@ def _check_paths(env) -> list[Finding]:
     return out
 
 
-def _resolve_project_name(project: Optional[str], resolved: dict) -> Finding:
+def _resolve_project_name(project: Optional[str], resolved: dict, config_home=None) -> Finding:
     from agentflow.config import resolve_project_name
 
-    resolved["name"] = resolve_project_name(project)
+    resolved["name"] = resolve_project_name(project, config_home=config_home)
     return Finding("project", OK, f"selected {resolved['name']!r}")
 
 
-def _check_project(name: str, resolved: dict) -> Finding:
+def _check_project(name: str, resolved: dict, config_home=None) -> Finding:
     from agentflow.config import load_project
 
-    proj = load_project(name)
+    proj = load_project(name, config_home=config_home)
     resolved["proj"] = proj   # same one-resolution rule as _check_environment above
     return Finding(f"project:{name}", OK, f"resolves; repo={proj.canonical_repo.host_ref}")
 
@@ -276,6 +367,9 @@ def _check_base_branch(proj) -> Finding:
     Every worktree is cut from it and every PR targets it, so a name that resolves
     nowhere fails the first build, far from the profile line that caused it. A remote
     tracking ref counts: a fresh clone has only the default branch locally.
+
+    A branch only in refs/heads WARNs when the checkout has an origin: the seats that
+    read `origin/<base_branch>` find nothing there, though a local build would work.
     """
     checkout = Path(proj.canonical_repo.local_checkout)
     branch = proj.canonical_repo.base_branch
@@ -283,9 +377,16 @@ def _check_base_branch(proj) -> Finding:
         return Finding("base_branch", INFO, f"{branch!r} not checked - no git checkout to look in")
     refs = (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}")
     try:
-        for ref in refs:
-            if _ref_exists(checkout, ref):
-                return Finding("base_branch", OK, f"{branch} ({ref})")
+        found = [ref for ref in refs if _ref_exists(checkout, ref)]
+        if found == [refs[0]] and "origin" in _git_remote(checkout).split():
+            return Finding(
+                "base_branch", WARN,
+                f"{branch} exists only as {refs[0]}; the checkout has an origin but no "
+                f"{refs[1]}, which seats that read origin/{branch} need",
+                f"push {branch} to origin (or fetch, if it is already there)",
+            )
+        if found:
+            return Finding("base_branch", OK, f"{branch} ({found[0]})")
     except _Unmeasured as why:
         return Finding("base_branch", OK, f"{branch} (not verified: {why})")
     return Finding(
@@ -522,9 +623,18 @@ _VOCAB_MASS_SHARE = 0.5
 _VOCAB_MASS_FLOOR = 3
 
 
+def _is_vocab_mass(n: int, total: int) -> bool:
+    return n >= _VOCAB_MASS_FLOOR and n / total >= _VOCAB_MASS_SHARE
+
+
+def _named(values: list[str]) -> str:
+    return ", ".join(repr(v) for v in values) + (" is" if len(values) == 1 else " are")
+
+
 def _check_vocabulary(env, name: str) -> Finding:
     """Tell a corpus-wide queue_class migration apart from a stray bad value (gh#254)."""
     from agentflow.epic_survey import KNOWN_QUEUE_CLASSES, survey_epics
+    from agentflow.vocabulary import QUEUE_CLASS_REWRITES
 
     records = survey_epics(env.data_root, env.mtime_cutoff_iso, project=name)
     declared = [r for r in records if r.queue_class is not None]
@@ -540,25 +650,134 @@ def _check_vocabulary(env, name: str) -> Finding:
             "vocabulary", OK, f"{len(declared)} queue_class value(s), all in vocabulary"
         )
 
+    # The ratio decides severity; membership decides the remedy. `migrate_queue_class`
+    # rewrites only the keys of QUEUE_CLASS_REWRITES, so sending a value outside it there is
+    # a run that changes nothing and leaves this check red, and withholding the command from
+    # a handful of retired values sends the reader to hand-edit what the migration exists to
+    # do. A value outside the map on a mass of specs is a vocabulary newer than this
+    # checkout, which only updating the checkout fixes.
+    total = len(declared)
+    retired = sorted(v for v in counts if v in QUEUE_CLASS_REWRITES)
+    unknown = sorted(v for v in counts if v not in QUEUE_CLASS_REWRITES)
+    ahead = [v for v in unknown if _is_vocab_mass(counts[v], total)]
+    stray = [v for v in unknown if v not in ahead]
+    remedies = []
+    if retired:
+        remedies.append(
+            f"{_named(retired)} retired: run `python -m agentflow.migrate_queue_class "
+            f"--project {name} --dry-run` and then `--apply`, which rewrites each to its current "
+            f"value - not by hand"
+        )
+    if ahead:
+        remedies.append(
+            f"{_named(ahead)} on too many specs to be a typo, yet neither known nor retired "
+            f"by this build: the vocabulary is newer than this checkout, so update the "
+            f"checkout so the code that knows it is the code running (the migration has "
+            f"nothing to rewrite)"
+        )
+    if stray:
+        remedies.append(
+            f"{_named(stray)} neither known nor retired, on too few specs to be a vocabulary "
+            f"change: fix the specs themselves"
+        )
+    remedy = "; ".join(remedies)
+
     value, n = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
-    if n >= _VOCAB_MASS_FLOOR and n / len(declared) >= _VOCAB_MASS_SHARE:
+    if _is_vocab_mass(n, total):
+        others = sorted(v for v in counts if v != value)
         return Finding(
             "vocabulary", FAIL,
-            f"{n} of {len(declared)} epic(s) declaring a queue_class carry {value!r}, which "
-            f"this build does not know",
-            f"that is a MIGRATION, not a typo: the corpus and the running code disagree about "
-            f"the vocabulary. Either run `python -m agentflow.migrate_queue_class --project "
-            f"{name} --dry-run` and then `--apply`, or update the checkout so the code that "
-            f"knows {value!r} is the code running",
+            f"{n} of {total} epic(s) declaring a queue_class carry {value!r}, which "
+            f"this build does not know"
+            + ("; also " + ", ".join(f"{v!r} x{counts[v]}" for v in others) if others else ""),
+            "that is a VOCABULARY CHANGE, not a typo: the corpus and the running code "
+            f"disagree about the vocabulary. {remedy}",
         )
     return Finding(
         "vocabulary", WARN,
         "out-of-vocabulary queue_class on "
-        f"{sum(counts.values())} of {len(declared)} epic(s): "
+        f"{sum(counts.values())} of {total} epic(s): "
         + ", ".join(f"{v!r} x{c}" for v, c in sorted(counts.items())),
-        "too few to be a pending migration, so these read as stray values - fix the specs "
-        "themselves, or run the migration if a cut really is in flight",
+        remedy,
     )
+
+
+class _SkippedSpecs(logging.Handler):
+    """Collects the specs the done-spec resolver could not read or parse (gh#365 review).
+
+    The resolver names them on the ``agentflow.epic_survey`` logger only. During ``diagnose()``
+    that logger's records go to the survey collector, which leaves these two shapes to this
+    check (``_OWNED_SURVEY_WARNINGS``); without this handler the report would say "every
+    pointer resolves" about a corpus in which some specs were never checked.
+    Keyed on the message prefix the resolver uses for exactly those two skips.
+    """
+
+    _PREFIXES = ("done-spec pointer check could not read:", "done-spec pointer check could not parse:")
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.skipped: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - a broken log record must not break the doctor
+            self.handleError(record)
+            return
+        if message.startswith(self._PREFIXES) and message not in self.skipped:
+            self.skipped.append(message)
+
+
+def _check_done_spec_pointers(env, proj, name: str) -> Finding:
+    """Done specs whose declared paths stopped resolving (gh#365).
+
+    `warn_unresolved_done_spec_paths` existed with no caller, so a spec's evidence trail still
+    died unreported the moment it moved into `done/`. This is that caller: the steward runs
+    `diagnose` every wake, and a terminal user can run it on demand. The check walks the corpus
+    once, which is why it lives here and not in `survey_epics` (see that function's docstring).
+
+    WARN, not FAIL: the record is historical and nothing the fleet runs depends on it, so it
+    must not turn the exit code red. Every pointer is named in the detail, because each one is a
+    separate edit and the report is the artifact somebody saves.
+    """
+    from agentflow.epic_survey import POINTER_DEPTH_SHIFT, warn_unresolved_done_spec_paths
+
+    checkout = Path(proj.canonical_repo.local_checkout)
+    # `load_project` already requires the checkout to exist, so this only guards the race of it
+    # being removed mid-run. Without it, `## Files` entries cannot be judged, only provenance.
+    repo = checkout if checkout.is_dir() else None
+    handler = _SkippedSpecs()
+    logger = logging.getLogger("agentflow.epic_survey")
+    logger.addHandler(handler)
+    try:
+        found = warn_unresolved_done_spec_paths(env.data_root, repo_root=repo, project=name)
+    finally:
+        logger.removeHandler(handler)
+    scope = "" if repo is not None else " (`## Files` not judged: checkout missing)"
+    skipped = handler.skipped
+    if not found and not skipped:
+        return Finding("done-spec-pointers", OK, f"every done-spec pointer resolves{scope}")
+    parts = []
+    if found:
+        shifted = sum(1 for u in found if u.kind == POINTER_DEPTH_SHIFT)
+        listed = "; ".join(f"{u.slug} {u.source} {u.pointer!r} ({u.kind})" for u in found)
+        parts.append(
+            f"{len(found)} declared path(s) in done specs do not resolve ({shifted} "
+            f"depth-shift, {len(found) - shifted} unresolved){scope}: {listed}"
+        )
+    else:
+        parts.append(f"no broken pointer in the specs that were checked{scope}")
+    if skipped:
+        parts.append(f"{len(skipped)} spec(s) NOT checked: " + "; ".join(skipped))
+    remediation = []
+    if found:
+        remediation.append(
+            "depth-shift: add one `../` (the spec moved into done/ after it was written); "
+            "unresolved: renamed, deleted or mistyped - fix that pointer by hand"
+        )
+    if skipped:
+        remediation.append("unchecked: re-save that spec as valid UTF-8 with parseable frontmatter")
+    return Finding("done-spec-pointers", WARN, " | ".join(parts), "; ".join(remediation))
 
 
 #: Seconds the fresh-interpreter import probe may take before its answer counts as unknown.
@@ -699,24 +918,29 @@ def _check_vault(env, proj) -> list[Finding]:
     return out
 
 
-def diagnose(project: Optional[str] = None) -> list[Finding]:
+def diagnose(project: Optional[str] = None, *, config_home=None) -> list[Finding]:
     """Every check, as data. Never raises — see the module docstring.
 
-    Config-resolution warnings are collected for the whole run and appended as WARN
-    findings at the end, so a clamped dial reaches the report instead of only stderr.
+    Config-resolution and epic-survey warnings are collected for the whole run and appended
+    as WARN findings at the end, so a clamped dial or an unpromotable spec reaches the report
+    instead of only stderr. A survey warning a check already names is not repeated.
+
+    *config_home* overrides ``$AGENTFLOW_CONFIG`` for this run's config reads (the installer
+    passes the home it provisioned), so no caller has to pin the process-global variable.
     """
-    with _collecting_config_warnings() as warnings:
-        findings = _checks(project)
-    return findings + warnings.findings()
+    with _collecting_config_warnings() as warnings, \
+            _collecting("agentflow.epic_survey", _SurveyWarnings()) as survey:
+        findings = _checks(project, config_home)
+    return findings + warnings.findings() + survey.findings(findings)
 
 
-def _checks(project: Optional[str]) -> list[Finding]:
+def _checks(project: Optional[str], config_home=None) -> list[Finding]:
     """The checks themselves. Split out so `diagnose` can wrap the whole run once."""
     findings: list[Finding] = []
     # Every resolved object is produced ONCE, here, and reused by the checks that need
     # it. Resolving a second time re-runs every validation and re-emits every warning.
     resolved: dict = {}
-    env_finding = _run("environment", lambda: _check_environment(resolved))
+    env_finding = _run("environment", lambda: _check_environment(resolved, config_home))
     findings.append(env_finding)
     if env_finding.failed:
         # Nothing below can be trusted without a resolved environment, and guessing
@@ -734,7 +958,7 @@ def _checks(project: Optional[str]) -> list[Finding]:
     # the single-projects/<name>.md default, which is exactly the state provision.py ships
     # in - so reading the variable alone made the installer's closing self-check examine
     # no project at all and still call the surface healthy (gh#416).
-    name_finding = _run("project", lambda: _resolve_project_name(project, resolved))
+    name_finding = _run("project", lambda: _resolve_project_name(project, resolved, config_home))
     if name_finding.failed:
         findings.append(name_finding)
         return findings
@@ -745,7 +969,7 @@ def _checks(project: Optional[str]) -> list[Finding]:
         )
         return findings
 
-    proj_finding = _run(f"project:{name}", lambda: _check_project(name, resolved))
+    proj_finding = _run(f"project:{name}", lambda: _check_project(name, resolved, config_home))
     findings.append(proj_finding)
     if proj_finding.failed:
         findings.append(Finding("(project checks)", INFO, f"skipped — {name} does not resolve"))
@@ -758,6 +982,7 @@ def _checks(project: Optional[str]) -> list[Finding]:
     findings.append(_run("registry", lambda: _check_registry(env, name)))
     findings.extend(_check_globs(env, name))
     findings.append(_run("vocabulary", lambda: _check_vocabulary(env, name)))
+    findings.append(_run("done-spec-pointers", lambda: _check_done_spec_pointers(env, proj, name)))
     findings.append(_run("autodoc", lambda: _check_autodoc(env, proj)))
     findings.extend(_check_vault(env, proj))
     return findings
@@ -776,14 +1001,22 @@ def render(findings: list[Finding]) -> str:
     if warned:
         lines.append(f"{len(warned)} WARNING:")
         lines.extend(f"  {f.check}: {f.remediation or f.detail}" for f in warned)
+    spec = [f for f in warned if f.spec_corpus]
     if not bad and not warned:
         lines.append("resolved surface healthy")
+    elif not bad and len(spec) == len(warned):
+        # Only the spec corpus is wrong. Saying "NOT everywhere as configured" here sends the
+        # reader to a config home that holds nothing to fix.
+        lines.append(f"resolved surface healthy and configured as intended; {spec_note(len(spec))}"
+                     " — see above")
     elif not bad:
         # The verdict has to carry the qualification, because the verdict is the line
         # people read. "healthy" on its own, under a warning saying a dial the operator
         # set is not the dial in force, is the contradiction this whole tier exists for.
-        lines.append("resolved surface healthy, but NOT everywhere as configured"
-                     " — see the warning(s) above")
+        verdict = "resolved surface healthy, but NOT everywhere as configured"
+        if spec:
+            verdict += f"; also {spec_note(len(spec))}"
+        lines.append(f"{verdict} — see the warning(s) above")
     return _NL.join(lines) + _NL
 
 
@@ -804,6 +1037,7 @@ def unexamined_verdict(report: str, projects_dir: Path) -> str:
     body, _, verdict = report.rstrip(_NL).rpartition(_NL)
     if not verdict.startswith("resolved surface healthy"):
         return report
+    # A spec-corpus-only verdict never reaches here: the survey runs inside the per-project checks.
     qualifier = " (see the warning(s) above)" if "NOT everywhere" in verdict else ""
     # The package's one enumeration of configured projects, which is also the candidate set
     # the resolver counts when it declines to pick one - so the number printed here is the

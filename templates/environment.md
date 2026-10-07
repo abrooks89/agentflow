@@ -43,10 +43,11 @@ shell: posix                  # R — posix | powershell
 editor_cmd: "${EDITOR:-code}" # O (default "${EDITOR:-code}")
 suite_root: "~/agentflow"     # R — install root; jr-dev skills inherit from lead-dev here
 worktree_root: "~/worktrees"  # R — root every lane's per-epic worktree is created under, laid out
-                              #     <worktree_root>/<project>/<epic-slug>. No default: a lane launches
+                              #     <worktree_root>/<project>/<epic-branch>, the claim branch name
+                              #     (<epic-slug> in a hand run). No default: a lane launches
                               #     from the launch directory, which is in no repo, so nothing can be
                               #     inferred from cwd. Must exist — create it before first launch.
-status_board_url_template: null  # O (default null) — e.g. "http://host:8889/{slug}"; null => print status.md path
+status_board_url_template: null  # O (default null) — e.g. "https://board.example/{slug}"; null => print status.md path
 
 # THREE states, and the third is the one worth writing down:
 #   key absent   — the install interview never asked

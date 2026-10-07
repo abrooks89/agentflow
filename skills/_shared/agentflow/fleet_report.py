@@ -71,7 +71,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator, Optional, Sequence
+from typing import Callable, Iterator, Mapping, Optional, Sequence
 
 from . import epic_survey as _survey
 from . import issue_intake as _intake
@@ -182,8 +182,8 @@ HEALTH_THRESHOLDS: dict[str, int] = {
     # THE ONLY THRESHOLD HERE THAT IS NOT 1, and it is not 1 on purpose. The other four count
     # things that should never happen at all, so one occurrence is the signal. Live notes are
     # the fleet's normal traffic: routing one is healthy, so at 1 this metric would report
-    # "over" on every board that has ever sent a note - a permanent red light beside six
-    # healthy lanes, which a reader learns to skip.
+    # "over" on every board that has ever sent a note - a permanent red light beside a
+    # fleet of healthy lanes, which a reader learns to skip.
     #
     # 40 is a DRAIN RATE, not a size. A seven-seat fleet routing a note apiece per wake puts a
     # day's ordinary traffic near 30, and every seat is instructed to strike what it consumed
@@ -462,6 +462,11 @@ class QuestionRow:
     def age(self) -> str:
         return format_age(self.age_hours)
 
+    @property
+    def subject(self) -> str:
+        """The 3-6 word subject printed beside ``qid`` - see `registry_subject`."""
+        return registry_subject(self.question)
+
 
 @dataclass(frozen=True)
 class BlockerRow:
@@ -470,6 +475,138 @@ class BlockerRow:
     owner: str
     work: str
     description: str
+
+    @property
+    def subject(self) -> str:
+        """The 3-6 word subject printed beside ``bid`` - see `registry_subject`."""
+        return registry_subject(self.description)
+
+
+# --------------------------------------------------------------------------- #
+# Names beside identifiers
+# --------------------------------------------------------------------------- #
+#: The most words a registry subject keeps. Long enough to say what the row is about, short
+#: enough to ride beside an id in a Mermaid node or an ASCII push.
+SUBJECT_MAX_WORDS = 6
+#: Below this a trailing filler word is kept rather than dropped, so a short question is never
+#: cut down to one or two words.
+SUBJECT_MIN_WORDS = 3
+_SUBJECT_TRAILING_FILLER = frozenset(
+    {"a", "an", "the", "of", "to", "and", "or", "in", "on", "for", "with", "by", "at", "from"}
+)
+_SUBJECT_STRIP = "`*_\"'"
+#: Characters a subject must not carry because the renderer drops it into a markdown table cell
+#: (``|`` splits the row) or a Mermaid node label (``<>`` read as markup).
+_SUBJECT_UNSAFE = str.maketrans({"|": "/", "<": "(", ">": ")"})
+#: A subject's width cap. Six words bound the count, not the width: one URL is a "word" of any
+#: length, and a table column or a Mermaid node sized by it is unreadable.
+SUBJECT_MAX_CHARS = 60
+_SUBJECT_TRAILING_PUNCT = ".,;:!?-—–()[]"
+#: A registry row id where it sits inside free text, e.g. a ``waiting_on`` cell.
+#: Id and ref digits are `[0-9]`, never `\d` (gh#1123): `\d` takes any Unicode decimal digit,
+#: so an id spelled in Arabic-Indic or fullwidth digits matched, compared unequal to its ASCII
+#: spelling, and `int()` still read it as a number. `registry.py` follows the same rule.
+#: The trailing `(?!\d)` refuses a non-ASCII digit run-on rather than cutting the id short.
+_REGISTRY_ID_IN_TEXT = re.compile(r"(?<![A-Za-z0-9])[QB]-[0-9]{3,}(?![A-Za-z0-9-])(?!\d)")
+
+#: What a registry id carries when the board has no row for it, or the row has no text. Explicit
+#: rather than a bare id, because a bare id beside its neighbours' subjects reads as an omission
+#: by the renderer when it is really a fact about the board.
+NO_SUBJECT = "no subject: not on the board"
+#: The same for an issue number the tracker read did not return a title for.
+NO_TITLE = "no title: not in the issue list read"
+
+
+def registry_subject(text: str) -> str:
+    """A 3-6 word subject for a registry Question or Blocker, derived from its own text.
+
+    The rule, deterministic so two reports of one board print one subject: collapse the
+    whitespace, strip markdown emphasis and quote characters from each word, keep the first
+    ``SUBJECT_MAX_WORDS`` words, then drop trailing punctuation and trailing filler words
+    ("the", "of", "to", ...) while more than ``SUBJECT_MIN_WORDS`` words remain. A text shorter
+    than three words is kept whole: inventing words would be worse than a short subject.
+    ``|`` and ``<>`` are replaced so the subject is safe in a table cell or a node label, and
+    the result is capped at ``SUBJECT_MAX_CHARS``, ending in ``...`` when cut.
+    Returns "" for blank text, which callers render as ``NO_SUBJECT``.
+    """
+    words = [w.strip(_SUBJECT_STRIP) for w in str(text or "").split()]
+    # A word that is only a pipe is table syntax, not meaning, so it goes rather than becoming
+    # a lone "/".
+    words = [w for w in words if w and w.strip("|")]
+    words = words[:SUBJECT_MAX_WORDS]
+    while words:
+        last = words[-1].rstrip(_SUBJECT_TRAILING_PUNCT)
+        if not last:
+            words.pop()
+            continue
+        words[-1] = last
+        if len(words) > SUBJECT_MIN_WORDS and last.lower() in _SUBJECT_TRAILING_FILLER:
+            words.pop()
+            continue
+        break
+    # Replaced only now, so the trailing-punctuation pass cannot eat the ")" a ">" became.
+    return _cap_width(" ".join(words).translate(_SUBJECT_UNSAFE))
+
+
+def _cap_width(text: str) -> str:
+    if len(text) <= SUBJECT_MAX_CHARS:
+        return text
+    return text[: SUBJECT_MAX_CHARS - 3].rstrip() + "..."
+
+
+@dataclass(frozen=True)
+class NamedId:
+    """An identifier with the human-readable name that has to travel beside it.
+
+    ``ident`` is the handle (``Q-0012``, ``B-0003``, ``#51``) and ``name`` the meaning (a
+    registry subject or an issue title). ``name`` is "" when it could not be found, and
+    ``str()`` then says so in words via ``missing`` instead of printing the id bare.
+    """
+
+    ident: str
+    name: str
+    missing: str = NO_SUBJECT
+
+    @property
+    def found(self) -> bool:
+        return bool(self.name)
+
+    def __str__(self) -> str:
+        return f"{self.ident} ({self.name or self.missing})"
+
+
+def registry_subjects(reg) -> dict:
+    """``{id: subject}`` for every Question and Blocker row on the board, blank text included."""
+    if reg is None:
+        return {}
+    subjects = {qid: registry_subject(q.fields.get("question", "")) for qid, q in reg.questions.items()}
+    subjects.update({bid: registry_subject(b.description) for bid, b in reg.blockers.items()})
+    return subjects
+
+
+def name_registry_id(ident: str, subjects: Mapping[str, str]) -> NamedId:
+    return NamedId(ident=ident, name=subjects.get(ident, ""))
+
+
+def name_issue(number: int, titles: Mapping[int, str]) -> NamedId:
+    # Same table/node safety as a registry subject; the words are the tracker's own, so only
+    # the width is capped, never the word count.
+    title = " ".join(
+        w.translate(_SUBJECT_UNSAFE)
+        for w in str(titles.get(number, "") or "").split()
+        if w.strip("|")
+    )
+    title = _cap_width(title)
+    return NamedId(ident=f"#{number}", name=title, missing=NO_TITLE)
+
+
+def name_registry_ids_in(text: str, subjects: Mapping[str, str]) -> str:
+    """*text* with every registry id in it followed by its subject (or ``NO_SUBJECT``).
+
+    A ``waiting_on`` cell is free text: usually one id, sometimes an id inside a sentence, and
+    sometimes no id at all ("gate green"), which comes back unchanged.
+    """
+    return _REGISTRY_ID_IN_TEXT.sub(lambda m: str(name_registry_id(m.group(0), subjects)), text)
 
 
 #: The `registry.unjudgeable_halts` reasons whose referent is DEAD - nothing will ever answer the
@@ -493,13 +630,16 @@ class StrandedLaneRow:
 
     The same classification `registry read --stranded` prints, so the report and the CLI never
     disagree about which lanes are stuck. ``reason`` is the registry's reason name and ``fix``
-    the action that unsticks it.
+    the action that unsticks it. ``waiting_on`` is the raw cell, kept for machines;
+    ``waiting_on_label`` is what a human surface prints - the same text with every registry id
+    followed by its subject, or ``NO_SUBJECT`` when the board has no row for it.
     """
 
     agent: str
     waiting_on: str
     reason: str
     fix: str
+    waiting_on_label: str = ""
 
 
 #: The `answered_by` values that are the fleet deciding without the human. Derived from the
@@ -523,6 +663,11 @@ class DecidedRow:
     answered_by: str
     answered_at: str
     raised_by: str = ""
+
+    @property
+    def subject(self) -> str:
+        """The 3-6 word subject printed beside ``qid`` - see `registry_subject`."""
+        return registry_subject(self.question)
 
 
 @dataclass(frozen=True)
@@ -698,7 +843,10 @@ class LaneRow:
     eta: str = ""
     waiting_on: str = ""
     why: str = ""
+    #: The raw ``waiting_on`` of a halted lane, the id exactly as the board holds it.
     resume_condition: str = ""
+    #: ``resume_condition`` with a subject beside every registry id in it - what a human reads.
+    resume_label: str = ""
     reaped_recent: bool = False
     #: PRODUCTION, not liveness. How many merged pull requests in the reporting window are
     #: attributable to this seat, or None when the question could not be asked at all (no
@@ -816,6 +964,12 @@ class DecidedSection:
     questions: Rows = field(default_factory=Rows)
     window_start: str = ""
     windowed: bool = True
+    #: Non-empty when the window could not be read whole - the cull log beside the registry was
+    #: unreadable, or a culled answer or the window start carried a stamp nothing can place. The
+    #: steward culls an applied question within hours and the report runs on a 24h ceiling, so
+    #: most of a window's delegated answers live ONLY in that log: an empty list over an unread
+    #: log is "checked, nothing there" printed over a source nobody looked at.
+    partial_note: str = ""
 
     @property
     def is_empty(self) -> bool:
@@ -842,16 +996,22 @@ class IntakeSection:
     #: asserted over a source nobody looked at.
     tracker_configured: bool = False
     untriaged_count: int = 0
+    #: What a builder may pick up: `issue_intake.builder_selectable` over the board's held set,
+    #: the same set the `selectable` CLI prints and WORK's `bug_claimable` splits out.
     selectable_count: int = 0
     untriaged: Rows = field(default_factory=Rows)
     selectable: Rows = field(default_factory=Rows)
-    #: Bug work carrying the `in-progress` marker — exactly what `selectable` now drops (gh#56).
+    #: Non-empty when the registry was not read, so no held set was subtracted and the pair's
+    #: selectable half is the label-only count. Printed beside the number: an unread board
+    #: subtracts nothing, so the figure can only be too high, never silently right.
+    selectable_note: str = ""
+    #: Bug work carrying the `in-progress` marker — dropped from `selectable` by its label.
     #: Carried separately rather than folded into `selectable`, because it is NOT claimable and
     #: must not be counted as such; carried AT ALL because WORK reassembles the whole bug set
     #: from this section, and an issue missing from both halves is invisible, not merely busy.
     claimed: Rows = field(default_factory=Rows)
     #: Bug work carrying `needs-decision` and no `in-progress` marker - also dropped from
-    #: `selectable` (gh#446). Registry-blind like `selectable`: one a lane holds through a
+    #: `selectable` by its label. Registry-blind, unlike `selectable`: one a lane holds through a
     #: registry row is counted here AND lands in WORK's bug_in_progress. Carried for the same
     #: reason as `claimed`: it waits on a human's product call, not
     #: on a builder, so it is neither claimable nor absent. Its own count, because a human
@@ -864,7 +1024,9 @@ class IntakeSection:
     #: The UNCAPPED halves WORK re-slices. The `Rows` above are cut to `rows_per_section` for
     #: rendering, and WORK's bug totals are counts, not renderings: splitting the capped rows
     #: printed "10 claimable" beside INTAKE's "48 selectable" with nothing saying either was
-    #: partial. Not rendered and not compared - they are the same issues as the rows above.
+    #: partial. Not rendered and not compared. `all_selectable` is the label-selectable set,
+    #: BEFORE the held set is subtracted: WORK finds an unmarked held bug only in it, so
+    #: handing WORK the held-filtered rows would drop that bug out of both its columns.
     all_selectable: tuple = field(default=(), repr=False, compare=False)
     all_claimed: tuple = field(default=(), repr=False, compare=False)
     all_awaiting: tuple = field(default=(), repr=False, compare=False)
@@ -884,7 +1046,8 @@ class IntakeSection:
 
     @property
     def bug_work_halves(self) -> tuple:
-        """``(selectable, claimed, awaiting)`` uncapped - what WORK's bug columns count over."""
+        """``(label-selectable, claimed, awaiting)`` uncapped - what WORK's bug columns count
+        over. The first half still holds the bugs on the board; WORK splits them out itself."""
         return (
             self._whole(self.selectable, self.all_selectable),
             self._whole(self.claimed, self.all_claimed),
@@ -908,6 +1071,7 @@ class IntakeSection:
             and not self.fix_claimed_count
             # An unread or partial count carries a note, and the note must stay on screen.
             and not self.fix_claims_note
+            and not self.selectable_note
         )
 
 
@@ -964,11 +1128,11 @@ class WorkSection:
     scan: Optional[ScanCount] = None
 
     #: Bug side. `triaged`, not `epic`, not `needs-decision`, no `in-progress` marker, and
-    #: not named by a registry claim - `builder_selectable` minus whatever a lane is building.
+    #: not held on the board - the same set the `selectable` CLI prints.
     bug_claimable: Rows = field(default_factory=Rows)
-    #: Selectable bugs named by `gh#N` in a claimed registry row - derived from the claim,
-    #: never from a label, because a label is a second thing to update and the copy is what
-    #: goes stale.
+    #: The held set: bug work published to a lane or being built, by `issue_intake.held_refs`
+    #: (a non-terminal Queue row or a non-idle Agents row naming its `gh#N` or bare `#N`) or the `in-progress`
+    #: marker.
     bug_in_progress: Rows = field(default_factory=Rows)
     #: Selectable bugs a registry claim MIGHT hold, when the registry could not be read: the bug
     #: half of `claim_ambiguous`. Held out of `bug_claimable` and named; `bug_note` says why.
@@ -1260,6 +1424,36 @@ class ChangedSince:
     questions_retracted: tuple = ()
     issues_triaged: tuple = ()
     health_crossings: tuple = ()
+    #: A ``NamedId`` for every question id and triaged issue number above, so the renderer
+    #: prints a subject or a title beside each one and never has to invent either. The id
+    #: tuples stay bare because they are what the next report diffs against; a subject edit
+    #: on the board must not read as a state change. Filled by `collect`, not `diff_since`,
+    #: which sees only snapshots.
+    names: tuple = ()
+    #: The live raises `diff_since` could not place in the window (no readable ``raised_at``).
+    #: Kept apart from ``note`` because `_fold_culled_answers` rewrites the
+    #: note; it joins this with the culled path's own partial note so neither is lost.
+    partial_note: str = ""
+    #: The live answers `diff_since` could not place (no readable ``answered_at``), also inside
+    #: ``partial_note``. Kept separately so DECIDED, which lists answers, can say it is partial
+    #: about a live answer as it already does about a culled one.
+    answer_partial_note: str = ""
+
+    def named(self, ident) -> NamedId:
+        """The ``NamedId`` for a question id (``"Q-0003"``) or an issue number (``51``).
+
+        An id this report did not name comes back with the missing marker rather than raising,
+        so a renderer can call it on every id it prints.
+        """
+        # A digit string is an issue number too: keying it as "51" would miss "#51" and come
+        # back with the registry marker instead of the issue one. ASCII digits only (gh#1123):
+        # `str.isdigit` also takes Arabic-Indic digits and superscripts.
+        text = str(ident).strip()
+        key = f"#{text}" if isinstance(ident, int) or re.fullmatch(r"[0-9]+", text) else text
+        for n in self.names:
+            if n.ident == key:
+                return n
+        return NamedId(key, "", NO_TITLE if key.startswith("#") else NO_SUBJECT)
 
     @property
     def is_empty(self) -> bool:
@@ -1713,6 +1907,7 @@ def classify_lane(
     awaiting: str = "",
     selection: str = "",
     dead_referent: str = "",
+    subjects: Optional[Mapping[str, str]] = None,
 ) -> LaneRow:
     """Classify one Agents row into LIVE / HALTED-BY-DESIGN / REAPED / SILENT.
 
@@ -1720,6 +1915,11 @@ def classify_lane(
     referent nothing will answer (a key of ``DEAD_REFERENT_FIXES``), computed once per report
     like ``silent_agents``. It changes the HALTED why-string, never the state: the lane is
     still halted, and it reaches the human through BLOCKED ON YOU.
+
+    ``subjects`` is ``registry_subjects(reg)``: with it every registry id in a why-string carries
+    its subject, or ``NO_SUBJECT`` when the board has no row for it. ``None`` means the caller
+    supplied no board to look in, and the ids are left as they are rather than marked missing
+    from a board nobody read.
 
     Order of tests is load-bearing:
 
@@ -1750,14 +1950,15 @@ def classify_lane(
     TWO FURTHER STATES REFINE WHAT WOULD OTHERWISE BE LIVE, and they are tested after the
     three problem states because a reaped or silent lane is not merely dry:
 
-    4. **BLOCKED** — the seat has an open Question it raised or an open Blocker it owns.
+    4. **BLOCKED** — the seat has an open halted/waiting Question it raised or an open Blocker
+       it owns (an advisory one has already proceeded; see ``_awaiting_a_decision``).
        It may still be building something else; the point is that a decision of ITS is
        waiting. Applies to every seat, since any seat can raise a question. Tested
        before DRY: a decision waiting on a human is more actionable than "nothing
        published yet", and a lane can honestly be both.
     5. **DRY** — nothing arriving through the channel this seat's work actually arrives
        through. Nothing is wrong; there is simply nothing to do, and the fix is *work
-       published*, not diagnosis. **DEFINED FOR ALL SIX SEATS.** It once was not:
+       published*, not diagnosis. **DEFINED FOR EVERY SEAT.** It once was not:
        ``registry.LANE_OF`` maps only the builder lanes, so the three lane-less seats were
        passed ``lane_has_work=None`` and could never render unproductive at all.
        ``_lane_has_work`` is now total and answers each seat on its own channel — the builders
@@ -1796,8 +1997,9 @@ def classify_lane(
         # mark, so the human reads WHY off the report instead of asking.
         reason = row.phase.strip()[len(_registry.STOOD_DOWN_PHASE):].lstrip(": ").strip()
         # Only a row that HOLDS work keeps a claim. Saying so over `work: -` told the human to
-        # expect work intact on resume where there was none to keep.
-        held = row.work.strip() not in ("", "-")
+        # expect work intact on resume where there was none to keep. An idle row's `work` cell
+        # is the epic it finished, so it holds nothing either: the held set's own idle test.
+        held = _intake._agent_row_holds(row.status) and row.work.strip() not in ("", "-")
         return LaneRow(
             state=LANE_STOOD_DOWN,
             why=(
@@ -1819,22 +2021,26 @@ def classify_lane(
         resume = row.waiting_on.strip()
         if resume in ("", "-"):
             resume = "unstated - the halt names no resume condition"
-        why = f"self-declared halt; resumes when: {resume}"
+        label = resume if subjects is None else name_registry_ids_in(resume, subjects)
+        why = f"self-declared halt; resumes when: {label}"
         if dead_referent in DEAD_REFERENT_FIXES:
             # "resumes when: Q-0001" over an answered or absent Q-0001 promises a resume that
             # will never come. The reason and the fix travel with the row, and the lane is
             # listed in BLOCKED ON YOU, which is where the human acts on it.
             why = (
-                f"halted on {resume}, which is dead ({dead_referent}): "
+                f"halted on {label}, which is dead ({dead_referent}): "
                 f"{DEAD_REFERENT_FIXES[dead_referent]}"
             )
         return LaneRow(
             state=LANE_HALTED,
             why=why,
             resume_condition=resume,
+            resume_label=label,
             **common,
         )
-    if age is None and not (row.status == "idle" and row.work.strip() in ("", "-")):
+    if age is None and not (
+        not _intake._agent_row_holds(row.status) and row.work.strip() in ("", "-")
+    ):
         return LaneRow(
             state=LANE_SILENT,
             why=(
@@ -1853,6 +2059,8 @@ def classify_lane(
             **common,
         )
     if awaiting:
+        if subjects is not None:
+            awaiting = name_registry_ids_in(awaiting, subjects)
         return LaneRow(
             state=LANE_BLOCKED,
             why=f"a decision of its own is waiting: {awaiting}",
@@ -2007,12 +2215,69 @@ def load_prior_snapshot(inputs: ReportInputs) -> tuple[Optional[dict], str, str]
 # --------------------------------------------------------------------------- #
 # The diff
 # --------------------------------------------------------------------------- #
-def diff_since(prior: Optional[dict], current: dict, *, prior_path: str = "", reason: str = "") -> ChangedSince:
+def _window_floor(window_start: str) -> Optional[datetime]:
+    """The window start both question paths compare a raise against, or None if unreadable.
+
+    FLOORED TO THE MINUTE. The prior report stamps to the second while ``raised_at`` and
+    ``answered_at`` are written to the minute, so a question raised at 02:11Z after a report
+    stamped 02:11:37 would compare earlier than the window and fall in neither report. Flooring
+    can only re-list a raise the prior report already carried, never drop one.
+    """
+    start = _registry._parse_iso(window_start)
+    return None if start is None else start.replace(second=0, microsecond=0)
+
+
+#: Where `_place_raise` puts one question's raise relative to the window.
+_RAISE_IN = "in"
+_RAISE_BEFORE = "before"
+_RAISE_UNDATED = "undated"
+_RAISE_UNPLACED = "unplaced"
+
+
+def _place_raise(fields: Mapping, start: datetime) -> str:
+    """Whether a question's raise falls in the window starting at ``start`` (already floored).
+
+    ONE RULE FOR LIVE AND CULLED QUESTIONS, so a question counts the same way before and after
+    the steward culls it. A question with NO ``raised_at`` predates the field and is not a raise
+    any window can claim (``_RAISE_UNDATED``). One whose ``raised_at`` is present but does not
+    parse is ``_RAISE_UNPLACED``, for the caller to name as partial, UNLESS its answer or
+    retraction is dated before the window, since a raise cannot come after either: without that
+    bound one malformed block in old history would mark every report partial forever.
+    """
+    if not fields.get("raised_at", "").strip():
+        return _RAISE_UNDATED
+    raised = _registry._parse_iso(fields["raised_at"])
+    if raised is None:
+        closed = (
+            _registry._parse_iso(fields.get(k, "")) for k in ("answered_at", "retracted_at")
+        )
+        if any(c is not None and c < start for c in closed):
+            return _RAISE_BEFORE
+        return _RAISE_UNPLACED
+    return _RAISE_IN if raised >= start else _RAISE_BEFORE
+
+
+def diff_since(
+    prior: Optional[dict],
+    current: dict,
+    *,
+    prior_path: str = "",
+    reason: str = "",
+    raised: Mapping[str, Mapping],
+) -> ChangedSince:
     """Compute CHANGED SINCE, or say plainly that there is nothing to compare against.
 
     "If no prior report exists, say so explicitly rather than silently rendering everything
     as new." Every collection field stays empty in that case — the alternative, treating the
     whole corpus as newly-changed, makes the first report of any install look like a crisis.
+
+    ``raised`` maps each live question id to its registry fields; the snapshots hold only id ->
+    state, so this is where a raise's ``raised_at`` comes from. REQUIRED, so no caller can drop
+    the dates and under-report silently. A new id it does not cover could not be placed and is
+    named in ``partial_note``; one it covers with no ``raised_at`` predates the field and is
+    silently not a raise, as on the culled path. An unreadable window start leaves
+    ``partial_note`` empty, because the culled path's own sentence already says so.
+    ``partial_note`` is merged into ``note`` only by ``_fold_culled_answers``.
     """
     if not prior:
         return ChangedSince(
@@ -2057,16 +2322,86 @@ def diff_since(prior: Optional[dict], current: dict, *, prior_path: str = "", re
 
     prior_q = prior.get("questions") or {}
     now_q = current.get("questions") or {}
-    opened = tuple(q for q in sorted(now_q) if q not in prior_q and now_q[q] == "open")
-    answered = tuple(
-        q for q in sorted(now_q) if now_q[q] == "answered" and prior_q.get(q) != "answered"
-    )
+    # OPENED MEANS RAISED IN THE WINDOW, whatever the question's state is now: absent from the
+    # prior snapshot AND placed in the window by `raised_at` (`_place_raise`, the culled path's
+    # own rule). Absence alone is not enough: a prior taken while the registry was unreadable
+    # stores `questions: {}`, and every live question then read as opened, days-old ones
+    # included. Neither path looks at current state. Filtering to still-open ids made a question
+    # raised and answered between two reports read as answered alone here, but as opened +
+    # answered once the steward culled it (`_fold_culled_answers`), so one question counted two
+    # ways depending on cull timing. Open questions are still listed under BLOCKED; that is the
+    # "what is waiting" view, and this line is the "what happened" one.
+    window_start = str(prior.get("generated_at") or "")
+    start = _window_floor(window_start)
+    opened_ids: list = []
+    unraised: list = []
+    # An unreadable start opens nothing and adds no sentence: `_culled_answers_in_window` says
+    # the window start is unreadable, and one cause is said once.
+    for q in sorted(now_q) if start is not None else ():
+        if q in prior_q:
+            continue
+        # Absent from `raised` means the caller had no fields for it, which is not the same as
+        # a block with no `raised_at` (legacy, undated): it could not be placed.
+        placed = _place_raise(raised[q], start) if q in raised else _RAISE_UNPLACED
+        if placed == _RAISE_IN:
+            opened_ids.append(q)
+        elif placed == _RAISE_UNPLACED:
+            unraised.append(q)
+    opened = tuple(opened_ids)
+    partial_note = ""
+    if unraised:
+        n = len(unraised)
+        partial_note = (
+            f"window partial: {_plural(n, 'live question')} on the board "
+            f"{_agree(n, 'carries', 'carry')} no readable raised_at and could not be placed: "
+            f"{', '.join(unraised)}"
+        )
+    # ANSWERED AND RETRACTED ARE DATED, as opened is, by the culled path's rule
+    # (`_culled_answers_in_window`), prior-state shortcut included. A state change from the prior
+    # snapshot alone inflated both
+    # when the prior's questions map was empty, listing an answer from days ago as new. An
+    # answer counts when the prior saw the question in another state (the snapshot was taken at
+    # the window start, so the answer came after it) or its `answered_at` is on or after the
+    # floored window start; with neither, an `answered_at` that does not parse is named as
+    # partial. A retraction counts when the prior saw the question in another state, when it was
+    # raised in this window, or when its `retracted_at` falls in it. Applied keeps the snapshot
+    # diff: no apply time is recorded.
+    answered_ids: list = []
+    unanswered_at: list = []
+    retracted_ids: list = []
+    # The prior-state test needs no window start, so an unreadable start (already named by the
+    # culled path) still lists what the snapshots prove; only the timestamp comparison is skipped.
+    def _in_window(at) -> bool:
+        return start is not None and at is not None and at >= start
+
+    for q in sorted(now_q):
+        fields = raised.get(q, {})
+        prior_state = prior_q.get(q)
+        if now_q[q] == "answered" and prior_state != "answered":
+            at = _registry._parse_iso(fields.get("answered_at", ""))
+            if prior_state is not None or _in_window(at):
+                answered_ids.append(q)
+            # A question `raised` does not cover is already named by the opened note; an
+            # unreadable start is already named by the culled path.
+            elif at is None and q in raised and start is not None:
+                unanswered_at.append(q)
+        elif now_q[q] == _registry.Q_RETRACTED and prior_state != _registry.Q_RETRACTED:
+            at = _registry._parse_iso(fields.get("retracted_at", ""))
+            if prior_state is not None or q in opened_ids or _in_window(at):
+                retracted_ids.append(q)
+    answered = tuple(answered_ids)
+    retracted = tuple(retracted_ids)
+    answer_partial = ""
+    if unanswered_at:
+        n = len(unanswered_at)
+        answer_partial = (
+            f"window partial: {_plural(n, 'live answer')} on the board "
+            f"{_agree(n, 'carries', 'carry')} no readable answered_at and could not be placed: "
+            f"{', '.join(unanswered_at)}"
+        )
+        partial_note = "; ".join(n for n in (partial_note, answer_partial) if n)
     applied = tuple(
         q for q in sorted(now_q) if now_q[q] == "applied" and prior_q.get(q) != "applied"
-    )
-    retracted = tuple(
-        q for q in sorted(now_q)
-        if now_q[q] == _registry.Q_RETRACTED and prior_q.get(q) != _registry.Q_RETRACTED
     )
 
     prior_triaged = set((prior.get("issues") or {}).get("triaged_numbers") or [])
@@ -2121,6 +2456,8 @@ def diff_since(prior: Optional[dict], current: dict, *, prior_path: str = "", re
         questions_retracted=retracted,
         issues_triaged=issues_triaged,
         health_crossings=tuple(crossings),
+        answer_partial_note=answer_partial,
+        partial_note=partial_note,
     )
     if changed.is_empty:
         # "The report can prove a quiet period" — a real and useful sentence that could
@@ -2128,6 +2465,22 @@ def diff_since(prior: Optional[dict], current: dict, *, prior_path: str = "", re
         stamp = changed.prior_generated_at or "the last report"
         changed = replace(changed, note=f"nothing changed since {stamp}")
     return changed
+
+
+def _name_changes(
+    changed: ChangedSince, subjects: Mapping[str, str], titles: Mapping[int, str]
+) -> ChangedSince:
+    """``changed`` with a ``NamedId`` for every question id and triaged issue number it holds."""
+    qids = dict.fromkeys(
+        changed.questions_opened
+        + changed.questions_answered
+        + changed.questions_applied
+        + changed.questions_retracted
+    )
+    names = tuple(name_registry_id(q, subjects) for q in qids) + tuple(
+        name_issue(n, titles) for n in changed.issues_triaged
+    )
+    return replace(changed, names=names)
 
 
 # --------------------------------------------------------------------------- #
@@ -2180,8 +2533,8 @@ def _worktree_drift(inputs: ReportInputs, agent_rows, runner: Optional[GitRunner
     """Worktree directories on disk vs the lanes that claim them. Directory listing only.
 
     **Listed at ``<worktree_root>/<project>``, one level down.** The layout is
-    ``<worktree_root>/<project>/<epic-slug>`` — config.py says so in its own remediation and
-    six SKILL.md files write it out. Listing the ROOT yielded the project directories, so every
+    ``<worktree_root>/<project>/<epic-branch>`` — config.py says so in its own remediation and
+    the SKILL.md files write it out. Listing the ROOT yielded the project directories, so every
     project in the data root was reported as a permanently unclaimed worktree (noise that
     trains the reader to ignore the row, growing by one per project) while the actual abandoned
     per-epic worktree the check exists to find was never seen. Scoping to the project also
@@ -2199,10 +2552,14 @@ def _worktree_drift(inputs: ReportInputs, agent_rows, runner: Optional[GitRunner
         dirs = tuple(sorted(p.name for p in root.iterdir() if p.is_dir()))
     except OSError as e:
         return WorktreeDrift(reason=f"could not list the worktree root: {type(e).__name__}: {e}")
+    # An idle row's `work` cell is the epic it finished; counting it hid that epic's abandoned
+    # worktree. Same idle test as the held set (`issue_intake`).
     claims = [
         row.work.strip()
         for row in agent_rows
-        if not _registry.is_reaped_phase(row.phase) and row.work.strip() not in ("", "-")
+        if not _registry.is_reaped_phase(row.phase)
+        and _intake._agent_row_holds(row.status)
+        and row.work.strip() not in ("", "-")
     ]
     unclaimed = tuple(d for d in dirs if not _claims_worktree(d, claims))
     registered, registration_note = _registered_worktrees(inputs, root, runner)
@@ -2223,7 +2580,8 @@ def _worktree_drift(inputs: ReportInputs, agent_rows, runner: Optional[GitRunner
 
 #: `e0768-account-limit-keystone` and `E-0768-the-fleet-cannot-survive` are the same epic, and no
 #: substring of either appears in the other. The number is the only thing both sides carry.
-_WT_EPIC_NUM = re.compile(r"(?i)\be-?(\d{3,})")
+#: ASCII digits only, and `(?!\d)` so `e0768` followed by a non-ASCII digit is no epic at all.
+_WT_EPIC_NUM = re.compile(r"(?i)\be-?([0-9]{3,})(?!\d)")
 
 
 def _claims_worktree(directory: str, claims: Sequence[str]) -> bool:
@@ -2322,14 +2680,11 @@ def _norm_wt_path(value) -> str:
 # --------------------------------------------------------------------------- #
 # Collection
 # --------------------------------------------------------------------------- #
-#: (section heading, header cell, minimum cells, id predicate) for each registry table
-#: `parse_registry` filters. Every one of these filters DROPS a row it does not like, in
-#: silence — that is a scan, so it owes a skip count.
-_REGISTRY_TABLES: tuple = (
-    ("Agents", "agent", 7, lambda c: c in _registry.AGENTS, "agent name is not one of the fleet's loops"),
-    ("Queue", "id", 7, lambda c: bool(_registry._E_ID.match(c)), "id is not an E-NNNN row id"),
-    ("Blockers", "id", 6, lambda c: bool(_registry._B_ID.match(c)), "id is not a B-NNNN row id"),
-)
+#: (section heading, header cell, minimum cells) for each registry table `parse_registry`
+#: filters. Every one of these filters DROPS a row it does not like, in silence — that is a
+#: scan, so it owes a skip count. The key check is the parser's own `_ROW_KEY_RULES`, read at
+#: call time, never a copy here: a copy drifts, and the count then disagrees with the parse.
+_REGISTRY_TABLES: tuple = (("Agents", "agent", 7), ("Queue", "id", 7), ("Blockers", "id", 6))
 
 
 def _registry_skips(text: str, reg: _registry.Registry, redact: Sequence[str]) -> list:
@@ -2344,7 +2699,8 @@ def _registry_skips(text: str, reg: _registry.Registry, redact: Sequence[str]) -
     RULE exists to close, on the one file the whole report leans on.
     """
     skips: list[SkippedFile] = []
-    for section, header0, minimum, id_ok, id_reason in _REGISTRY_TABLES:
+    for section, header0, minimum in _REGISTRY_TABLES:
+        key_label, key_why = _registry._ROW_KEY_RULES[section][1:]
         try:
             body = _registry._get_body(text, section)
         except _registry.RegistryError:
@@ -2355,8 +2711,8 @@ def _registry_skips(text: str, reg: _registry.Registry, redact: Sequence[str]) -
             name = cells[0] or f"<row {index}>"
             if len(cells) < minimum:
                 reason = f"row has {len(cells)} cells, expected at least {minimum}"
-            elif not id_ok(cells[0]):
-                reason = id_reason
+            elif not _registry._row_key_ok(section, cells[0]):
+                reason = f"{key_label}: {key_why}"
             elif len(cells) > minimum:
                 reason = (
                     f"row has {len(cells)} cells, expected {minimum} - an unescaped '|' shifts "
@@ -2437,18 +2793,49 @@ def _read_registry(
     )
 
 
+def _read_held_board(inputs: ReportInputs, reg, registry_reason: str) -> tuple:
+    """(board, unread): the board the held-set readers use, or None and why it was not read.
+
+    ``_read_registry`` parses leniently so the rest of the report survives a damaged board, but
+    the held set must not: the parser drops a short row and keeps only the last of a duplicated
+    id, so a held issue would vanish and be offered as free (gh#1005). The held set therefore
+    goes through ``issue_intake.read_board``, the refusal the ``selectable`` CLI and the bug
+    mirror use, so all three read one board one way.
+    """
+    if reg is None:
+        return None, registry_reason or "the registry was not read"
+    try:
+        return _intake.read_board(Path(inputs.registry_path)), ""
+    except _intake.IssueIntakeError as e:
+        return None, normalise_reason(e, redaction_prefixes(inputs.data_root))
+
+
 def _collect_intake(
     inputs: ReportInputs,
     *,
     issues: Optional[Sequence],
     runner,
     cap: int,
-) -> tuple[IntakeSection, tuple]:
-    """INTAKE, and the triaged issue numbers the diff needs.
+    held: Optional[frozenset] = None,
+    held_unread: str = "",
+    registry_read: bool = False,
+) -> tuple[IntakeSection, tuple, dict]:
+    """INTAKE, the triaged issue numbers the diff needs, and ``{number: title}`` for them.
+
+    The titles ride out beside the numbers so CHANGED SINCE can print ``#N (title)`` from the
+    same read, rather than a renderer pairing a number with a title from somewhere else.
 
     Untriaged and selectable are computed from ONE issue list. Two separate tracker calls
     could disagree with each other mid-report, and the pair being consistent is the whole
     point of the pair.
+
+    ``held`` is the board's held set (``issue_intake.held_issue_numbers``), subtracted from
+    selectable so INTAKE prints the number the ``selectable`` CLI and WORK's ``bug_claimable``
+    print. ``None`` means no held set was read; ``held_unread`` then says why, and the
+    count is marked label-only rather than passed off as the builder's list. ``registry_read``
+    says whether the lenient parse the rest of the report uses succeeded: when it did, the
+    held set was REFUSED, not unread, and the note must not tell the reader the board was never
+    opened while every other section prints from it.
     """
     capped = False
     issues_supplied = issues is not None
@@ -2471,18 +2858,18 @@ def _collect_intake(
                         f"cli={inputs.tracker_cli or 'unset'})"
                     ),
                     tracker_configured=True,
-                ), ()
+                ), (), {}
             return IntakeSection(
                 reason=(
                     "no issue tracker for this project "
                     f"(work_source.kind={inputs.tracker_kind or 'unset'}, "
                     f"cli={inputs.tracker_cli or 'unset'})"
                 )
-            ), ()
+            ), (), {}
         if not inputs.tracker_host_ref:
             return IntakeSection(
                 reason="no tracker host_ref configured for this project", tracker_configured=True
-            ), ()
+            ), (), {}
         try:
             issues = _intake.list_open_issues(
                 inputs.tracker_host_ref,
@@ -2492,7 +2879,7 @@ def _collect_intake(
                 limit=inputs.issue_limit,
             )
         except _intake.IssueIntakeError as e:
-            return IntakeSection(reason=f"tracker unreachable: {e}", tracker_configured=True), ()
+            return IntakeSection(reason=f"tracker unreachable: {e}", tracker_configured=True), (), {}
         # A tracker page that came back exactly full is indistinguishable from one that was
         # truncated, and the untriaged/selectable pair would then be a partial count with no
         # skip beside it.
@@ -2504,12 +2891,27 @@ def _collect_intake(
         return IntakeSection(
             reason=f"could not read carved-spec cross-links: {e}",
             tracker_configured=True,
-        ), ()
+        ), (), {}
     untriaged = _intake.untriaged(issues, linked)
-    selectable = _intake.builder_selectable(issues)
+    label_selectable = _intake.builder_selectable(issues)
+    selectable = _intake.builder_selectable(issues, held or frozenset())
+    if held is not None:
+        selectable_note = ""
+    elif registry_read:
+        selectable_note = (
+            "label-only: the registry's claim check refused the board, so bugs already on the "
+            f"board are still counted ({held_unread or 'no reason given'})"
+        )
+    else:
+        selectable_note = (
+            "label-only: the registry was not read, so bugs already on the board are still "
+            f"counted ({held_unread or 'no reason given'})"
+        )
     claimed = _intake.label_claimed(issues)
     awaiting = _intake.awaiting_decision(issues)
-    triaged = tuple(sorted(i.number for i in issues if _intake.TRIAGED_LABEL in i.labels))
+    triaged_issues = [i for i in issues if _intake.TRIAGED_LABEL in i.labels]
+    triaged = tuple(sorted(i.number for i in triaged_issues))
+    triaged_titles = {i.number: i.title for i in triaged_issues}
     fix_count, fix_claimed, fix_note = _intake_fix_claims(
         inputs, issues, runner=runner, specs_dir=specs_dir, issues_supplied=issues_supplied
     )
@@ -2526,12 +2928,13 @@ def _collect_intake(
             selectable_count=len(selectable),
             untriaged=_cap(untriaged, cap),
             selectable=_cap(selectable, cap),
+            selectable_note=selectable_note,
             claimed=_cap(claimed, cap),
             awaiting_count=len(awaiting),
             awaiting=_cap(awaiting, cap),
             capped=capped,
             limit=inputs.issue_limit,
-            all_selectable=tuple(selectable),
+            all_selectable=tuple(label_selectable),
             all_claimed=tuple(claimed),
             all_awaiting=tuple(awaiting),
             fix_claimed_count=fix_count,
@@ -2539,6 +2942,7 @@ def _collect_intake(
             fix_claims_note=fix_note,
         ),
         triaged,
+        triaged_titles,
     )
 
 
@@ -2622,8 +3026,12 @@ def collect(
     # Built HERE rather than at the constructor 100 lines down, because `core["health"]` needs
     # it: `survey_skips` is every scan's skips, and the epic survey is only one of the two.
     counted_skipped = CountedSkippedSection(scans=(epic_scan, registry_scan))
-    intake, triaged_numbers = _collect_intake(
-        inputs, issues=issues, runner=issue_runner, cap=cap
+    held_board, held_unread = _read_held_board(inputs, reg, registry_reason)
+    intake, triaged_numbers, triaged_titles = _collect_intake(
+        inputs, issues=issues, runner=issue_runner, cap=cap,
+        held=_intake.held_issue_numbers(held_board) if held_board is not None else None,
+        held_unread=held_unread,
+        registry_read=reg is not None,
     )
 
     # ---- prior + the diff, computed before the sections that depend on it -- #
@@ -2645,22 +3053,30 @@ def collect(
     # lead-dev picks from the claimable epics and bugs and only publishes into its Queue lane
     # afterwards, so an empty lane beside startable work is a seat about to pick, not a dry one.
     # Only SHIPPED needs the diff, and it is attached once the diff exists.
-    claims_unread = "" if reg is not None else (registry_reason or "the registry was not read")
+    #
+    # BOTH HALVES READ THE CHECKED BOARD. The epic half read the lenient parse, which keeps only
+    # the last of a duplicated id and drops an off-pattern one: a terminal twin then hid a
+    # building claim and offered the held epic as claimable. `held_board` is the board the bug
+    # half and the `selectable` CLI read, and `held_unread` says why there is none.
     work = _work_section(
-        reg, scoped_records, None, inputs=inputs, cap=cap, scan=epic_scan,
-        claims_unread=claims_unread,
+        held_board, scoped_records, None, inputs=inputs, cap=cap, scan=epic_scan,
+        claims_unread=held_unread,
     )
     # WORK's bug side is a RE-SLICE of the issue list INTAKE already read, never a second
     # tracker call: "two separate tracker calls could disagree with each other mid-report".
     # Same one-read discipline, one section further along.
-    work = _attach_bug_work(work, intake, reg, claims_unread=claims_unread, cap=cap)
+    work = _attach_bug_work(work, intake, held_board, claims_unread=held_unread, cap=cap)
     # Third pass rather than a branch inside either half: the signal spans BOTH columns
     # (an epic can be held by a bug's files and the reverse), so it cannot be computed
     # until both are assembled.
     work = _attach_seam_signal(work, scoped_records, inputs)
 
+    # One subject map for every section, so LANES, BLOCKED and CHANGED SINCE cannot name one
+    # id two ways.
+    subjects = registry_subjects(reg)
     lanes = _lanes_section(
-        reg, now=now, stale_hours=inputs.stale_hours, selection=_lead_selection(work, intake)
+        reg, now=now, stale_hours=inputs.stale_hours, selection=_lead_selection(work, intake),
+        subjects=subjects,
     )
     core = {
         "version": SNAPSHOT_VERSION,
@@ -2681,7 +3097,9 @@ def collect(
     }
 
     # ---- sections -------------------------------------------------------- #
-    blocked = _blocked_section(reg, scoped_records, now=now, cap=cap, scan=epic_scan)
+    blocked = _blocked_section(
+        reg, scoped_records, now=now, cap=cap, scan=epic_scan, subjects=subjects
+    )
     health = _health_section(
         reg,
         scoped_records,
@@ -2696,8 +3114,37 @@ def collect(
     # produced the WAS side one report ago — see `_health_metrics` for why they cannot be two
     # dicts. `lanes` here is the pre-attach binding; the test pins the pair end to end.
     core["health"] = _health_metrics(health, lanes, counted_skipped)
-    changed = diff_since(prior, core, prior_path=prior_path, reason=prior_reason)
-    decided = _decided_section(reg, changed, cap=cap)
+    changed = diff_since(
+        prior, core, prior_path=prior_path, reason=prior_reason,
+        raised={qid: q.fields for qid, q in reg.questions.items()} if reg else {},
+    )
+    # A question opened, answered, applied and culled between two reports is in neither
+    # snapshot, so the diff alone never sees it. Only a windowed report reads the cull log: with
+    # no prior there is no window to filter the archive's whole history against.
+    # ONE read of the cull log per collect, shared with the production signal below.
+    cull_log = _read_cull_log(inputs)
+    window = _CulledWindow()
+    if not changed.no_prior:
+        window = _culled_answers_in_window(
+            inputs, reg, changed.prior_generated_at,
+            log=cull_log, prior_questions=prior.get("questions") or {},
+        )
+        changed = _fold_culled_answers(changed, window)
+    changed = _name_changes(
+        changed,
+        {
+            **{qid: registry_subject(f.get("question", ""))
+               for qid, f in {**window.retractions, **window.raises, **window.answers}.items()},
+            **subjects,
+        },
+        triaged_titles,
+    )
+    decided = _decided_section(
+        reg, changed, cap=cap, culled=window.answers,
+        partial_note="; ".join(
+            n for n in (changed.answer_partial_note, window.answer_note) if n
+        ),
+    )
     work = _attach_shipped(work, changed, cap)
 
     # One read, two consumers: DONE renders the merged PRs, and WORK's diff-derived rows
@@ -2711,7 +3158,7 @@ def collect(
         lanes,
         merged_prs,
         reg,
-        inputs=inputs,
+        log=cull_log,
         available=done.available,
         reason=done.reason,
         window=done.window or f"last {DONE_WINDOW_LIMIT} merged PRs",
@@ -2766,7 +3213,15 @@ def collect(
 # --------------------------------------------------------------------------- #
 # Section builders
 # --------------------------------------------------------------------------- #
-def _blocked_section(reg, records, *, now: datetime, cap: int, scan: ScanCount) -> BlockedSection:
+def _blocked_section(
+    reg,
+    records,
+    *,
+    now: datetime,
+    cap: int,
+    scan: ScanCount,
+    subjects: Optional[Mapping[str, str]] = None,
+) -> BlockedSection:
     """1. BLOCKED ON YOU — open Questions with AGE, oldest first; human-owned Blockers;
     the count of drafted specs awaiting promotion.
 
@@ -2815,10 +3270,13 @@ def _blocked_section(reg, records, *, now: datetime, cap: int, scan: ScanCount) 
         r for r in records if _survey._norm_state(r.current_state) == DRAFTED_CURRENT_STATE
     ]
     drafted_sorted = _by_priority_then_slug(drafted)
+    if subjects is None:
+        subjects = registry_subjects(reg)
     stranded = [
         StrandedLaneRow(
             agent=u.agent, waiting_on=u.waiting_on, reason=u.reason,
             fix=DEAD_REFERENT_FIXES[u.reason],
+            waiting_on_label=name_registry_ids_in(u.waiting_on, subjects),
         )
         for u in _dead_referent_halts(reg, now).values()
     ]
@@ -2848,7 +3306,265 @@ def _dead_referent_halts(reg, now: datetime) -> dict:
     }
 
 
-def _decided_section(reg, changed: ChangedSince, *, cap: int) -> DecidedSection:
+#: The question states that record an answer. `retracted` blocks are culled to the same log, but
+#: a withdrawn question was never answered, so it is not a decision.
+_ANSWERED_STATES = ("answered", "applied")
+
+
+def _culled_questions(log_text: str) -> dict:
+    """``{qid: fields}`` for every ``### Q-NNNN`` block in the cull log.
+
+    The steward moves a closed block to ``registry-log.md`` verbatim - the same ``### Q-NNNN``
+    heading and ``- field: value`` lines the live board carries - so it parses with the
+    registry's own block pattern. A block's fields END at its first non-field line after the
+    heading, because the log interleaves blocks with culled table rows and struck notes and
+    nothing else separates them. A repeated field keeps its LAST value, as `parse_registry` does
+    on the live board, and a later block for the same id replaces an earlier one: ids are allocated past every id the log mentions, so a
+    repeat is the newer record.
+    """
+    out: dict = {}
+    for qid, block in _registry._iter_qblocks(log_text):
+        fields: dict = {}
+        for line in block.split("\n")[1:]:
+            fm = _registry._QFIELD_RE.match(line)
+            if fm:
+                fields[fm.group(1)] = fm.group(2).strip()
+            elif fields or line.strip():
+                break
+        out[qid] = fields
+    return out
+
+
+@dataclass(frozen=True)
+class _CullLog:
+    """``registry-log.md``, read ONCE per collect and handed to every consumer.
+
+    The log passes 1 MB on a mature fleet, and DECIDED/CHANGED SINCE and the production signal
+    each used to read it for themselves. ``error`` is a failure that is NOT absence: a missing
+    file is a fresh install with nothing culled and leaves ``text`` empty and ``error`` None,
+    which is also the shape when there is no registry path at all. Each consumer decides for
+    itself what an ``error`` means, exactly as it did when it read the file alone.
+    """
+
+    text: str = ""
+    error: Optional[OSError] = None
+    name: str = "registry-log.md"
+
+    @property
+    def unreadable(self) -> str:
+        return f"{self.name} unreadable ({self.error.__class__.__name__})"
+
+
+def _read_cull_log(inputs: "ReportInputs") -> _CullLog:
+    if inputs.registry_path is None:
+        return _CullLog()
+    log_path = Path(inputs.registry_path).parent / "registry-log.md"
+    try:
+        # errors="replace", not strict: one bad byte anywhere in a 1 MB append-only archive must
+        # not take the whole report down, and a mangled character in a culled work_item cannot
+        # change an id or a claimed_by cell.
+        return _CullLog(text=log_path.read_text(encoding="utf-8", errors="replace"),
+                        name=log_path.name)
+    except FileNotFoundError:
+        return _CullLog(name=log_path.name)
+    except OSError as exc:
+        return _CullLog(error=exc, name=log_path.name)
+
+
+def _culled_answers_in_window(
+    inputs: "ReportInputs",
+    reg,
+    window_start: str,
+    *,
+    log: _CullLog,
+    prior_questions: Optional[Mapping] = None,
+) -> "_CulledWindow":
+    """The questions already culled to the log that moved inside the window (``_CulledWindow``).
+
+    ``answers`` are the questions answered OR APPLIED since ``window_start``. The cull keeps no
+    apply time, so ``answered_at`` alone cannot date an apply whose answer came before the
+    window. The prior report's snapshot can: a question it recorded as ``answered`` whose culled
+    block now says ``applied`` was applied between the two reports, and the cull moves blocks
+    verbatim, so that is exact. ``raises`` are the questions RAISED since ``window_start`` that
+    are in neither the prior snapshot nor the live board, so a question raised and culled
+    between two reports still reads as opened. ``retractions`` close those raises: a culled
+    ``retracted`` block was withdrawn in the window when the prior snapshot held it in any other
+    state, when it was raised in the window, or when its ``retracted_at`` falls in it.
+
+    An unreadable log returns nothing and says the window is partial, because on a mature fleet
+    the log holds most of the window's answers. A block still on the live board is left to the
+    diff (deduped by id), so one question cannot be listed twice or with two different states.
+    Every answerer is returned - CHANGED SINCE lists answers by anyone - and DECIDED filters to
+    the delegated seats itself. A block with NO ``raised_at`` at all predates the field and is
+    not a raise this window can claim. One whose ``raised_at`` is present but does not parse is
+    named in ``raise_note`` UNLESS its answer or retraction is dated before the window, since a
+    raise cannot come after either: without that bound one malformed block in old history would
+    mark every report partial forever.
+    """
+    if inputs.registry_path is None:
+        return _CulledWindow()
+    if log.error is not None:
+        whole = (
+            f"window partial: {log.unreadable}, so answers the steward has already culled are "
+            "missing, and culled raises with them"
+        )
+        return _CulledWindow(answer_note=whole, raise_note=whole)
+    # Floored to the minute by the same helper `diff_since` uses, so a raise in the window
+    # start's own minute counts on both paths or on neither.
+    start = _window_floor(window_start)
+    if start is None:
+        whole = (
+            f"window partial: the window start {window_start!r} is unreadable, so culled answers "
+            f"in {log.name} could not be placed in it, nor culled raises"
+        )
+        return _CulledWindow(answer_note=whole, raise_note=whole)
+    prior_questions = prior_questions or {}
+    live = set(reg.questions) if reg is not None else set()
+    found: dict = {}
+    raises: dict = {}
+    retractions: dict = {}
+    unplaced: list = []
+    unraised: list = []
+    for qid, fields in _culled_questions(log.text).items():
+        if qid in live:
+            continue
+        # In the prior snapshot means the prior report already saw it raised.
+        if qid not in prior_questions:
+            placed = _place_raise(fields, start)
+            if placed == _RAISE_IN:
+                raises[qid] = fields
+            elif placed == _RAISE_UNPLACED:
+                unraised.append(qid)
+        state = fields.get("state", "")
+        if state == _registry.Q_RETRACTED:
+            prior_state = prior_questions.get(qid)
+            retracted = _registry._parse_iso(fields.get("retracted_at", ""))
+            if prior_state != _registry.Q_RETRACTED and (
+                prior_state is not None
+                or qid in raises
+                or (retracted is not None and retracted >= start)
+            ):
+                retractions[qid] = fields
+            continue
+        if state not in _ANSWERED_STATES:
+            continue
+        if state == "applied" and prior_questions.get(qid) == "answered":
+            found[qid] = fields
+            continue
+        # The prior snapshot, taken at the window start, saw it in another state: answered since,
+        # the shortcut the live answered line takes, so a question counts the same before and
+        # after the cull. Answered only: an applied block keeps the rule above, as the live
+        # applied line keeps its own snapshot diff.
+        if state == "answered" and prior_questions.get(qid) not in (None, "answered"):
+            found[qid] = fields
+            continue
+        answered = _registry._parse_iso(fields.get("answered_at", ""))
+        if answered is None:
+            unplaced.append(qid)
+        elif answered >= start:
+            found[qid] = fields
+    answer_note = raise_note = ""
+    if unplaced:
+        answer_note = (
+            f"window partial: {_plural(len(unplaced), 'culled answer')} in {log.name} "
+            f"{_agree(len(unplaced), 'carries', 'carry')} an unreadable answered_at and could "
+            f"not be placed: {', '.join(unplaced)}"
+        )
+    if unraised:
+        raise_note = (
+            f"window partial: {_plural(len(unraised), 'culled question')} in {log.name} "
+            f"{_agree(len(unraised), 'carries', 'carry')} an unreadable raised_at and could not "
+            f"be placed: {', '.join(unraised)}"
+        )
+    return _CulledWindow(found, raises, retractions, answer_note, raise_note)
+
+
+@dataclass(frozen=True)
+class _CulledWindow:
+    """What the cull log adds to one window.
+
+    ``answer_note`` is about the answers and travels to DECIDED and CHANGED SINCE. ``raise_note``
+    is about the raises and travels to CHANGED SINCE only: DECIDED lists answers, and a raise
+    that could not be placed is missing from no line of it.
+    """
+
+    answers: Mapping = field(default_factory=dict)
+    raises: Mapping = field(default_factory=dict)
+    retractions: Mapping = field(default_factory=dict)
+    answer_note: str = ""
+    raise_note: str = ""
+
+    @property
+    def changed_note(self) -> str:
+        return "; ".join(dict.fromkeys(n for n in (self.answer_note, self.raise_note) if n))
+
+
+def _fold_culled_answers(changed: ChangedSince, window: _CulledWindow) -> ChangedSince:
+    """``changed`` with the culled answers added to ``questions_answered`` / ``questions_applied``,
+    the culled raises to ``questions_opened`` and the culled retractions to
+    ``questions_retracted``.
+
+    Answers are filed under their CURRENT state only, exactly as ``diff_since`` files a live
+    question: an ``applied`` block goes on the applied line and an ``answered`` one on the
+    answered line. Raises are listed as opened whatever state the block is in now, and so is a
+    live question in ``diff_since``; neither path looks at current state. Both date the raise the
+    same way (``_place_raise``): absent from the prior snapshot and ``raised_at`` inside the
+    window. So a question raised and closed inside the window reads as opened + closed both while it is
+    still on the board and after it is culled. A live id is never taken from the log (the diff
+    owns it; the skip is in ``_culled_answers_in_window``), and the two sets are unioned, so one
+    question is never listed twice. Folding the retractions gives every culled opened question
+    its matching close.
+
+    A partial read is ALWAYS said in CHANGED SINCE, not only when the section is empty: a raise
+    that could not be placed is missing from the opened line however many other lines are
+    filled. On an otherwise empty section it rewrites the "nothing changed" note, which would
+    otherwise be a confident sentence over a source that was not read.
+    """
+    culled = window.answers
+    if culled:
+        changed = replace(
+            changed,
+            note="",
+            questions_answered=tuple(sorted(
+                set(changed.questions_answered)
+                | {q for q, f in culled.items() if f.get("state") == "answered"}
+            )),
+            questions_applied=tuple(sorted(
+                set(changed.questions_applied)
+                | {q for q, f in culled.items() if f.get("state") == "applied"}
+            )),
+        )
+    if window.raises:
+        changed = replace(
+            changed,
+            note="",
+            questions_opened=tuple(sorted(set(changed.questions_opened) | set(window.raises))),
+        )
+    if window.retractions:
+        changed = replace(
+            changed,
+            note="",
+            questions_retracted=tuple(sorted(
+                set(changed.questions_retracted) | set(window.retractions)
+            )),
+        )
+    # The live raises `diff_since` could not place, then the culled path's own gaps.
+    partial = "; ".join(n for n in (changed.partial_note, window.changed_note) if n)
+    if partial and changed.is_empty:
+        changed = replace(changed, note=f"{changed.note} in what could be read; {partial}")
+    elif partial:
+        changed = replace(changed, note=partial)
+    return changed
+
+
+def _decided_section(
+    reg,
+    changed: ChangedSince,
+    *,
+    cap: int,
+    culled: Optional[Mapping] = None,
+    partial_note: str = "",
+) -> DecidedSection:
     """2. DECIDED BY AGENTS — Questions answered under delegated authority since the last
     report.
 
@@ -2859,10 +3575,15 @@ def _decided_section(reg, changed: ChangedSince, *, cap: int) -> DecidedSection:
     The window comes from the diff: with a prior report on disk only the newly-answered rows
     show, and with no prior every currently-answered row shows once (``windowed=False``), which
     the renderer says out loud rather than implying a window it does not have.
+
+    ``culled`` holds the window's answers already culled to the log (``_culled_answers_in_window``);
+    their ids are in ``changed`` and their fields come from the log. ``partial_note`` says the
+    window could not be read whole, and travels to the renderer unchanged.
     """
+    culled = culled or {}
     rows: list[DecidedRow] = []
-    if reg is not None:
-        if changed.no_prior:
+    if reg is not None or culled:
+        if changed.no_prior and reg is not None:
             qids = [
                 qid for qid, q in reg.questions.items()
                 if q.fields.get("state") in ("answered", "applied")
@@ -2881,17 +3602,18 @@ def _decided_section(reg, changed: ChangedSince, *, cap: int) -> DecidedSection:
                 )
             )
         for qid in qids:
-            q = reg.questions.get(qid)
-            if q is None or q.fields.get("answered_by") not in DELEGATED_ANSWERERS:
+            q = reg.questions.get(qid) if reg is not None else None
+            fields = q.fields if q is not None else culled.get(qid)
+            if fields is None or fields.get("answered_by") not in DELEGATED_ANSWERERS:
                 continue
             rows.append(
                 DecidedRow(
                     qid=qid,
-                    question=q.fields.get("question", ""),
-                    answer=q.fields.get("answer", ""),
-                    answered_by=q.fields.get("answered_by", ""),
-                    answered_at=q.fields.get("answered_at", ""),
-                    raised_by=q.fields.get("raised_by", ""),
+                    question=fields.get("question", ""),
+                    answer=fields.get("answer", ""),
+                    answered_by=fields.get("answered_by", ""),
+                    answered_at=fields.get("answered_at", ""),
+                    raised_by=fields.get("raised_by", ""),
                 )
             )
         rows.sort(key=lambda r: (r.answered_at, r.qid), reverse=True)
@@ -2899,6 +3621,7 @@ def _decided_section(reg, changed: ChangedSince, *, cap: int) -> DecidedSection:
         questions=_cap(rows, cap),
         window_start=changed.prior_generated_at,
         windowed=not changed.no_prior,
+        partial_note=partial_note,
     )
 
 
@@ -2948,7 +3671,11 @@ def _work_section(
     # `depends_on`", and an ended run put nothing on main - so they are excluded here in their
     # own right: a run that ended is not work a lane can start, whatever its spec still says.
     # An ended board therefore counts toward no WORK list, so a board whose only epics have
-    # ended does not suppress the no-work alert. Both sets are read through the module, never bound or restated.
+    # ended does not suppress the no-work alert. A board whose `status:` is outside the
+    # vocabulary (`UNRECOGNISED_BOARD_STATUS`) is not claimable either: `selectable` refuses it,
+    # and the report must not offer what every builder refuses. All three come from ONE set,
+    # `_survey.UNSELECTABLE_LIFECYCLE_STATES`, the same one `selectable` drops by, read through
+    # the module and never bound or restated.
     # `test_a_terminal_lifecycle_cannot_diverge_from_its_current_state` pins the pass 1/2
     # property; `test_an_ended_board_is_not_claimable_while_its_spec_still_reads_approved` pins
     # the pass 3 one.
@@ -2969,8 +3696,7 @@ def _work_section(
             project=inputs.project,
             warn_foreign=False,
         )
-        if r.lifecycle_state not in _survey.TERMINAL_CURRENT_STATES
-        and r.lifecycle_state not in _survey._ENDED_BOARD_STATUSES
+        if r.lifecycle_state not in _survey.UNSELECTABLE_LIFECYCLE_STATES
     ])
     running = _by_priority_then_slug([r for r in records if r.lifecycle_state == "running"])
     drafted = [r for r in records if _survey._norm_state(r.current_state) == DRAFTED_CURRENT_STATE]
@@ -2990,6 +3716,11 @@ def _work_section(
     lane_by_name: dict = {}
     if reg is not None:
         for row in reg.agents.values():
+            # An idle row's `work` cell still names the epic it finished; reading it would print
+            # that lane and its stale eta against an epic nobody is building. Same idle test as
+            # the held set (`issue_intake`), so an off-enum or odd-cased status still holds.
+            if not _intake._agent_row_holds(row.status):
+                continue
             name = _registry._epic_name(row.work)
             if name:
                 eta_by_name.setdefault(name, row.eta)
@@ -3066,6 +3797,10 @@ def _work_section(
             if name:
                 queue_claims.append((name, getattr(row, "work_item", "") or "", state == "parked"))
         for row in reg.agents.values():
+            # An idle row holds nothing: its `work` cell is the epic it finished, and counting it
+            # kept a shipped epic in flight until the lane's next status write.
+            if not _intake._agent_row_holds(row.status):
+                continue
             name = _registry._epic_name(row.work)
             if name and not any(name == q[0] for q in queue_claims):
                 agent_claims.append((name, "", False))
@@ -3206,19 +3941,25 @@ def _attach_bug_work(
 ) -> WorkSection:
     """Split INTAKE's already-read issues into WORK's bug columns.
 
-    in-flight is decided by EITHER claim route: a `gh#N` appearing in a claimed registry row
-    (E-0212's route, and the one with a reaper behind it), or the `in-progress` marker on the
-    issue itself (gh#56's route, and the only one issue selection can see). The registry claim
-    is the record of who is building what; the marker is the gate that stops a selector
-    offering the issue - written at different moments by different mechanisms, so they are not
-    two copies of one fact.
+    `bug_in_progress` is the held set: bug work published to a lane or being built. It reads
+    `issue_intake.held_refs`, the one predicate the `selectable` CLI and the bug mirror read
+    too, so the three cannot disagree. A `gh#N` in the work item of a non-terminal Queue row
+    (claimed or not) or in a non-idle Agents row is held; a `done` or `withdrawn` row and a Note are
+    not. The `in-progress` marker on the issue is honoured beside it, though nothing writes it
+    on its own. `bug_claimable` is the selectable bugs minus the held set.
 
-    The union with `intake.claimed` is load-bearing, not tidiness. `intake.selectable` no
-    longer contains marked issues, so splitting it alone would drop a bug out of BOTH columns
-    at the moment a lane took it - a board reading `0 in progress` while a lane builds, which
-    is exactly what an idle fleet reads like. `intake.awaiting` joins the union for the same
+    The union with `intake.claimed` is load-bearing, not tidiness. `intake.selectable` does
+    not contain marked issues, so splitting it alone would drop a bug out of BOTH columns at
+    the moment a lane took it - a board reading `0 in progress` while a lane builds, which is
+    exactly what an idle fleet reads like. `intake.awaiting` joins the union for the same
     reason (gh#446): a registry row can hold a `needs-decision` bug that carries no marker.
-    Unclaimed, it stays out of `bug_claimable` - a human call comes before any build.
+    Unheld, it stays out of `bug_claimable` - a human call comes before any build.
+
+    A held bug waiting unclaimed in a `ready` row is ALSO named in `published_unclaimed`, with
+    its lane, because only that lane's owner may take it.
+
+    `reg` is the board `issue_intake.read_board` returned (`_read_held_board`), never the
+    lenient parse the rest of the report reads; when there is none, `claims_unread` says why.
     """
     if not intake.available:
         # Say WHY the column is empty. "no open bugs" and "we could not look" are different
@@ -3226,15 +3967,11 @@ def _attach_bug_work(
         # them and WORK must not undo that one section later.
         return replace(work, bug_note=intake.reason or "tracker not available")
 
-    claimed_text = []
+    claimed_text = _intake.held_refs(reg) if reg is not None else []
     published_rows = []  # (row id, lane, text) for `ready` rows nobody has claimed
     if reg is not None:
-        for row in reg.agents.values():
-            claimed_text.append(f"{row.work} {row.phase}")
-        for row in getattr(reg, "queue", {}).values():
-            if getattr(row, "claimed_by", "-") not in ("-", ""):
-                claimed_text.append(f"{row.id} {row.work_item}")
-            elif getattr(row, "state", "") == "ready":
+        for row in reg.queue.values():
+            if row.claimed_by in ("-", "") and row.state == "ready":
                 published_rows.append((row.id, row.lane, f"{row.id} {row.work_item}"))
 
     # Split the UNCAPPED halves and cap only what is rendered. Splitting INTAKE's capped rows
@@ -3269,21 +4006,19 @@ def _attach_bug_work(
             ),
         )
 
-    # A bug published into a lane and not yet claimed leaves `bug_claimable` for the reason the
-    # epic side's does: only that lane's owner may take it. Matched by the same `gh#N` reading
-    # as a claim, one row at a time so each bug carries the lane it waits in.
+    # A bug published into a lane and not yet claimed is already out of `bug_claimable` (it is
+    # held), and is named here with the lane it waits in, because only that lane's owner may
+    # take it. One row at a time so each bug carries its own lane.
     published_bugs: list = []
     seen: set = set()
     for row_id, lane, text in published_rows:
-        for i in _intake.in_flight(
-            [i for i in claimable_items if hasattr(i, "number")], [text]
-        ):
-            if i.number not in seen:
+        row_numbers = _intake.ref_numbers([text])
+        for i in in_flight_items:
+            if getattr(i, "number", None) in row_numbers and i.number not in seen:
                 seen.add(i.number)
                 published_bugs.append(
                     PublishedRow(name=_issue_name(i), lane=lane, row_id=row_id, kind="bug")
                 )
-    claimable_items = [i for i in claimable_items if getattr(i, "number", None) not in seen]
     epic_published = work.published_unclaimed
     published = list(epic_published.items) + published_bugs
     return replace(
@@ -3424,7 +4159,7 @@ def _attach_seam_signal(
 ) -> WorkSection:
     """gh#121 - say how much of WORK a free lane could actually start.
 
-    The disjointness rule is right and this does not touch it: three builders in one seam
+    The disjointness rule is right and this does not touch it: builders sharing one seam
     produce merge conflicts even with worktrees. What was missing is a channel. On 2026-09-02
     every lane behaved correctly while the lead lane could claim nothing, because the board
     showed one healthy `building` row, three selectable bugs and non-zero WORK - and the only
@@ -3663,7 +4398,7 @@ _CHECK_RANK = {
 }
 
 
-_JOB_ID = re.compile(r"/job/(\d+)/?$")
+_JOB_ID = re.compile(r"/job/([0-9]+)/?$")
 
 
 def _check_identity(c: dict):
@@ -3787,6 +4522,9 @@ def _branch_lane_map(agent_rows, queue_rows) -> dict:
     for row in agent_rows or []:
         if _registry.is_reaped_phase(row.phase):
             continue
+        # An idle row holds nothing, so it must not name itself owner of a PR nobody is working.
+        if not _intake._agent_row_holds(row.status):
+            continue
         key = _wt_epic_key(row.work)
         if key:
             out.setdefault(key, row.agent)
@@ -3836,8 +4574,8 @@ def _attach_pr_evidence(rows: list, prs: tuple) -> list:
 
 
 #: What answers "does this seat have work" for a seat with NO Queue lane. The lane-shaped
-#: predicate below covers ``lead-dev`` / ``jr-dev-1`` / ``jr-dev-2``; the other three seats are
-#: fed by the routed-note inbox instead, and that is a real predicate rather than a stand-in -
+#: predicate below covers every seat ``registry.LANE_OF`` maps (the builders); the lane-less seats
+#: are fed by the routed-note inbox instead, and that is a real predicate rather than a stand-in -
 #: a note addressed to the auditor, the steward or dev-manager IS that seat's work item, which
 #: is why every one of them is instructed to drain its inbox at the wake read.
 INBOX_BASIS = "routed Notes addressed to it"
@@ -3923,8 +4661,10 @@ def _lane_has_work(reg, agent: str, *, selectable: bool = False) -> tuple:
 #: `production_available: True`. That is the exact confidently-wrong reading this signal exists
 #: to prevent, and BOTH reviewers found it independently. The map is now keyed under the full id
 #: AND its bare number, and this pattern is greedy, so a title carrying either form resolves.
-_PR_EPIC_KEY_RE = re.compile(r"\bE-\d{3,}(?:-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)?")
-_PR_ISSUE_KEY_RE = re.compile(r"\bgh#(\d+)\b", re.IGNORECASE)
+#: Digits are `[0-9]` (gh#1123); `(?!\d)` and the Unicode `\b` refuse a non-ASCII digit
+#: run-on instead of reading its ASCII prefix as a shorter id.
+_PR_EPIC_KEY_RE = re.compile(r"\bE-[0-9]{3,}(?!\d)(?:-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)?")
+_PR_ISSUE_KEY_RE = re.compile(r"\bgh#([0-9]+)\b", re.IGNORECASE)
 
 #: Distinguishes "no seat recorded yet" from "recorded as ambiguous", which None alone cannot.
 _UNSET = object()
@@ -3954,7 +4694,7 @@ def _seat_by_epic_id(reg, log_text: str) -> dict:
         if not s.startswith("|"):
             continue
         cells = [c.strip() for c in s.strip("|").split("|")]
-        if len(cells) < 4 or not _registry._E_ID.match(cells[0]):
+        if len(cells) < 4 or not _registry._row_key_ok("Queue", cells[0]):
             continue
         if cells[3] not in _registry.AGENTS:
             continue
@@ -3994,7 +4734,7 @@ def _seat_by_epic_id(reg, log_text: str) -> dict:
 #: A row whose SUBJECT is an issue: the work_item opens with the issue it is there to fix
 #: (``BUG gh#134 - ...``). This is a structural ownership claim, unlike a mention of gh#134
 #: anywhere else in the same paragraph of seam prose.
-_ISSUE_SUBJECT_RE = re.compile(r"^\s*(?:BUG\s+)?gh#(\d+)\b", re.IGNORECASE)
+_ISSUE_SUBJECT_RE = re.compile(r"^\s*(?:BUG\s+)?gh#([0-9]+)\b", re.IGNORECASE)
 
 
 def _seat_by_issue_number(reg, log_text: str) -> dict:
@@ -4035,7 +4775,7 @@ def _seat_by_issue_number(reg, log_text: str) -> dict:
             if not s.startswith("|"):
                 continue
             cells = [c.strip() for c in s.strip("|").split("|")]
-            if len(cells) < 4 or not _registry._E_ID.match(cells[0]):
+            if len(cells) < 4 or not _registry._row_key_ok("Queue", cells[0]):
                 continue
             scan(cells[1], cells[3])
         for row in reg.queue.values():
@@ -4072,7 +4812,7 @@ def _attach_production_signal(
     prs: tuple,
     reg,
     *,
-    inputs: "ReportInputs",
+    log: _CullLog,
     available: bool,
     reason: str,
     window: str,
@@ -4093,26 +4833,15 @@ def _attach_production_signal(
             section, reason or "the tracker could not be read", window
         )
 
-    log_text = ""
-    if inputs.registry_path is not None:
-        log_path = Path(inputs.registry_path).parent / "registry-log.md"
-        try:
-            # errors="replace", not strict: one bad byte anywhere in a 900KB append-only
-            # archive must not take the whole report down, and a mangled character in a
-            # culled work_item cannot change an id or a claimed_by cell.
-            log_text = log_path.read_text(encoding="utf-8", errors="replace")
-        except FileNotFoundError:
-            # GENUINELY ABSENT, which is the fresh-install shape. It only narrows the map.
-            log_text = ""
-        except OSError as exc:
-            # ANY OTHER FAILURE IS NOT ABSENCE, AND ON A MATURE FLEET THE LOG *IS* THE MAP -
-            # shipped rows are culled within a wake or two, so a denial here collapses every
-            # lane to zero. Reporting those zeros beside `production_available: True` would be
-            # "0 merged" printed next to a lane that shipped four things, which is the precise
-            # failure this signal was written against. Refuse to measure instead.
-            return _production_unmeasured(
-                section, f"{log_path.name} unreadable ({exc.__class__.__name__})", window
-            )
+    # A GENUINELY ABSENT log (empty text, no error) is the fresh-install shape: it only narrows
+    # the map. ANY OTHER FAILURE IS NOT ABSENCE, AND ON A MATURE FLEET THE LOG *IS* THE MAP -
+    # shipped rows are culled within a wake or two, so a denial here collapses every lane to
+    # zero. Reporting those zeros beside `production_available: True` would be "0 merged"
+    # printed next to a lane that shipped four things, which is the precise failure this signal
+    # was written against. Refuse to measure instead.
+    if log.error is not None:
+        return _production_unmeasured(section, log.unreadable, window)
+    log_text = log.text
 
     by_epic = _seat_by_epic_id(reg, log_text) if reg is not None else {}
     by_issue = _seat_by_issue_number(reg, log_text) if reg is not None else {}
@@ -4175,16 +4904,24 @@ def _credit(lane: LaneRow, n: int, basis: str) -> LaneRow:
 
 
 def _awaiting_a_decision(reg, agent: str) -> str:
-    """The ids of open Questions this seat RAISED and open Blockers it OWNS, or "".
+    """The ids of open halted/waiting Questions this seat RAISED and open Blockers it OWNS, or "".
 
     Raised-vs-owned is the asymmetry that matters: a question is answered FOR its
     raiser, and a blocker is resolved BY its owner. Reading either the other way round
     would mark the wrong seat as waiting.
+
+    AN ADVISORY QUESTION DOES NOT COUNT. Its raiser already made the call and kept moving on its
+    stated `assumption` (docs/REGISTRY.md #Questions; `registry.order_open_questions` ranks it
+    last for that reason), so nothing of the seat's is waiting and BLOCKED over it reports a
+    working seat as stalled on the human - the false alarm "ask + default, keep working" exists
+    to avoid. Only `halted` and `waiting` stop work. An urgency outside that vocabulary still
+    counts: a malformed row is surfaced, never silently treated as harmless.
     """
     ids = [
         qid for qid, q in sorted(reg.questions.items())
         if q.fields.get("state", "").strip() == "open"
         and q.fields.get("raised_by", "").strip() == agent
+        and q.fields.get("urgency", "").strip() != "advisory"
     ]
     # A lane HALTED on a dead referent (retracted, answered, missing) is not read here: the
     # halted branch of `classify_lane` returns before `awaiting` is ever consulted, so nothing
@@ -4199,6 +4936,11 @@ def _awaiting_a_decision(reg, agent: str) -> str:
 
 def _plural(n: int, noun: str) -> str:
     return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _agree(n: int, singular: str, plural: str) -> str:
+    """The verb form that agrees with a count of ``n``: ``_agree(1, "carries", "carry")``."""
+    return singular if n == 1 else plural
 
 
 def _lead_selection(work: WorkSection, intake: IntakeSection) -> tuple:
@@ -4261,6 +5003,7 @@ def _lanes_section(
     now: datetime,
     stale_hours: float,
     selection: tuple = (False, ""),
+    subjects: Optional[Mapping[str, str]] = None,
 ) -> LanesSection:
     """5. LANES — one row per loop, classified, with why it is not working.
 
@@ -4274,6 +5017,8 @@ def _lanes_section(
     )
     selectable, sentence = selection
     dead = _dead_referent_halts(reg, now)
+    if subjects is None:
+        subjects = registry_subjects(reg)
     # DRY and BLOCKED are DERIVED here, once, rather than in each renderer - the whole
     # reason the derivation lives in the collector is that two surfaces recomputing it
     # is two surfaces that can disagree.
@@ -4289,6 +5034,7 @@ def _lanes_section(
             awaiting=_awaiting_a_decision(reg, agent),
             selection=sentence if basis == SELECTION_BASIS else "",
             dead_referent=dead[agent].reason if agent in dead else "",
+            subjects=subjects,
         ))
     lanes = tuple(lanes)
     counts = {LANE_LIVE: 0, LANE_HALTED: 0, LANE_REAPED: 0, LANE_SILENT: 0,

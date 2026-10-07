@@ -28,8 +28,8 @@ then exits:
     1  at least one BEHAVIORAL assertion FAILed (structural-only failures warn,
        never fail the exit code)
     2  usage error: argparse, an unknown --only group, a config passed alongside
-       --self-test, or a config file that is missing or not readable JSON (reason
-       on stderr)
+       --self-test, or a config file that is missing, not readable JSON, not a
+       JSON object, or missing a required key (reason on stderr)
     3  no behavioral FAIL, but a scenario selected by --only (all, by default) was
        never recorded on this machine: its rows SKIP via `_unrecorded` and a
        `# unrecorded:` line names each missing artifact (gh#628)
@@ -53,7 +53,7 @@ CLI
 Record layout (this file is the contract the P0-T6..T10 recorders follow)
 -------------------------------------------------------------------------
     records/scenarioA/plan.md            solution-emitted plan (A2-A9)
-    records/scenarioB/status.md          orchestrator status board (B5-B7, E2)
+    records/scenarioB/status.md          orchestrator status board (B2, B5-B7, E2)
     records/scenarioB/wave-evidence.json {worktree_path, commits:[{sha,files:[]}],
                                           pytest_head:{result}}   (B2-B4, B8)
     records/scenarioC/                    MUST NOT contain a status.md (C3)
@@ -126,6 +126,19 @@ REQUIRED_CONFIG_KEYS = (
     "orchestrator_skill",
     "builder_entry",
 )
+
+#: The JSON type each REQUIRED_CONFIG_KEYS value must have, as (python type, name the
+#: error message uses). `status_roots` is iterated and each entry fed to Path (C3); the
+#: rest are path or skill-name strings. A str is iterable, so it must not pass for a
+#: list: it would iterate by character instead of failing (gh#989).
+REQUIRED_CONFIG_TYPES = {
+    "specs_dir": (str, "string"),
+    "plans_dir": (str, "string"),
+    "status_roots": (list, "list of strings"),
+    "solution_skill": (str, "string"),
+    "orchestrator_skill": (str, "string"),
+    "builder_entry": (str, "string"),
+}
 
 #: Keys a config may still carry from the Phase-0 port, read without error and
 #: ignored. `resolver_cmd` selected the pre-port `lib.plan_parser` import when null;
@@ -576,6 +589,13 @@ def _load_scenario_b(ctx: Context):
             evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             return state, None, f"wave-evidence.json unparseable: {exc}"
+        if not isinstance(evidence, dict):
+            # Valid JSON of the wrong shape is a malformed recording, refused here like
+            # an unparseable one - every B row reads it with `.get`, so passing a list
+            # through crashed B2/B3/B4/B8 instead of naming the defect (gh#769).
+            return state, None, (
+                f"wave-evidence.json is not a JSON object (got {type(evidence).__name__})"
+            )
     return state, evidence, None
 
 
@@ -606,6 +626,32 @@ def b1_record_present(ctx: Context) -> Result:
     return Result(PASS, "scenarioB status.md + wave-evidence.json present")
 
 
+#: The two ESCALATION headings the orchestrator's Step 1.1 opens before any wave can run.
+_STEP_1_1_STOPS = ("ESCALATION: Target tree unresolvable", "ESCALATION: Worktree mandate")
+
+
+def _scenario_b_step_1_1(state) -> Optional[str]:
+    """Why the recorded run did NOT get past Step 1.1 to Step 2, or None when it did.
+
+    Scenario B used to stop at Step 1.1 by design of the fixture (gh#1105): no epic worktree
+    and no origin matching host_ref. A recording of that stop must not read as a wave run.
+    Stopped: an unanswered Step 1.1 escalation is on the board. Reached Step 2: the board
+    carries a write only Step 2 or later makes - `preflight_audit_status` (Step 2's own
+    write) or a task moved off `pending` (Step 2 marks the ready set).
+    """
+    for esc in state.escalations:
+        if esc.answer is None and any(stop in esc.question for stop in _STEP_1_1_STOPS):
+            heading = next(s for s in _STEP_1_1_STOPS if s in esc.question)
+            return f"run stopped at orchestrator Step 1.1: open escalation {esc.id} ({heading})"
+    moved = [tid for tid, t in state.tasks.items() if t.state != "pending"]
+    if state.preflight_audit_status is None and not moved:
+        return (
+            "run never reached orchestrator Step 2: no preflight_audit_status and every task "
+            "still pending"
+        )
+    return None
+
+
 def b2_worktree(ctx: Context) -> Result:
     state, evidence, err = _load_scenario_b(ctx)
     if state is None:
@@ -614,9 +660,16 @@ def b2_worktree(ctx: Context) -> Result:
     # copied. It used to be duplicated here, so B2 could report one root while the
     # allowlist comparison used another and nothing would say so.
     wt = _scenario_b_worktree(state, evidence)
-    if wt:
-        return Result(PASS, f"worktree created: {wt}")
-    return Result(FAIL, "no worktree_path recorded (wave-evidence or task state)")
+    stopped = _scenario_b_step_1_1(state)
+    # The Step 1.1 stop is named first: it is the reason no worktree was recorded, so the
+    # bare "no worktree_path" line would hide the actual finding.
+    if stopped and "Step 1.1" in stopped:
+        return Result(FAIL, stopped)
+    if not wt:
+        return Result(FAIL, "no worktree_path recorded (wave-evidence or task state)")
+    if stopped:
+        return Result(FAIL, f"worktree recorded ({wt}) but {stopped}")
+    return Result(PASS, f"worktree created: {wt}; run got past Step 1.1 to Step 2")
 
 
 def b3_commit_touches_calc(ctx: Context) -> Result:
@@ -1031,10 +1084,10 @@ def c4_no_wake_scheduled(ctx: Context) -> Result:
     that none was scheduled. Absence of the log is not absence of the wake.
 
     There is no fixture-path substitute here: a wake is fired by the live skill through
-    the ScheduleWakeup stub, and the in-process parse C1-C3 run has no wake surface at
-    all. Per run-scenario.md, Scenario C produces no C row even in a FULL live recording
-    - so the only available evidence that the recording surface was live is the census
-    of the other scenarios' rows. With no rows at all, nothing was observed: SKIP.
+    the real ScheduleWakeup and logged by hand, and the in-process parse C1-C3 run has
+    no wake surface at all. Per run-scenario.md, Scenario C produces no C row even in a
+    FULL live recording - so the only available evidence that the recording surface was
+    live is the census of the other scenarios' rows. With no rows at all, nothing was observed: SKIP.
     """
     rows = ctx.wake_rows()
     hits = [r for r in rows if r["scenario"] == "C"]
@@ -1446,9 +1499,11 @@ def c13_slash_argument_beats_injected_default(ctx: Context) -> Result:
     and asserts the argument wins. Prose gates cannot reach precedence - only
     running it can, which is why this lives here and not in a grep.
     """
-    suite = ctx.skills_root() / "_shared"
-    if not (suite / "agentflow" / "config.py").is_file():
-        return Result(SKIP, f"agentflow package not found under {suite} (pre-port layout)")
+    suite, why = _shared_package_root(ctx, "config.py")
+    if suite is None:
+        # FAIL, not SKIP: the clone always ships skills/_shared, so finding none is a
+        # broken checkout, and a SKIP here exited 0 with the precedence check unrun.
+        return Result(FAIL, f"{why}; cannot execute `agentflow.config show`")
     with tempfile.TemporaryDirectory() as td:
         home = Path(td) / "config"
         (home / "projects").mkdir(parents=True)
@@ -1547,19 +1602,32 @@ _CLI_TIMEOUT = 120.0
 _DEPLOY_TAKE_SPELLINGS = (("deploy-lock", "take"), ("deploy-take",))
 
 
-def _registry_cli_root(ctx: Context) -> tuple[Optional[Path], str]:
-    """Directory to run ``python -m agentflow.registry`` from, or (None, why)."""
+def _shared_package_root(ctx: Context, module: str) -> tuple[Optional[Path], str]:
+    """The `skills/_shared` dir whose `agentflow/<module>` exists, or (None, why).
+
+    The clone comes first because the default skills_root (`~/.claude/skills`) is the
+    deployed tree, which never carries `_shared` - a check keyed on skills_root alone
+    found nothing there and SKIPped green (gh#944).
+    """
     candidates = [
         SCRIPT_DIR.parent / "skills" / "_shared",  # this repo: harness/ sits beside skills/
         ctx.skills_root() / "_shared",             # a separately configured skills tree
     ]
     for cand in candidates:
-        if (cand / "agentflow" / "registry.py").is_file():
+        if (cand / "agentflow" / module).is_file():
             return cand, ""
     return None, (
-        "agentflow/registry.py not found under any of "
-        f"{[str(c) for c in candidates]} - cannot execute the registry CLI"
+        f"agentflow/{module} not found under any of: {', '.join(str(c) for c in candidates)} - "
+        "neither this clone nor skills_root has a skills/_shared package"
     )
+
+
+def _registry_cli_root(ctx: Context) -> tuple[Optional[Path], str]:
+    """Directory to run ``python -m agentflow.registry`` from, or (None, why)."""
+    root, why = _shared_package_root(ctx, "registry.py")
+    if root is None:
+        return None, f"{why}; cannot execute the registry CLI"
+    return root, ""
 
 
 #: What `notify()` reads when the suite's own config does not resolve — its documented
@@ -2197,6 +2265,15 @@ def _registry_queue_row(text: str, eid: str) -> Optional[dict]:
     return None
 
 
+def _import_registry():
+    """The registry module whose row-key rule D4 defers to, or None. Never raises."""
+    try:
+        from agentflow import registry  # noqa: PLC0415 - optional, degrades to FAIL
+    except Exception:  # noqa: BLE001 - a missing install must not crash the harness
+        return None
+    return registry
+
+
 def d4_consume_first(ctx: Context) -> Result:
     """Consume-first (REGISTRY.md firing contract step 2): a builder wake that
     finds an answered Question row applies it BEFORE claiming new work.
@@ -2220,10 +2297,18 @@ def d4_consume_first(ctx: Context) -> Result:
         return Result(FAIL, "fixtures/scenarioD-registry-before.md not found")
     before = fixture.read_text(encoding="utf-8")
 
-    qm = re.search(r"^###\s+(Q-\d+)\s*$", before, re.M)
+    # ASCII digits only (gh#1123): a non-ASCII-digit id is not a registry id.
+    qm = re.search(r"^###\s+(Q-[0-9]+)\s*$", before, re.M)
+    # A Queue row is whatever the registry's own parser keeps (gh#1136): a private pattern here
+    # missed named ids (`E-0101-export`) and accepted ids the registry drops (`E-1`).
+    registry = _import_registry()
+    if registry is None:
+        return Result(FAIL, "agentflow.registry not importable - D4 cannot tell a Queue row id")
     parked_id = None
     ready_id = None
-    for m in re.finditer(r"^\|\s*(E-\d+)\s*\|", before, re.M):
+    for m in re.finditer(r"^\|\s*([^|\n]*?)\s*\|", before, re.M):
+        if not registry._row_key_ok("Queue", m.group(1)):
+            continue
         row = _registry_queue_row(before, m.group(1))
         if row is None:
             continue
@@ -2482,10 +2567,21 @@ def _frontmatter_field(text: str, key: str) -> Optional[str]:
 
 def _carved_specs() -> list[Path]:
     """The carve, tracked rather than recorded (scenario-D precedent: never commit a record;
-    a fixture is an input the assertion reasons about, which is a different thing)."""
+    a fixture is an input the assertion reasons about, which is a different thing).
+
+    Membership comes from the git index (gh#410): an untracked spec dropped beside the carve
+    would otherwise vouch for F2/F4 on one machine and not in CI. Rooted at the harness dir,
+    not the carve dir, so a carve dir holding only untracked files reads as empty rather than
+    tripping the helper's empty-index refusal."""
     if not _CARVED_DIR.is_dir():
         return []
-    return sorted(_CARVED_DIR.glob("*.md"))
+    from agentflow.tracked_paths import tracked_files  # noqa: PLC0415 - lazy so modes that never reach F2/F4 still run without agentflow; this path requires it
+
+    prefix = _CARVED_DIR.relative_to(SCRIPT_DIR).as_posix() + "/"
+    return tracked_files(
+        SCRIPT_DIR,
+        lambda rel: rel.startswith(prefix) and "/" not in rel[len(prefix):] and rel.endswith(".md"),
+    )
 
 
 class _UnreadableSpec(Exception):
@@ -2806,7 +2902,7 @@ SCENARIO_GROUPS = ("A", "B", "C", "D", "F", "G")
 
 
 class UsageError(Exception):
-    """A bad invocation (unknown --only group, unreadable config). `main` turns it into
+    """A bad invocation (unknown --only group, unreadable or malformed config). `main` turns it into
     a stderr message and exit 2, so exit 1 keeps meaning a behavioral FAIL (gh#628)."""
 
 
@@ -2828,8 +2924,65 @@ def parse_only(only: Optional[str]) -> Optional[set]:
     return groups
 
 
+def _config_type_errors(cfg: dict) -> list:
+    """`key: expected <type>, got <type>` for every present required key of the wrong type.
+
+    The one type check both `check.py <config>` and `--self-test` use (gh#989): a wrong
+    type otherwise crashed an assertion (C3 `TypeError`, exit 1) - a config typo read as
+    a behavioral regression.
+    """
+    errors = []
+    for key, (kind, name) in REQUIRED_CONFIG_TYPES.items():
+        if key not in cfg:
+            continue
+        value = cfg[key]
+        ok = isinstance(value, kind)
+        if ok and kind is list:
+            ok = all(isinstance(item, str) for item in value)
+        if not ok:
+            got = type(value).__name__
+            if isinstance(value, list):
+                got = "list containing " + ", ".join(sorted({type(i).__name__ for i in value if not isinstance(i, str)}))
+            errors.append(f"{key}: expected {name}, got {got}")
+    return errors
+
+
+def _check_config_shape(config_path: Path) -> None:
+    """Refuse a config that is not a JSON object carrying every REQUIRED_CONFIG_KEYS key
+    with the REQUIRED_CONFIG_TYPES type.
+
+    Without this a missing key surfaced as an assertion crash (`KeyError` in C6, exit 1)
+    and a `[]` or `"x"` config as a traceback - a config typo read as a behavioral
+    regression, which is what exit 1 is reserved for (gh#943).
+    """
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        raise UsageError(
+            f"FATAL: config {config_path} is not readable JSON: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(cfg, dict):
+        raise UsageError(
+            f"FATAL: config {config_path} must be a JSON object, got {type(cfg).__name__} - "
+            f"regenerate it from {EXAMPLE_CONFIG.name}"
+        )
+    missing = [k for k in REQUIRED_CONFIG_KEYS if k not in cfg]
+    if missing:
+        raise UsageError(
+            f"FATAL: config {config_path} is missing required key(s) {missing} - "
+            f"see {EXAMPLE_CONFIG.name} for every key it must carry"
+        )
+    wrong = _config_type_errors(cfg)
+    if wrong:
+        raise UsageError(
+            f"FATAL: config {config_path} has required key(s) of the wrong type: "
+            f"{'; '.join(wrong)} - see {EXAMPLE_CONFIG.name}"
+        )
+
+
 def run_suite(config_path: Path, only: Optional[str]) -> int:
     groups = parse_only(only)
+    _check_config_shape(config_path)
     try:
         ctx = Context(config_path)
     except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
@@ -3130,7 +3283,7 @@ ABSENCE_PASS_EVIDENCE = {
     "C10": lambda ctx: _steward_cadence_block(ctx)[0],
     "C11": lambda ctx: _registry_cli_root(ctx)[0],
     "C12": lambda ctx: _registry_cli_root(ctx)[0],
-    "C13": lambda ctx: (ctx.skills_root() / "_shared" / "agentflow" / "config.py").is_file(),
+    "C13": lambda ctx: _shared_package_root(ctx, "config.py")[0],
     "C14": _parsed_fixture_probe("plan-missing-epic.md"),
     "C15": lambda ctx: _registry_cli_root(ctx)[0],
     "E1": lambda ctx: (ctx.orchestrator_dir().parent / "_vendored" / "review-prompts").is_dir(),
@@ -3250,7 +3403,8 @@ def run_self_test(config_path: Optional[Path] = None) -> int:
     # 4b's graded count, the gh#220 shape that the tests had closed and the command
     # had not. Pinning, rather than only naming the config that decided, is what
     # makes two runs of one tree agree; the trade is that a malformed local config
-    # no longer fails here, and `check.py <config>` still rejects it when it loads.
+    # no longer fails here. `check.py <config>` rejects it instead: `run_suite` refuses
+    # a non-object config or a missing required key with exit 2 (gh#943).
     if config_path is None:
         config_path = EXAMPLE_CONFIG
         if DEFAULT_CONFIG.exists():
@@ -3268,8 +3422,11 @@ def run_self_test(config_path: Optional[Path] = None) -> int:
         if missing:
             ok = False
             print(f"FAIL self-test.config: {config_path} missing keys {missing}")
+        elif wrong := _config_type_errors(cfg):
+            ok = False
+            print(f"FAIL self-test.config: {config_path} wrong-typed keys: {'; '.join(wrong)}")
         else:
-            print(f"PASS self-test.config: {config_path.name} loads, all required keys present")
+            print(f"PASS self-test.config: {config_path.name} loads, all required keys present and correctly typed")
     except Exception as exc:  # noqa: BLE001
         ok = False
         print(f"FAIL self-test.config: {type(exc).__name__}: {exc}")

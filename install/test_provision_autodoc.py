@@ -203,15 +203,15 @@ def test_a_project_level_autodoc_root_is_seen_by_the_preinstall_scan(tmp_path):
         "autodoc_root: null\n",
         {"alpha": 'autodoc_root: "~/wiki/alpha-autodoc"\n'},
     )
-    on, reason = provision._resolve_autodoc(None, home)
-    assert on is True
+    on, reason, source = provision._resolve_autodoc(None, home)
+    assert (on, source) == (True, "scan")
     assert "alpha" in reason, f"the reason must name WHICH file set it: {reason}"
 
 
 def test_the_machine_default_still_wins_when_it_is_set(tmp_path):
     home = _config_home(tmp_path, 'autodoc_root: "~/wiki/code"\n', {"alpha": "\n"})
-    on, reason = provision._resolve_autodoc(None, home)
-    assert on is True
+    on, reason, source = provision._resolve_autodoc(None, home)
+    assert (on, source) == (True, "scan")
     assert "environment.md" in reason
 
 
@@ -220,22 +220,28 @@ def test_all_null_is_still_off_and_says_how_many_files_it_read(tmp_path):
     the project files at all - which was the actual bug, and would be invisible again."""
     home = _config_home(tmp_path, "autodoc_root: null\n",
                         {"alpha": "autodoc_root: null\n", "beta": "\n"})
-    on, reason = provision._resolve_autodoc(None, home)
-    assert on is False
+    on, reason, source = provision._resolve_autodoc(None, home)
+    assert (on, source) == (False, "scan")
     assert "3" in reason, f"expected a count of the files scanned: {reason}"
 
 
 def test_an_explicit_flag_still_beats_every_scan(tmp_path):
     home = _config_home(tmp_path, "autodoc_root: null\n")
-    assert provision._resolve_autodoc(True, home)[0] is True
-    assert provision._resolve_autodoc(False, home)[0] is False
+    assert provision._resolve_autodoc(True, home) == (True, "forced by --autodoc", "flag")
+    assert provision._resolve_autodoc(False, home) == (False, "forced by --no-autodoc", "flag")
+
+
+def test_the_env_tier_is_recorded_as_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_AUTODOC", "1")
+    home = _config_home(tmp_path, "autodoc_root: null\n")
+    assert provision._resolve_autodoc(None, home) == (True, "AGENTFLOW_AUTODOC='1'", "env")
 
 
 def test_no_config_at_all_is_off_and_says_so_distinctly(tmp_path):
     """Distinct from "read them and found nothing": one is an install that has not been
     configured yet, the other is a decision."""
-    on, reason = provision._resolve_autodoc(None, tmp_path / "absent")
-    assert on is False
+    on, reason, source = provision._resolve_autodoc(None, tmp_path / "absent")
+    assert (on, source) == (False, "none")
     assert "no config present" in reason
 
 
@@ -249,15 +255,16 @@ def test_the_recheck_CORRECTS_a_wrong_heuristic_and_prints_both_numbers(tmp_path
 
     fake_env = type("E", (), {"autodoc_root": None, "data_root": str(tmp_path)})()
     with mock.patch.dict(sys.modules, {"agentflow.config": mock.MagicMock(
-        load_environment=lambda: fake_env,
-        load_project=lambda n: type("P", (), {"name": n, "autodoc_root": None})(),
+        load_environment=lambda **_k: fake_env,
+        load_project=lambda n, **_k: type("P", (), {"name": n, "autodoc_root": None})(),
         resolve_autodoc_root=lambda e, p=None: "/derived/alpha/autodoc" if p else None,
     )}):
         provision._confirm_autodoc_against_config(opts)
 
     assert opts.autodoc is True
     out = capsys.readouterr().out
-    assert "CORRECTED" in out
+    assert out.splitlines()[0] == "  autodoc     : CORRECTED disabled -> enabled"
+    assert out.count("resolved config says") == 1
     assert "unset/null" in out, "the heuristic's reason must survive into the report"
     assert "derived" in out, "the resolved answer must be named too"
 
@@ -271,8 +278,8 @@ def test_the_recheck_is_SILENT_when_the_heuristic_was_already_right(tmp_path, ca
 
     fake_env = type("E", (), {"autodoc_root": "~/wiki/code", "data_root": str(tmp_path)})()
     with mock.patch.dict(sys.modules, {"agentflow.config": mock.MagicMock(
-        load_environment=lambda: fake_env,
-        load_project=lambda n: type("P", (), {"name": n, "autodoc_root": None})(),
+        load_environment=lambda **_k: fake_env,
+        load_project=lambda n, **_k: type("P", (), {"name": n, "autodoc_root": None})(),
         resolve_autodoc_root=lambda e, p=None: "/wiki/code",
     )}):
         provision._confirm_autodoc_against_config(opts)
@@ -296,8 +303,8 @@ def test_an_AutodocRootError_is_NOT_swallowed_by_the_recheck(tmp_path):
         raise AutodocRootError("/new/empty", "/legacy/with/corpus")
 
     with mock.patch.dict(sys.modules, {"agentflow.config": mock.MagicMock(
-        load_environment=lambda: type("E", (), {"autodoc_root": None, "data_root": "x"})(),
-        load_project=lambda n: type("P", (), {"name": n, "autodoc_root": None})(),
+        load_environment=lambda **_k: type("E", (), {"autodoc_root": None, "data_root": "x"})(),
+        load_project=lambda n, **_k: type("P", (), {"name": n, "autodoc_root": None})(),
         resolve_autodoc_root=boom,
         AutodocRootError=AutodocRootError,
     )}):
@@ -306,34 +313,34 @@ def test_an_AutodocRootError_is_NOT_swallowed_by_the_recheck(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# gh#690: an EXPLICIT --autodoc / --no-autodoc is never silently overruled
+# An operator's answer (--autodoc / --no-autodoc / AGENTFLOW_AUTODOC) is never overruled
 # --------------------------------------------------------------------------- #
 def _fake_config(tmp_path: Path, root):
     """agentflow.config stand-in whose resolver answers `root` for every project."""
     fake_env = type("E", (), {"autodoc_root": root, "data_root": str(tmp_path)})()
     return mock.patch.dict(sys.modules, {"agentflow.config": mock.MagicMock(
-        load_environment=lambda: fake_env,
-        load_project=lambda n: type("P", (), {"name": n, "autodoc_root": None})(),
+        load_environment=lambda **_k: fake_env,
+        load_project=lambda n, **_k: type("P", (), {"name": n, "autodoc_root": None})(),
         resolve_autodoc_root=lambda e, p=None: root,
     )})
 
 
-def test_explicit_autodoc_with_no_resolvable_root_REFUSES(tmp_path, capsys):
+def test_explicit_autodoc_with_no_resolvable_root_WARNS_and_stays_on(tmp_path, capsys):
     """Repro (a): autodoc_root null + `--autodoc` used to print `CORRECTED disabled -> disabled`
-    and quietly finish with autodoc off. The flag cannot work, so the install refuses and names
-    both the flag and the config field."""
+    and quietly finish with autodoc off. Warn, not refuse: the flag is kept (it only installs
+    deps nothing uses) and one WARNING line names the flag and the resolved config."""
     opts = _make_opts(tmp_path)
     opts.config_home = _config_home(tmp_path, "autodoc_root: null\n", {"alpha": "\n"})
-    opts.autodoc, opts.autodoc_explicit = True, True
+    opts.autodoc, opts.autodoc_source = True, "flag"
 
     with _fake_config(tmp_path, None):
-        with pytest.raises(RuntimeError) as excinfo:
-            provision._confirm_autodoc_against_config(opts)
+        provision._confirm_autodoc_against_config(opts)
 
-    msg = str(excinfo.value)
-    assert "--autodoc" in msg
-    assert "autodoc_root" in msg
-    assert "CORRECTED" not in capsys.readouterr().out
+    assert opts.autodoc is True
+    assert opts.autodoc_reason == "forced by --autodoc"
+    assert capsys.readouterr().out.splitlines() == [
+        "  autodoc     : WARNING --autodoc keeps autodoc enabled, but resolved config says disabled"
+    ]
 
 
 def test_explicit_no_autodoc_STAYS_OFF_when_config_enables_it(tmp_path, capsys):
@@ -342,17 +349,17 @@ def test_explicit_no_autodoc_STAYS_OFF_when_config_enables_it(tmp_path, capsys):
     opts = _make_opts(tmp_path)
     opts.config_home = _config_home(tmp_path, 'autodoc_root: "~/wiki/code"\n')
     opts.autodoc, opts.autodoc_reason = False, "forced by --no-autodoc"
-    opts.autodoc_explicit = True
+    opts.autodoc_source = "flag"
 
     with _fake_config(tmp_path, "/wiki/code"):
         provision._confirm_autodoc_against_config(opts)
 
     assert opts.autodoc is False
     assert opts.autodoc_reason == "forced by --no-autodoc"
-    out = capsys.readouterr().out
-    assert "CORRECTED" not in out
-    assert "WARNING --no-autodoc keeps autodoc disabled" in out
-    assert "/wiki/code" in out, "the warning must name what the config enables"
+    assert capsys.readouterr().out.splitlines() == [
+        "  autodoc     : WARNING --no-autodoc keeps autodoc disabled, but resolved config "
+        "says enabled ((machine default) -> /wiki/code)"
+    ]
 
     step6 = next(s for s in provision.build_steps(opts) if s.n == 6)
     assert not step6.applies_fn(opts), "step 6 (npm ci) must not apply under --no-autodoc"
@@ -364,7 +371,7 @@ def test_heuristic_CORRECTED_line_prints_the_true_before_and_after(tmp_path, cap
     opts = _make_opts(tmp_path)
     opts.config_home = _config_home(tmp_path, 'autodoc_root: "~/wiki/code"\n')
     opts.autodoc, opts.autodoc_reason = False, "autodoc_root unset/null in 1 config file(s)"
-    assert opts.autodoc_explicit is False
+    assert opts.autodoc_source == "scan"
 
     with _fake_config(tmp_path, "/wiki/code"):
         provision._confirm_autodoc_against_config(opts)
@@ -385,7 +392,8 @@ def test_heuristic_CORRECTED_line_prints_the_true_before_and_after(tmp_path, cap
 def test_heuristic_CORRECTED_enabled_to_disabled(tmp_path, capsys):
     opts = _make_opts(tmp_path)
     opts.config_home = _config_home(tmp_path, "autodoc_root: null\n")
-    opts.autodoc, opts.autodoc_reason = True, "AGENTFLOW_AUTODOC='1'"
+    opts.autodoc, opts.autodoc_reason = True, "autodoc_root set in environment.md"
+    opts.autodoc_source = "scan"
 
     with _fake_config(tmp_path, None):
         provision._confirm_autodoc_against_config(opts)
@@ -394,21 +402,102 @@ def test_heuristic_CORRECTED_enabled_to_disabled(tmp_path, capsys):
     out = capsys.readouterr().out
     assert out.splitlines()[0] == "  autodoc     : CORRECTED enabled -> disabled"
     assert out.count("resolved config says") == 1
-    assert "resolved config says disabled" in out
+    assert out.splitlines()[2].strip() == (
+        "post-install re-check     : resolved config says disabled"
+    )
 
 
-def test_main_marks_the_flag_explicit_only_when_one_was_passed(tmp_path, monkeypatch):
-    """The explicit marker comes from argparse's None default, not from reason text."""
+def test_a_no_config_answer_is_corrected_too(tmp_path, capsys):
+    """"none" is the scan finding nothing to read: still the heuristic's answer, so still
+    corrected."""
+    opts = _make_opts(tmp_path)
+    opts.autodoc, opts.autodoc_source = False, "none"
+    opts.autodoc_reason = "no config present (autodoc_root undetermined)"
+
+    with _fake_config(tmp_path, "/wiki/code"):
+        provision._confirm_autodoc_against_config(opts)
+
+    assert opts.autodoc is True
+    assert capsys.readouterr().out.splitlines()[0] == (
+        "  autodoc     : CORRECTED disabled -> enabled"
+    )
+
+
+def test_env_AGENTFLOW_AUTODOC_on_against_a_disabled_config_WARNS_and_stays_on(tmp_path, capsys):
+    """The env tier ranks above the scan, so the re-check keeps its answer and warns, naming
+    the variable. It used to print CORRECTED and switch autodoc off."""
+    opts = _make_opts(tmp_path)
+    opts.config_home = _config_home(tmp_path, "autodoc_root: null\n")
+    opts.autodoc, opts.autodoc_reason = True, "AGENTFLOW_AUTODOC='1'"
+    opts.autodoc_source = "env"
+
+    with _fake_config(tmp_path, None):
+        provision._confirm_autodoc_against_config(opts)
+
+    assert opts.autodoc is True
+    assert opts.autodoc_reason == "AGENTFLOW_AUTODOC='1'"
+    assert capsys.readouterr().out.splitlines() == [
+        "  autodoc     : WARNING AGENTFLOW_AUTODOC='1' keeps autodoc enabled, but resolved config "
+        "says disabled"
+    ]
+
+
+def test_env_AGENTFLOW_AUTODOC_off_against_an_enabled_config_WARNS_and_skips_step_6(
+        tmp_path, capsys):
+    opts = _make_opts(tmp_path)
+    opts.config_home = _config_home(tmp_path, 'autodoc_root: "~/wiki/code"\n')
+    opts.autodoc, opts.autodoc_reason = False, "AGENTFLOW_AUTODOC='0'"
+    opts.autodoc_source = "env"
+
+    with _fake_config(tmp_path, "/wiki/code"):
+        provision._confirm_autodoc_against_config(opts)
+
+    assert opts.autodoc is False
+    assert capsys.readouterr().out.splitlines() == [
+        "  autodoc     : WARNING AGENTFLOW_AUTODOC='0' keeps autodoc disabled, but resolved config "
+        "says enabled ((machine default) -> /wiki/code)"
+    ]
+    step6 = next(s for s in provision.build_steps(opts) if s.n == 6)
+    assert not step6.applies_fn(opts)
+
+
+def test_env_AGENTFLOW_AUTODOC_unrecognised_value_is_named_in_the_warning(
+        tmp_path, capsys, monkeypatch):
+    """`enable` is not in the truthy set, so it reads as off. The warning has to carry the raw
+    value, or an operator who meant on cannot see why step 6 was skipped."""
+    monkeypatch.setenv("AGENTFLOW_AUTODOC", "enable")
+    on, reason, source = provision._resolve_autodoc(None, tmp_path / "cfg")
+    assert (on, source) == (False, "env")
+    opts = _make_opts(tmp_path)
+    opts.config_home = _config_home(tmp_path, 'autodoc_root: "~/wiki/code"\n')
+    opts.autodoc, opts.autodoc_reason, opts.autodoc_source = on, reason, source
+
+    with _fake_config(tmp_path, "/wiki/code"):
+        provision._confirm_autodoc_against_config(opts)
+
+    assert opts.autodoc is False
+    assert capsys.readouterr().out.splitlines() == [
+        "  autodoc     : WARNING AGENTFLOW_AUTODOC='enable' keeps autodoc disabled, but resolved "
+        "config says enabled ((machine default) -> /wiki/code)"
+    ]
+
+
+def test_main_records_which_tier_decided(tmp_path, monkeypatch):
+    """The source comes from the tier `_resolve_autodoc` took, not from reason text."""
     seen = {}
 
     def capture(opts, steps):
-        seen["explicit"] = opts.autodoc_explicit
+        seen["source"] = opts.autodoc_source
 
     monkeypatch.setattr(provision, "print_plan", capture)
+    monkeypatch.delenv("AGENTFLOW_AUTODOC", raising=False)
     base = ["--dry-run", "--config-home", str(tmp_path / "cfg")]
-    for extra, want in (([], False), (["--autodoc"], True), (["--no-autodoc"], True)):
+    for extra, want in (([], "none"), (["--autodoc"], "flag"), (["--no-autodoc"], "flag")):
         provision.main(base + extra)
-        assert seen["explicit"] is want, extra
+        assert seen["source"] == want, extra
+    monkeypatch.setenv("AGENTFLOW_AUTODOC", "1")
+    provision.main(base)
+    assert seen["source"] == "env"
 
 
 def _dry_run_out(tmp_path, capsys, *extra) -> str:
@@ -420,14 +509,27 @@ def _dry_run_out(tmp_path, capsys, *extra) -> str:
     return capsys.readouterr().out
 
 
-def test_dry_run_with_explicit_autodoc_says_it_is_confirmed_at_step_5(tmp_path, capsys):
-    """A dry run never reaches the resolver, so `--dry-run --autodoc` with no autodoc root
-    cannot refuse; it must at least say where the flag will be confirmed and refused."""
+def test_dry_run_with_explicit_autodoc_says_it_is_confirmed_at_step_5(
+        tmp_path, capsys, monkeypatch):
+    """A dry run never reaches the resolver, so `--dry-run --autodoc` cannot check the flag;
+    it must at least say where the flag will be checked and what happens there."""
+    monkeypatch.delenv("AGENTFLOW_AUTODOC", raising=False)
     out = _dry_run_out(tmp_path, capsys, "--autodoc")
-    assert ("--autodoc is confirmed against the resolved config at step 5, and refused there "
+    assert ("--autodoc is checked against the resolved config at step 5, with a WARNING there "
             "if no autodoc_root resolves") in out
 
 
-def test_dry_run_without_explicit_autodoc_prints_no_confirmation_line(tmp_path, capsys):
+def test_dry_run_with_env_autodoc_on_says_it_is_confirmed_at_step_5(
+        tmp_path, capsys, monkeypatch):
+    """The env tier is checked at step 5 exactly as the flag is, so the dry run says so too."""
+    monkeypatch.setenv("AGENTFLOW_AUTODOC", "1")
+    out = _dry_run_out(tmp_path, capsys)
+    assert ("AGENTFLOW_AUTODOC is checked against the resolved config at step 5, with a WARNING "
+            "there if no autodoc_root resolves") in out
+
+
+def test_dry_run_without_explicit_autodoc_prints_no_confirmation_line(
+        tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("AGENTFLOW_AUTODOC", raising=False)
     for extra in ([], ["--no-autodoc"]):
-        assert "confirmed against the resolved config" not in _dry_run_out(tmp_path, capsys, *extra)
+        assert "checked against the resolved config" not in _dry_run_out(tmp_path, capsys, *extra)

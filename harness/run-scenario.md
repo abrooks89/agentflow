@@ -2,8 +2,11 @@
 
 This is the operator runbook for producing the A, B and D recordings. A **live
 Claude session** drives the CURRENT skills through each scenario against the fixtures in
-`stubs/` and the toy repo, using the **record-stubs** (`stubs/README.md`) so no real wake
-loop is ever entered. The deterministic checker `check.py` later reads the filesystem
+`stubs/` and the toy repo. **Nothing in this repo intercepts `ScheduleWakeup`:** when a
+skill calls it during a recording, the call is real and registers a real wake in the
+recording session. The operator writes each wake row by hand (format in `stubs/README.md`)
+and stops any registered wake before it fires, so the recurring loop is never entered on
+purpose. The deterministic checker `check.py` later reads the filesystem
 artifacts these runs produce and checks properties of them - it never compares one
 recording with another, so to show a change preserved behaviour, re-record A, B and D
 after it and re-run `check.py <config>`.
@@ -12,14 +15,96 @@ Behavior-frozen rule: you are RECORDING how the current skills behave. Do not mo
 live skill, command, or the toy repo's seeded baseline mid-run except as the scenario
 prescribes.
 
+**STOP: never record A, B or D without `--project harness-toy`.** Every live launch line
+below passes `--project harness-toy`, which names the harness's non-fleet toy project. A
+launch with no `--project` resolves the session default, and with any other name resolves
+that project; either can be a REAL fleet project, and the builder would claim, build and
+merge real work. Do not shorten, retype or drop the flag. And before the first launch line of a
+session, the profile must resolve (Setup step 3) and, for A and B, the session's injected
+`[project]` line must read `harness-toy` (Setup step 4); if either does not, stop and fix
+the setup instead of recording.
+
+## Setup: the harness-toy project (before A, B or D)
+
+The harness ships a project profile whose only repository is the toy repo:
+`toy-profile/harness-toy.md`. Install it once per machine:
+
+1. **Seed the toy repo:** `python harness/seed_toy_repo.py` from the clone root. Besides
+   `harness/toy-repo` it builds the repo's `origin`, a local bare repo at
+   `harness/toy-origin/example/harness-toy.git` reached by a `file://` URL, and Scenario B's
+   epic worktree, `<worktree_root>/harness-toy/toy-calc-single-task`. `<worktree_root>` comes
+   from `environment.md` (`--worktree-root <dir>` overrides it, but Step 1.1 only looks
+   under `environment.md`'s); with neither, the script says on stderr that it made no
+   worktree, and Scenario B will stop at Step 1.1.
+2. **Install the profile:** copy `harness/toy-profile/harness-toy.md` to
+   `<config_home>/projects/harness-toy.md` (`<config_home>` is `$AGENTFLOW_CONFIG`, else
+   `~/.agentflow/config`) and, in the copy, replace `<agentflow_clone>` with this clone's
+   absolute path. Change no other profile.
+3. **Prove it resolves:** `python -m agentflow.config show --project harness-toy` must exit
+   0 and print `[project] harness-toy (repo: example/harness-toy)` with
+   `canonical_repo.local_checkout` naming this clone's `harness/toy-repo`. An unreplaced
+   placeholder fails here, loudly, naming the field.
+4. **A and B: make it the session default.** `/lead-dev` strips and applies `--project`
+   itself; `solution` and `orchestrator` have no argument parser for it. They take their
+   project from the session's injected `[project]` line, which for the orchestrator selects
+   only `canonical_repo` (the git target): its status board, `state.project`, worktree
+   fallback and wave-script directory key off the PLAN's `project:` instead, which
+   `fixtures/plan-single-task.md` declares as `harness-toy`, so the two agree only while the
+   session default names the toy too; start the A and B
+   recording session with `AGENTFLOW_PROJECT=harness-toy` in its environment and confirm
+   the injected block reads `[project] harness-toy` before the launch line. A Claude Code
+   settings `env` block that sets `AGENTFLOW_PROJECT` wins over the shell, which is then
+   thrown away (`docs/INSTALL.md` §12). If the injected block names any other project,
+   stop: record A and B from a launch directory or machine whose Claude Code settings do
+   not set `AGENTFLOW_PROJECT`. Never pass `--settings` to override it: a `--settings`
+   `env` block displaces the whole settings `env` rather than merging with it.
+
+What the profile does not move: `data_root` and `worktree_root` are machine-level
+(`environment.md`), and the resolver rejects either as an unknown key in a profile. The
+recordings therefore write under the machine's real `data_root`. A and D write inside
+`<data_root>/projects/harness-toy/` (registry, plans, state), a subtree no other project
+reads, and D's builder worktrees land under `<worktree_root>/harness-toy/`. B's board,
+wave scripts and worktree follow the plan's `project:`, which the fixture sets to
+`harness-toy`, so they join the same subtrees (B's worktree is
+`<worktree_root>/harness-toy/toy-calc-single-task`). One side
+effect while it is installed: a machine with no `$AGENTFLOW_PROJECT` that relied on its
+single `projects/<name>.md` as the default resolves no project until the toy profile is
+removed.
+
+**Removing it.** Once `check.py <config>` has read the records, delete
+`<config_home>/projects/harness-toy.md`, `<data_root>/projects/harness-toy/` and
+`<worktree_root>/harness-toy/`, then run `git -C harness/toy-repo worktree prune` (or
+re-seed with `python harness/seed_toy_repo.py --force`, which removes and recreates Scenario
+B's worktree itself) so the toy repo forgets the deleted trees. `harness/toy-origin/` is
+gitignored and may stay; delete it with `harness/toy-repo` if you want neither. Remove `<lock_dir>/harness-toy-registry.lock` if a run was cut off holding it. On a
+machine with a vault, the mirror routes by project name, so also remove any `harness-toy/`
+folder a run created under the vault's epic subdirectory (`vault_root` / `vault_subdir` in
+the resolved block); B's status mirror lands there too, under
+`harness-toy/toy-calc-single-task/`, because the plan declares `project:`. Notifications are not
+contained: the orchestrator's and lead-dev's ntfy go to the machine's real notify topic, so
+expect B and D lines on it.
+
 ## Global rules (every scenario)
 
 - **Config indirection.** All path/skill/command names come from
   `harness.config.json` (`solution_skill`, `orchestrator_skill`, `builder_entry`, dirs).
   Never hardcode them into a recording; read them from the config so every re-recording
-  uses the same procedure.
-- **Stubbed wakes only.** Any `ScheduleWakeup` the skill fires is captured by the stub as
-  a row in `stubs/schedulewakeup_log.md`. It does not sleep and does not auto-wake.
+  uses the same procedure. The launch lines below spell the shipped values; the project
+  they pass is `toy_project` (`harness-toy`), which must equal the installed profile's
+  `name`.
+- **Wakes are recorded by hand; the call itself is real.** Nothing intercepts
+  `ScheduleWakeup`. For each call the skill makes, the operator appends one row by hand to
+  `stubs/schedulewakeup_log.md`, in the format `stubs/README.md` gives. The row is the
+  evidence `check.py` reads; writing it does not cancel the wake.
+- **A real wake is registered.** Any recording session registers a real wake when a
+  Scenario B or D run calls `ScheduleWakeup`; one running with bypass permissions does so
+  without prompting. A wake belongs to the session that scheduled it, so it ends when that
+  session ends (the same reason `docs/INSTALL.md`, "Stopping, and undoing the install",
+  gives for loops). Once the scenario's records are written, end the session (`Ctrl`+`C`
+  in its window, or close the window) before the real wake fires (the call's
+  `delaySeconds` after it was made, not the `wake_at` you logged). If the wake fires
+  first, the skill's prompt runs again in that session: that is the recurring loop, so
+  interrupt it and end the session; nothing it does belongs in the recording.
 - **One inline wake cycle MAX.** Where a scenario needs a wake to actually advance, the
   operator performs exactly ONE inline wake by hand. Never enter the recurring loop.
   (Scenario B is the single, deliberate exception: it drives a scripted SECOND inline wake
@@ -31,7 +116,13 @@ prescribes.
 ## Scenario A — refine -> solution emits a parseable plan
 
 - **Entry:** invoke the `solution_skill` (config: `solution`) on the canned refine
-  input `refine-toy.md`.
+  input `refine-toy.md`, in a session whose `[project]` reads `harness-toy` (Setup step 4).
+  The `--project harness-toy` flag is advisory for this skill (only the model reads it); the
+  injected `[project]` is what binds:
+
+  ```
+  /solution --project harness-toy harness/fixtures/refine-toy.md
+  ```
 - **Gate:** the deps/decomposition gate -> answer **None** (no extra dependencies).
 - **Wake:** none. Scenario A produces a plan file only; it schedules no wake.
 - **Records for the checker:** the emitted plan file (frontmatter contract, parse success,
@@ -41,17 +132,37 @@ prescribes.
 ## Scenario B — single-task plan -> one wave -> review -> commit
 
 - **Entry:** invoke the `orchestrator_skill` (config: `orchestrator`) on
-  `plan-single-task.md` against a freshly re-inited `toy-repo`.
+  `plan-single-task.md` against a freshly re-inited `toy-repo`, in a session whose
+  `[project]` reads `harness-toy` (Setup step 4). The `--project harness-toy` flag is
+  advisory for this skill (only the model reads it); the injected `[project]` is what binds:
+
+  ```
+  /orchestrator --project harness-toy harness/fixtures/plan-single-task.md
+  ```
+- **Target tree:** the plan declares `project: harness-toy` and no `worktree:`, so the
+  orchestrator resolves its tree from the fallback layout and has no project to ask for. An
+  `ESCALATION: Target tree unresolvable` or a question asking which project means the run is
+  not exercising B: stop, and check the fixture still carries `project:`. Step 1.1 then
+  pre-flights `<worktree_root>/harness-toy/toy-calc-single-task`, which the orchestrator
+  never creates, and checks that its `origin` resolves to `host_ref`. The seed (Setup
+  step 1) makes both: the worktree on branch `toy-calc-single-task`, and an origin whose
+  `file://` path ends in `example/harness-toy.git`. An `ESCALATION: Worktree mandate` means
+  the seed ran without a worktree root, or the tree was removed since: reseed with
+  `python harness/seed_toy_repo.py --force` before recording. Step 1.1 looks under
+  `environment.md`'s `worktree_root`, so that file must resolve; `--worktree-root <dir>` is
+  an override for tests and only helps when it names that same directory. B2 fails a recording whose board
+  shows the run stopped at Step 1.1 or never reached Step 2.
 - **Gate:** the orchestrator's approval gate (#2) -> answer **Approve**.
 - **Wake:** run **exactly one** inline wake cycle. The wave runs inline once; the
-  `ScheduleWakeup` the orchestrator fires is recorded to `stubs/schedulewakeup_log.md`
-  (tag `scenario=B`, `wake_at` in the future, prompt verbatim) — this is assertion B9.
+  `ScheduleWakeup` the orchestrator fires is recorded by hand to
+  `stubs/schedulewakeup_log.md` (tag `scenario=B`, `wake_at` in the future, prompt
+  verbatim) — this is assertion B9.
 - **Second wake (B/E2 only):** after the first wake writes the
   `escalation_prompted` / `merge_decision_prompted` decision-log markers, drive ONE
   scripted second inline wake and confirm the buttoned prompt does NOT re-fire (the marker
   gates it). This is the re-prompt-guard evidence (E2). This is the ONLY scenario
   that drives two wakes; it is still not the recurring loop.
-- **Records for the checker:** worktree created, >=1 new commit touching `calc.py`, commit
+- **Records for the checker:** the worktree the wave ran in, >=1 new commit touching `calc.py`, commit
   diff within the file allowlist, `status.md` marks the task done,
   `test_status.result == pass`, review verdict recorded, independent pytest on the worktree
   HEAD green, one future `ScheduleWakeup` logged — assertions B2-B9 (+ E2).
@@ -85,15 +196,20 @@ prescribes.
 
 ## Scenario D — builder command self-paced wake-continuation
 
-- **Entry:** fire the current `builder_entry` (config: `/lead-dev`) with a concrete
-  `<target>`.
+- **Entry:** fire the current `builder_entry` (config: `/lead-dev`) with
+  `--project harness-toy` and a concrete `<target>`:
+
+  ```
+  /lead-dev --project harness-toy <target>
+  ```
 - **Gate:** answer the dispatch gate **Dispatch** if raised.
 - **Wake:** capture the `ScheduleWakeup` continuation prompt VERBATIM into
   `stubs/schedulewakeup_log.md` (tag `scenario=D`). Perform at most one inline wake to
   confirm the continuation re-invokes the SAME `builder_entry` with the resolved target
-  written literally, plus `--project <name>` when the launch passed it (the lead-dev
+  written literally, plus `--project harness-toy`, which this launch passed (the lead-dev
   continuation contract). A literal `$ARGUMENTS` in the recorded prompt is a failure.
-  Confirm no second wake fires on its own.
+  Confirm the inline wake records no second `ScheduleWakeup` call (one row for
+  `scenario=D`), then end the session before any registered wake fires.
 - **Records for the checker:** the recorded continuation prompt re-targets the config's
   `builder_entry` with arguments intact; exactly one wake row for `scenario=D`; no
   spontaneous second wake — assertions D1-D3. D1-D3 read the expected continuation command
@@ -107,12 +223,18 @@ claiming new work (`docs/REGISTRY.md` firing contract, step 2 CONSUME FIRST). Re
 live builder firing — this record cannot be canned.
 
 1. **Seed.** Copy `fixtures/scenarioD-registry-before.md` to the toy project's registry
-   path (`<data_root>/projects/<toy>/status/registry.md`). It seeds: `Q-0101` in state
+   path (`<data_root>/projects/harness-toy/status/registry.md`), never to a fleet project's.
+   It seeds: `Q-0101` in state
    `answered` (raised by the builder, answering its parked work), Queue row `E-0101`
    `parked` on `Q-0101`, and a fresh `ready` row `E-0102` in the same lane. Do not edit the
    seed — D4 reads its ids from the fixture, never hardcoded.
-2. **Fire.** Fire the `builder_entry` exactly as in the base Scenario D procedure (record
-   stubs active, one inline wake maximum, canned answer **Dispatch** if a gate is raised).
+2. **Fire.** Fire the `builder_entry` exactly as in the base Scenario D procedure (wake
+   rows written by hand, registered wake stopped, one inline wake maximum, canned answer
+   **Dispatch** if a gate is raised), with the same launch line:
+
+   ```
+   /lead-dev --project harness-toy <target>
+   ```
 3. **Capture.** After the single wake's WRITE phase completes, copy the toy project's
    registry verbatim to `records/scenarioD/registry-after.md`. Do not hand-edit it.
 - **Records for the checker:** D4 asserts the captured registry shows `Q-0101` flipped to
@@ -199,3 +321,5 @@ Leave the produced artifacts in place (`toy-repo` state, `status.md`,
 `stubs/schedulewakeup_log.md`, decision log). These are gitignored (they embed personal
 paths / server IPs) but stay on disk for `check.py` to read. Do not hand-edit them to make
 an assertion pass — a red assertion is a real finding to report, not to paper over.
+After `check.py <config>` has read them, remove the toy project's config and data per
+*Setup*, "Removing it".

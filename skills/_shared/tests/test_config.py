@@ -6,6 +6,7 @@ fail, name!=filename — plus optional-default resolution, first-yaml-block extr
 and secret-name-only reads.
 """
 
+import ast
 import json
 import re
 import textwrap
@@ -331,6 +332,26 @@ def test_verification_strategy_as_missing_skillpath(home, d):
     assert ei.value.field_path == "verification.strategy"
 
 
+@pytest.mark.parametrize("blank", ['""', '"   "'], ids=["empty", "whitespace"])
+def test_a_blank_verification_strategy_is_rejected(home, d, blank):
+    # Required delegated path: blank must hard-fail, not read as unset like the optional ones.
+    _write_project(home, "foo", _valid_project_body(d).replace("strategy: test-suite", f"strategy: {blank}"))
+    with pytest.raises(ConfigError) as ei:
+        load_project("foo")
+    assert ei.value.field_path == "verification.strategy"
+
+
+@pytest.mark.parametrize("blank", ['""', '"   "'], ids=["empty", "whitespace"])
+@pytest.mark.parametrize("field", ["vault.mirror_helper", "generation_skills.polishing",
+                                   "generation_skills.provision"])
+def test_a_blank_optional_delegated_path_reads_as_unset(home, d, field, blank):
+    block, key = field.split(".")
+    root = f"\n      root: {d}" if block == "vault" else ""
+    _write_project(home, "foo", _valid_project_body(d) + f"\n    {block}:{root}\n      {key}: {blank}")
+    proj = load_project("foo")
+    assert getattr(getattr(proj, block), key) is None
+
+
 def test_audit_defaults_when_block_absent(home, d):
     _write_project(home, "foo", _valid_project_body(d))
     proj = load_project("foo")
@@ -398,6 +419,39 @@ def test_an_audit_window_of_true_is_not_read_as_one(home, d):
     with pytest.raises(ConfigError) as ei:
         load_project("foo")
     assert ei.value.field_path == "audit.window"
+
+
+def _project_with_page(d: str, page: str) -> str:
+    return _valid_project_body(d) + f"\n    work_source:\n      kind: github-issues\n      open_issue_page: {page}"
+
+
+def test_open_issue_page_defaults_to_200_absent_or_with_a_block(home, d):
+    # absent block and a block without the key both keep the old constant's value
+    _write_project(home, "foo", _valid_project_body(d))
+    assert load_project("foo").work_source.open_issue_page == 200
+    _write_project(home, "foo", _valid_project_body(d) + "\n    work_source:\n      kind: github-issues")
+    assert load_project("foo").work_source.open_issue_page == 200
+
+
+@pytest.mark.parametrize("page", [1, 300])
+def test_open_issue_page_parses(home, d, page):
+    _write_project(home, "foo", _project_with_page(d, str(page)))
+    assert load_project("foo").work_source.open_issue_page == page
+
+
+# The intake refusal's way out is this key, so a bad value must stop the load rather than
+# fall back to 200: a silent fallback would make the edit look applied while intake refused.
+@pytest.mark.parametrize("page,reason", [
+    ("0", "is below 1"), ("-5", "is below 1"),
+    ("true", "expected int"), ("'300'", "expected int"), ("2.5", "expected int"),
+])
+def test_open_issue_page_rejects_non_positive_and_non_int_loudly(home, d, page, reason):
+    _write_project(home, "foo", _project_with_page(d, page))
+    with pytest.raises(ConfigError) as ei:
+        load_project("foo")
+    # the reason, not just the path: an unknown-key rejection carries the same path
+    assert ei.value.field_path == "work_source.open_issue_page"
+    assert reason in ei.value.reason
 
 
 def test_config_error_carries_all_four_fields(home, d):
@@ -572,8 +626,8 @@ def test_show_cli_unknown_project_hard_fails(home, d, monkeypatch, capsys):
 
 
 def test_render_resolved_block_shape_is_pinned(home, d, monkeypatch):
-    """Golden-ish structural pin. The hook injects this block verbatim and six
-    loop skills parse it, so silent reformatting is a breaking change."""
+    """Golden-ish structural pin. The hook injects this block verbatim and every
+    loop skill parses it, so silent reformatting is a breaking change."""
     _write_env(home, _valid_env_body(d))
     _named_project(home, "alpha", d)
     monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
@@ -1824,6 +1878,37 @@ def test_resolve_vault_autodoc_update_skill_precedence():
     assert resolve(NS(vault=None), NS(vault=None)) is None
 
 
+# A blank skill path is unset. Path("") is Path("."), which exists, so before the blank check
+# an empty value cleared the presence check and the block printed `= .` - a directory a seat
+# would then try to follow as a skill.
+_BLANK_SKILL_FIELDS = (("save_skill", _save_lines), ("autodoc_update_skill", _autodoc_lines))
+
+
+@pytest.mark.parametrize("blank", ['""', '"   "'], ids=["empty", "whitespace"])
+@pytest.mark.parametrize("level", ["env", "project"])
+@pytest.mark.parametrize(("field", "pick"), _BLANK_SKILL_FIELDS,
+                         ids=[f for f, _ in _BLANK_SKILL_FIELDS])
+def test_a_blank_skill_path_is_absent_from_the_block(home, d, field, pick, level, blank):
+    extra = _vault_extra(d, **{field: blank})
+    lines = _block_lines(home, d, **{"env_extra" if level == "env" else "proj_extra": extra})
+    assert any(ln.startswith("  vault_root   = ") for ln in lines)
+    assert pick(lines) == []
+
+
+@pytest.mark.parametrize(("field", "pick"), _BLANK_SKILL_FIELDS,
+                         ids=[f for f, _ in _BLANK_SKILL_FIELDS])
+def test_a_blank_project_skill_path_falls_back_to_the_environments(home, d, field, pick):
+    env_skill = _save_skill(d, "env" + field)
+    lines = _block_lines(
+        home, d,
+        env_extra=_vault_extra(d, **{field: env_skill}),
+        proj_extra=_vault_extra(d, **{field: '""'}),
+    )
+    got = pick(lines)
+    assert len(got) == 1
+    assert Path(got[0].split(" = ", 1)[1]) == Path(env_skill)
+
+
 def test_a_bad_publish_host_ref_is_rejected_as_loudly_as_the_canonical_one(home, d):
     body = _valid_project_body(d) + f"{NL}    publish_repo:{NL}      host_ref: noslash{NL}"
     _write_project(home, "foo", body)
@@ -1893,7 +1978,7 @@ def test_the_resolver_never_hands_publish_repo_back_as_a_GIT_REMOTE(home, d):
 
 
 def test_the_blocks_repo_line_still_names_the_WORKING_repo(home, d):
-    """`[project] <name> (repo: ...)` is the line six loop skills read to decide which
+    """`[project] <name> (repo: ...)` is the line every loop skill reads to decide which
     repo to work in. A publish target must never displace it."""
     _write_env(home, _valid_env_body(d))
     _write_project(home, "foo", _valid_project_body(d) + _PUBLISH_BLOCK)
@@ -2241,7 +2326,7 @@ def test_gitea_work_source_with_a_tracker_cli_is_flagged(home, d, host_kind, cli
     reason = config.work_source_host_conflict(env, proj)
     assert reason is not None and "'gitea'" in reason and f"'{cli}'" in reason
     flagged = [ln for ln in config.render_resolved_block(env, proj).split("\n")
-               if ln.startswith("[work_source]")]
+               if ln.startswith("[work_source] CONFLICT")]
     assert flagged == [f"[work_source] CONFLICT: {reason}"]
 
 
@@ -2252,10 +2337,376 @@ def test_gitea_work_source_with_a_tracker_cli_is_flagged(home, d, host_kind, cli
 )
 def test_pairings_intake_accepts_are_not_flagged(home, d, host_kind, ws_kind, cli):
     """The control: a verified tracker, no tracker, or gitea with cli none (the documented
-    no-op) is not a conflict, and the block prints no [work_source] line at all."""
+    no-op) is not a conflict, and the block prints no CONFLICT line."""
     _write_env(home, _env_on_host(d, host_kind, cli))
     _write_project(home, "foo", _project_with_work_source(d, ws_kind))
     env, proj = load_environment(), load_project("foo")
     assert config.work_source_host_conflict(env, proj) is None
-    assert "[work_source]" not in config.render_resolved_block(env, proj)
+    assert "[work_source] CONFLICT" not in config.render_resolved_block(env, proj)
     assert config.work_source_host_conflict(env, None) is None
+
+
+def _work_source_lines(env, proj) -> list:
+    return [ln for ln in config.render_resolved_block(env, proj).split("\n")
+            if ln.startswith("[work_source] ") and "CONFLICT" not in ln]
+
+
+def test_work_source_defaults_are_PRINTED_when_the_block_is_absent(home, d):
+    """gh#1031: a project with no work_source block still shows the three keys intake reads,
+    as their defaults, on one line in the project section after [verification]."""
+    _write_env(home, _valid_env_body(d))
+    _write_project(home, "foo", _valid_project_body(d))
+    env, proj = load_environment(), load_project("foo")
+    assert _work_source_lines(env, proj) == [
+        "[work_source] kind: filesystem, bug_triage: False, open_issue_page: 200"
+    ]
+    lines = config.render_resolved_block(env, proj).split("\n")
+    at = lines.index(_work_source_lines(env, proj)[0])
+    assert lines[at - 1].startswith("[verification] ")
+
+
+def test_work_source_explicit_values_are_PRINTED(home, d):
+    _write_env(home, _env_on_host(d, "github", "gh"))
+    _write_project(home, "foo", _valid_project_body(d) + """
+    work_source:
+      kind: github-issues
+      bug_triage: true
+      open_issue_page: 50
+    """)
+    env, proj = load_environment(), load_project("foo")
+    assert _work_source_lines(env, proj) == [
+        "[work_source] kind: github-issues, bug_triage: True, open_issue_page: 50"
+    ]
+
+
+def test_work_source_line_sits_beside_a_CONFLICT_line(home, d):
+    """The settings line does not replace the conflict flag: both print, settings first."""
+    _write_env(home, _env_on_host(d, "github", "gh"))
+    _write_project(home, "foo", _project_with_work_source(d, "gitea"))
+    env, proj = load_environment(), load_project("foo")
+    ws = [ln for ln in config.render_resolved_block(env, proj).split("\n")
+          if ln.startswith("[work_source]")]
+    assert ws[0] == "[work_source] kind: gitea, bug_triage: False, open_issue_page: 200"
+    assert len(ws) == 2 and ws[1].startswith("[work_source] CONFLICT: ")
+
+
+# --------------------------------------------------------------------------- #
+# gh#881 - an unknown or path-shaped project name says what went wrong, on line one
+# --------------------------------------------------------------------------- #
+# Seats ntfy the first line of a config failure to a phone, so the name, where it came
+# from, the configured names and the closest match all have to be on it - and the
+# "run the installer" advice only belongs to a machine with nothing configured.
+def _first_line(exc: ConfigError) -> str:
+    return str(exc).splitlines()[0]
+
+
+def test_an_unknown_project_from_the_argument_names_source_list_and_guess(home, d, monkeypatch):
+    _write_env(home, _valid_env_body(d))
+    _two_projects(home, d)
+    monkeypatch.setenv("AGENTFLOW_PROJECT", "alpha")
+    name = config.resolve_project_name("alpah")
+    with pytest.raises(ConfigError) as ei:
+        load_project(name)
+    line = _first_line(ei.value)
+    assert "unknown project 'alpah' (from --project)" in line, line
+    assert "configured: alpha, beta" in line, line
+    assert "did you mean 'alpha'?" in line, line
+    assert "installer" not in str(ei.value)
+    assert "--project" in ei.value.remediation
+    # Callers report a missing project file by this field path without echoing the text.
+    assert ei.value.field_path == "<file>"
+
+
+def test_an_unknown_project_from_the_env_var_says_so(home, d, monkeypatch):
+    _write_env(home, _valid_env_body(d))
+    _two_projects(home, d)
+    monkeypatch.setenv("AGENTFLOW_PROJECT", "zzz")
+    with pytest.raises(ConfigError) as ei:
+        load_project(config.resolve_project_name(None))
+    line = _first_line(ei.value)
+    assert "unknown project 'zzz' (from $AGENTFLOW_PROJECT)" in line, line
+    assert "did you mean" not in line, "no near match, so no guess"
+    assert "$AGENTFLOW_PROJECT" in ei.value.remediation
+
+
+def test_an_explicit_source_beats_the_remembered_resolution(home, d):
+    _write_env(home, _valid_env_body(d))
+    _two_projects(home, d)
+    with pytest.raises(ConfigError) as ei:
+        load_project("gamma", source="from a test")
+    assert "unknown project 'gamma' (from a test)" in _first_line(ei.value)
+
+
+def test_show_cli_unknown_project_puts_the_facts_on_the_errors_first_line(home, d, monkeypatch, capsys):
+    _write_env(home, _valid_env_body(d))
+    _two_projects(home, d)
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    assert config.main(["show", "--project", "betta"]) == 1  # exit code unchanged
+    err = capsys.readouterr().err.splitlines()
+    # Line 1 is what a seat's ntfy carries, so the facts sit there and the headline after.
+    assert err[0].startswith("[<file>] "), err
+    assert "unknown project 'betta' (from --project); configured: alpha, beta; did you mean 'beta'?" in err[0]
+    assert err[1] == "agentflow config resolution FAILED", err
+    assert any("remediation:" in ln for ln in err[2:]), err
+
+
+_HOOK = Path(__file__).resolve().parents[3] / "hooks" / "sessionstart-inject-config.py"
+
+
+def _run_hook_main():
+    """Load the SessionStart hook from THIS tree and run its main() in-process."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_sessionstart_hook_under_test", _HOOK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.main()
+
+
+def test_hook_unknown_project_puts_the_facts_on_stderr_line_one(home, d, monkeypatch, capsys):
+    _write_env(home, _valid_env_body(d))
+    _two_projects(home, d)
+    monkeypatch.setenv("AGENTFLOW_PROJECT", "betta")
+    assert _run_hook_main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    err = captured.err.splitlines()
+    assert "unknown project 'betta' (from $AGENTFLOW_PROJECT)" in err[0], err
+    assert "configured: alpha, beta" in err[0], err
+    assert err[1] == "agentflow SessionStart config injection FAILED", err
+    assert any("remediation:" in ln for ln in err[2:]), err
+
+
+def test_hook_and_show_lead_with_the_same_error_line(home, d, monkeypatch, capsys):
+    """The two emitters share one formatter: same line 1, only the headline differs."""
+    _write_env(home, _valid_env_body(d))
+    _two_projects(home, d)
+    monkeypatch.setenv("AGENTFLOW_PROJECT", "zzz")
+    assert _run_hook_main() == 1
+    hook_err = capsys.readouterr().err.splitlines()
+    assert config.main(["show"]) == 1
+    show_err = capsys.readouterr().err.splitlines()
+    assert hook_err[0] == show_err[0]
+    assert "unknown project 'zzz'" in show_err[0], show_err
+    assert hook_err[2:] == show_err[2:]
+
+
+def test_failure_report_puts_a_multiline_reasons_first_line_first(tmp_path):
+    exc = ConfigError("a.b", tmp_path / "x.md", "first fact\nsecond fact", "fix it")
+    lines = config.failure_report(exc, "HEADLINE").splitlines()
+    assert lines[0] == "[a.b] first fact"
+    assert lines[1] == "HEADLINE"
+    assert lines[2:] == str(exc).splitlines()
+
+
+def test_failure_report_skips_blank_leading_lines_of_the_reason(tmp_path):
+    exc = ConfigError("a.b", tmp_path / "x.md", "\n  \nthe fact", "fix it")
+    assert config.failure_report(exc, "HEADLINE").splitlines()[0] == "[a.b] the fact"
+
+
+def test_with_no_project_configured_the_installer_remediation_stays(home, d):
+    _write_env(home, _valid_env_body(d))
+    with pytest.raises(ConfigError) as ei:
+        load_project("anything")
+    assert "config file not found" in ei.value.reason
+    assert "run the agentflow installer" in ei.value.remediation
+
+
+@pytest.mark.parametrize("bad", ["../environment", "sub/alpha", r"sub\alpha", "C:alpha", "..", "."])
+def test_a_path_shaped_project_name_is_rejected_before_any_file_is_read(home, d, bad):
+    # `../environment` exists, so without the check it loaded environment.md as a project
+    # and failed on a missing `name:` - an error pointing nowhere near the typo.
+    _write_env(home, _valid_env_body(d))
+    _two_projects(home, d)
+    (home / "projects" / "sub").mkdir()
+    _named_project(home / "projects" / "sub", "alpha", d)
+    with pytest.raises(ConfigError) as ei:
+        load_project(bad, source="from --project")
+    line = _first_line(ei.value)
+    assert f"invalid project name '{bad}' (from --project)" in line, line
+    assert ei.value.field_path == "<project>"
+
+
+def test_a_correct_project_name_still_loads_unchanged(home, d, monkeypatch):
+    """Control: the new checks sit in front of the load and must not change a good one."""
+    _write_env(home, _valid_env_body(d))
+    _two_projects(home, d)
+    monkeypatch.setenv("AGENTFLOW_PROJECT", "beta")
+    proj = load_project(config.resolve_project_name(None))
+    assert proj.name == "beta"
+    assert load_project("alpha").name == "alpha"
+
+
+# --------------------------------------------------------------------------- #
+# gh#882 - a misspelled REQUIRED key is named in the same run that reports it missing
+# --------------------------------------------------------------------------- #
+def test_a_misspelled_required_environment_key_names_the_stray(home, d):
+    _write_env(home, _valid_env_body(d).replace("lock_dir:", "lockdir:"))
+    with pytest.raises(ConfigError) as ei:
+        load_environment()
+    assert ei.value.field_path == "lock_dir"
+    assert ei.value.reason == "required key 'lock_dir' is missing; found 'lockdir' - a misspelling?"
+    assert "rename 'lockdir:' to 'lock_dir:'" in ei.value.remediation
+
+
+def test_a_misspelled_nested_required_key_names_the_stray(home, d):
+    _write_env(home, _valid_env_body(d))
+    _write_project(home, "foo", _valid_project_body(d).replace("strategy:", "stratgy:"))
+    with pytest.raises(ConfigError) as ei:
+        load_project("foo")
+    assert ei.value.field_path == "verification.strategy"
+    assert "found 'stratgy' - a misspelling?" in ei.value.reason
+
+
+def test_a_misspelled_required_int_and_block_name_the_stray(home, d):
+    _write_env(home, _valid_env_body(d).replace("schema_version:", "schema_verison:"))
+    with pytest.raises(ConfigError) as ei:
+        load_environment()
+    assert "found 'schema_verison'" in ei.value.reason
+    _write_env(home, _valid_env_body(d).replace("git_host:", "git_hots:"))
+    with pytest.raises(ConfigError) as ei:
+        load_environment()
+    assert ei.value.reason == "required block 'git_host' is missing; found 'git_hots' - a misspelling?"
+
+
+def test_a_misspelled_worktree_root_names_the_stray(home, d):
+    _write_env(home, _valid_env_body(d).replace("worktree_root:", "worktreeroot:"))
+    with pytest.raises(ConfigError) as ei:
+        load_environment()
+    assert "found 'worktreeroot' - a misspelling?" in ei.value.reason
+    assert "worktree_root: ~/worktrees" in ei.value.remediation  # the field's own advice kept
+
+
+def test_a_missing_required_key_with_no_near_match_is_unchanged(home, d):
+    """Control: no stray spelling, so the message and remediation are exactly the old ones."""
+    _write_env(home, _valid_env_body(d).replace(f"    lock_dir: {d}\n", "    unrelated_thing: 1\n"))
+    with pytest.raises(ConfigError) as ei:
+        load_environment()
+    assert ei.value.reason == "required key 'lock_dir' is missing"
+    assert ei.value.remediation == "add 'lock_dir:' (string)"
+
+
+def test_a_stem_with_inner_dots_is_legal_and_fails_only_as_unknown(home, d):
+    _write_env(home, _valid_env_body(d))
+    _two_projects(home, d)
+    with pytest.raises(ConfigError) as ei:
+        load_project("a..b", source="from --project")
+    assert ei.value.field_path == "<file>"
+    assert "unknown project 'a..b'" in _first_line(ei.value)
+
+
+def test_a_missing_key_never_suggests_renaming_a_legitimate_later_key(home, d):
+    # `autodoc_root` is read AFTER `data_root`, so it is unread when data_root is found
+    # missing - and is still a schema key, never a misspelling.
+    body = _valid_env_body(d).replace(f"    data_root: {d}\n", f"    autodoc_root: {d}\n")
+    _write_env(home, body)
+    with pytest.raises(ConfigError) as ei:
+        load_environment()
+    assert ei.value.reason == "required key 'data_root' is missing"
+
+
+def test_a_missing_required_key_never_suggests_another_required_key(home, d):
+    _write_env(home, _valid_env_body(d).replace(f"    suite_root: {d}\n", ""))
+    with pytest.raises(ConfigError) as ei:
+        load_environment()
+    assert ei.value.field_path == "suite_root"
+    assert ei.value.reason == "required key 'suite_root' is missing"
+
+
+def test_a_project_schema_key_is_never_a_near_miss_candidate():
+    # No REQUIRED project key sits near another project key today, so the pairs the review
+    # reproduced are exercised on the helper directly: each sibling is a legitimate key.
+    assert config._near_miss({"deprecated_mirror_checkout": "x"}, "deprecated_mirror", "") is None
+    assert config._near_miss({"provision": "x"}, "polishing", "generation_skills") is None
+    assert config._near_miss({"provision": "x"}, "provisio", "generation_skills") is None
+
+
+def test_a_missing_project_block_still_names_an_unknown_near_spelling(home, d):
+    """Control for the exclusion: a truly unknown key in a project file is still suggested."""
+    body = _valid_project_body(d).replace(
+        "    verification:\n      strategy: test-suite\n", "    verificaton: 1\n"
+    )
+    _write_env(home, _valid_env_body(d))
+    _write_project(home, "foo", body)
+    with pytest.raises(ConfigError) as ei:
+        load_project("foo")
+    assert ei.value.reason == "required block 'verification' is missing; found 'verificaton' - a misspelling?"
+
+
+def test_a_missing_nested_key_names_an_unknown_sibling():
+    assert config._near_miss({"provison": "x"}, "provision", "generation_skills") == "provison"
+
+
+def _schema_reads_from_source() -> dict:
+    """Per-block keys the two builders read, derived from config.py's own AST.
+
+    Maps each block variable to its path through `x = _require_block(data, "k", ...)`, then
+    collects the key literal of every reader call on it - the same calls that feed
+    `_reject_unknown_keys`, so a reader added without updating `_SCHEMA_KEYS` fails here.
+    """
+    readers = {
+        "_note", "_optional_block", "_require_block", "_require_int", "_require_str",
+        "_require_enum", "_require_owner_repo", "_opt_bool", "_opt_int", "_opt_str", "_opt_list",
+    }
+    tree = ast.parse(Path(config.__file__).read_text(encoding="utf-8"))
+    found: dict = {}
+    for fn in tree.body:
+        if not (isinstance(fn, ast.FunctionDef) and fn.name in ("_build_environment", "_build_project")):
+            continue
+        var = {"data": ""}
+        for n in ast.walk(fn):
+            if (isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+                    and getattr(n.value.func, "id", None) == "_require_block"):
+                var[n.targets[0].id] = n.value.args[1].value
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and getattr(n.func, "id", None) in readers and len(n.args) >= 2:
+                block, key = n.args[0], n.args[1]
+                if isinstance(block, ast.Name) and isinstance(key, ast.Constant):
+                    found.setdefault(var[block.id], set()).add(key.value)
+    return {k: frozenset(v) for k, v in found.items()}
+
+
+def test_schema_keys_match_what_the_builders_read():
+    assert config._SCHEMA_KEYS == _schema_reads_from_source()
+
+
+# --------------------------------------------------------------------------- #
+# An explicit config home, per call, instead of a pinned $AGENTFLOW_CONFIG
+# --------------------------------------------------------------------------- #
+def _two_homes(tmp_path: Path, d: str) -> tuple:
+    """Home A (in the variable) and home B (passed explicitly), each with its own profile."""
+    a, b = tmp_path / "home-a", tmp_path / "home-b"
+    _write_env(a, _valid_env_body(d).replace("Sample User", "Person A"))
+    _write_env(b, _valid_env_body(d).replace("Sample User", "Person B"))
+    _named_project(a, "alpha", d)
+    _named_project(b, "beta", d)
+    return a, b
+
+
+def test_an_explicit_config_home_beats_the_variable_for_every_reader(tmp_path, d, monkeypatch):
+    a, b = _two_homes(tmp_path, d)
+    monkeypatch.setenv("AGENTFLOW_CONFIG", str(a))
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+
+    assert config.config_home(b) == b
+    assert config.environment_path(b) == b / "environment.md"
+    assert load_environment(config_home=b).person.name == "Person B"
+    assert load_project("beta", config_home=b).name == "beta"
+    assert config.resolve_project_name(None, config_home=b) == "beta"
+    # The variable is read, never written, and the default path is unchanged.
+    assert config.config_home() == a
+    assert load_environment().person.name == "Person A"
+    assert config.resolve_project_name(None) == "alpha"
+    assert config.os.environ["AGENTFLOW_CONFIG"] == str(a)
+
+
+def test_an_unknown_project_under_an_explicit_home_lists_THAT_homes_profiles(tmp_path, d,
+                                                                             monkeypatch):
+    """The failure path enumerates profiles too: under the variable's home it would name
+    `alpha` while the caller asked about home B."""
+    a, b = _two_homes(tmp_path, d)
+    monkeypatch.setenv("AGENTFLOW_CONFIG", str(a))
+    with pytest.raises(ConfigError) as exc:
+        load_project("betx", config_home=b)
+    assert "configured: beta" in str(exc.value)
+    assert "alpha" not in str(exc.value)

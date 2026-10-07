@@ -117,7 +117,7 @@ def test_a_broken_git_is_not_stillness(tmp_path: Path):
 
     assert backoff.refs_signal(not_a_repo) is None
 
-    marker = backoff.take_marker(repo=not_a_repo, queue_fingerprints=())
+    marker = backoff.take_marker(repo=not_a_repo, queue_fingerprints=(), lane_fingerprints=())
     assert "refs" in marker.unreadable
     verdict = backoff.compare(marker, marker)
     assert verdict.verdict == backoff.UNKNOWN
@@ -157,8 +157,8 @@ def test_an_empty_queue_is_a_measurement_not_an_absence():
     assert backoff.queue_signal(None) is None
 
     still = backoff.compare(
-        backoff.Marker(refs="r", queue=empty),
-        backoff.Marker(refs="r", queue=empty),
+        backoff.Marker(refs="r", queue=empty, lanes="l"),
+        backoff.Marker(refs="r", queue=empty, lanes="l"),
     )
     assert still.verdict == backoff.STILL
 
@@ -182,8 +182,8 @@ def test_an_unreadable_signal_can_never_produce_a_still():
 def test_a_definite_change_outranks_an_unreadable_signal():
     """MOVED beats UNKNOWN: a change we watched happen is not unmade by a blind second signal."""
     result = backoff.compare(
-        backoff.Marker("r1", None),
-        backoff.Marker("r2", None),
+        backoff.Marker("r1", None, "l"),
+        backoff.Marker("r2", None, "l"),
     )
     assert result.verdict == backoff.MOVED
     assert result.moved == ("refs",)
@@ -201,14 +201,16 @@ def test_no_prior_marker_is_unknown_not_still():
 # --------------------------------------------------------------------------- #
 def test_the_marker_carries_only_local_signals():
     """The PR leg cost a `gh pr list` per lane per wake and could not say anything the refs
-    signal does not: a merge moves master, and master is a ref this module reads with no fetch.
+    signal does not once that ref is fetched: a merge moves master, and the refs signal reads
+    master's remote-tracking ref locally, as of the checkout's last fetch.
 
     Pinned as the SIGNAL ROSTER rather than as the absence of one function, because the roster
-    is what `Marker`, `compare` and `still_streak` all key off - a third signal added back for
-    symmetry would have to pass through here.
+    is what `Marker`, `compare` and `still_streak` all key off - a network signal added back for
+    symmetry would have to pass through here. Every name on the roster is a local read: ``refs``
+    from the checkout, ``queue`` from the spec survey, ``lanes`` from the registry file.
     """
-    assert backoff.SIGNALS == ("refs", "queue")
-    assert backoff.Marker().as_dict() == {"refs": None, "queue": None}
+    assert backoff.SIGNALS == ("refs", "queue", "lanes")
+    assert backoff.Marker().as_dict() == {"refs": None, "queue": None, "lanes": None}
     assert not hasattr(backoff, "merged_pr_signal"), (
         "the merged-PR signal is back; it is a network round-trip per lane per wake for a fact "
         "the local refs signal already carries"
@@ -222,8 +224,8 @@ def test_a_row_written_by_the_older_three_signal_shape_still_reads_back():
     An unknown key is ignored rather than rejected: raising here would make one historical line
     unreadable, which ends a streak - an honest direction, but a needless one.
     """
-    marker = backoff.Marker.from_dict({"refs": "r", "queue": "q", "prs": "p"})
-    assert marker == backoff.Marker(refs="r", queue="q")
+    marker = backoff.Marker.from_dict({"refs": "r", "queue": "q", "lanes": "l", "prs": "p"})
+    assert marker == backoff.Marker(refs="r", queue="q", lanes="l")
     assert marker.unreadable == ()
 
 
@@ -605,7 +607,7 @@ def test_observe_walks_a_freeze_from_base_cadence_to_a_stand_down(tmp_path: Path
     drops everybody back to base cadence.
     """
     path = _log(tmp_path)
-    frozen = backoff.Marker(refs="r", queue=backoff.queue_signal(()))
+    frozen = backoff.Marker(refs="r", queue=backoff.queue_signal(()), lanes=backoff.lanes_signal(()))
 
     movement, plan = backoff.observe(path, frozen, "lead-dev", now=T0)
     assert movement.verdict == backoff.UNKNOWN
@@ -634,7 +636,7 @@ def test_observe_walks_a_freeze_from_base_cadence_to_a_stand_down(tmp_path: Path
     assert plan.honourable_s is None
     assert plan.residual_s == backoff.FLOOR_INTERVAL_S
 
-    moved = backoff.Marker(refs="r2", queue=frozen.queue)
+    moved = backoff.Marker(refs="r2", queue=frozen.queue, lanes=frozen.lanes)
     movement, plan = backoff.observe(
         path, moved, "lead-dev", now=T0 + timedelta(hours=5, minutes=35)
     )
@@ -759,7 +761,7 @@ def test_a_scheduled_plan_carries_no_eta_field():
 
 def test_observe_attaches_the_eta_to_a_stand_down(tmp_path: Path):
     path = _log(tmp_path)
-    frozen = backoff.Marker(refs="r", queue=backoff.queue_signal(()))
+    frozen = backoff.Marker(refs="r", queue=backoff.queue_signal(()), lanes=backoff.lanes_signal(()))
     backoff.observe(path, frozen, "lead-dev", now=T0)
     for i in range(1, 6):
         backoff.observe(path, frozen, "jr-dev-1", now=T0 + timedelta(minutes=8 * i))
@@ -835,3 +837,292 @@ def test_the_guard_slot_constants_are_the_guard_cron_expression():
     assert backoff._parse_guard_cron("7 */3 * * *") == (7, 3)
     with pytest.raises(ValueError):
         backoff._parse_guard_cron("23 0,5,10 * * *")
+
+
+# --------------------------------------------------------------------------- #
+# 8. THE LANES SIGNAL - the registry Queue rows the junior lanes select from
+# --------------------------------------------------------------------------- #
+EPOCH = "1970-01-01T00:00:00Z"
+
+
+def _board(tmp_path: Path) -> tuple[Path, list[str]]:
+    """A real registry written by `init`, and the argv prefix every later verb on it needs."""
+    reg = tmp_path / "projects" / "demo-project" / "status" / "registry.md"
+    lock = tmp_path / "locks"
+    lock.mkdir(parents=True)
+    base = ["--file", str(reg), "--lock-dir", str(lock), "--project", "demo-project"]
+    assert registry.main(["init", *base]) == 0
+    return reg, base
+
+
+def _gather(tmp_path: Path, monkeypatch, reg: Path, repo: Path | None = None):
+    """`gather_marker` against a tmp fleet: the real three-probe path, config stubbed out."""
+    from agentflow import fleet_report
+    from agentflow.fleet_report import ReportInputs
+
+    inputs = ReportInputs(
+        data_root=tmp_path, project="demo-project", mtime_cutoff_iso=EPOCH,
+        registry_path=reg, repo_path=repo,
+    )
+    monkeypatch.setattr(fleet_report, "inputs_from_config", lambda p: inputs)
+    return backoff.gather_marker("demo-project")
+
+
+def _gather_clean(tmp_path: Path, monkeypatch, reg: Path, repo: Path | None = None):
+    """`_gather` with `$AGENTFLOW_REGISTRY` cleared, so the host's environment cannot decide it."""
+    monkeypatch.delenv("AGENTFLOW_REGISTRY", raising=False)
+    return _gather(tmp_path, monkeypatch, reg, repo)
+
+
+def _queue_ids(reg: Path) -> list[str]:
+    return list(registry.parse_registry(reg.read_text(encoding="utf-8")).queue)
+
+
+def _publish(base: list[str], slug: str, lane: str = "jr-dev-1") -> None:
+    assert registry.main([
+        "publish", *base, "--actor", "lead-dev", "--slug", slug, "--title", slug, "--lane", lane,
+    ]) == 0
+
+
+def test_publishing_a_ready_row_into_a_junior_lane_moves_the_marker(tmp_path, monkeypatch):
+    """The defect this signal exists for. Lead-dev publishes a row into jr-dev-1's lane; the spec
+    survey does not change, so `refs` and `queue` read identical on both sides. Only `lanes` can
+    see it, and it must, or the junior reads STILL while its lane holds work."""
+    reg, base = _board(tmp_path)
+    before, notes = _gather(tmp_path, monkeypatch, reg)
+    assert before.lanes is not None, notes
+    _publish(base, "fresh-row")
+    after, _ = _gather(tmp_path, monkeypatch, reg)
+
+    assert after.queue == before.queue, "the spec survey did not move - only lanes can see this"
+    movement = backoff.compare(before, after)
+    assert movement.verdict == backoff.MOVED
+    assert movement.moved == ("lanes",)
+
+
+def test_a_published_row_is_not_stood_down_on_a_long_frozen_board(tmp_path, monkeypatch):
+    """The stand-down decision itself, driven through `observe` over a log that has earned the
+    floor. Control first: the same log and an unchanged marker DOES stand down, so the second
+    assertion can fail. With the published row the verdict is MOVED and the lane schedules at
+    base cadence."""
+    reg, base = _board(tmp_path)
+    quiet, _ = _gather(tmp_path, monkeypatch, reg)
+    # `refs` is not under test here; a fixed value keeps the marker fully readable.
+    quiet = backoff.Marker(refs="r", queue=quiet.queue, lanes=quiet.lanes)
+
+    def frozen_log(where: Path) -> Path:
+        path = _log(where)
+        for i in range(6):
+            _append(path, backoff.STILL, quiet, at=T0 + timedelta(minutes=8 * i))
+        return path
+
+    later = T0 + timedelta(hours=6)
+    _, control = backoff.observe(frozen_log(tmp_path / "control"), quiet, "jr-dev-1", now=later)
+    assert control.action == backoff.STAND_DOWN, "the control log must earn the floor"
+
+    _publish(base, "ready-for-jr")
+    published, _ = _gather(tmp_path, monkeypatch, reg)
+    published = backoff.Marker(refs="r", queue=published.queue, lanes=published.lanes)
+    movement, plan = backoff.observe(
+        frozen_log(tmp_path / "fixed"), published, "jr-dev-1", now=later
+    )
+    assert movement.verdict == backoff.MOVED and movement.moved == ("lanes",)
+    assert plan.action == backoff.SCHEDULE
+    assert plan.intended_s == backoff.BASE_WAKE_S
+
+
+def test_claim_release_and_relane_each_move_the_lanes_signal(tmp_path, monkeypatch):
+    """Every transition a junior's selection turns on moves the fingerprint: a claim (claimed_by
+    and state), a release to another state, and a relane."""
+    reg, base = _board(tmp_path)
+    _publish(base, "row-a")
+    (eid,) = _queue_ids(reg)
+    seen = [_gather(tmp_path, monkeypatch, reg)[0].lanes]
+
+    assert registry.main(["claim", *base, "--actor", "jr-dev-1", "--id", eid]) == 0
+    seen.append(_gather(tmp_path, monkeypatch, reg)[0].lanes)
+    assert registry.main([
+        "release", *base, "--actor", "jr-dev-1", "--id", eid, "--state", "review",
+    ]) == 0
+    seen.append(_gather(tmp_path, monkeypatch, reg)[0].lanes)
+
+    assert None not in seen
+    assert len(set(seen)) == 3, f"a claim or a release left the fingerprint where it was: {seen}"
+
+    _publish(base, "row-b")
+    published = _gather(tmp_path, monkeypatch, reg)[0].lanes
+    (rid,) = [k for k in _queue_ids(reg) if k != eid]
+    assert registry.main([
+        "relane", *base, "--actor", "lead-dev", "--id", rid, "--lane", "jr-dev-2",
+        "--reason", "jr-dev-1 is busy",
+    ]) == 0
+    assert _gather(tmp_path, monkeypatch, reg)[0].lanes != published, "a relane did not move it"
+
+
+def test_notes_do_not_move_the_lanes_signal(tmp_path, monkeypatch):
+    """A note annotates the board; it changes nothing any lane can take. Neither a Notes-block
+    note nor an edit to a row's own notes cell may reset the fleet's streak."""
+    reg, base = _board(tmp_path)
+    _publish(base, "row-a")
+    before = _gather(tmp_path, monkeypatch, reg)[0].lanes
+
+    assert registry.main([
+        "note", *base, "--actor", "jr-dev-1", "--text", "looked at row-a, nothing to add",
+    ]) == 0
+    assert registry.parse_registry(reg.read_text(encoding="utf-8")).notes, "the note did not land"
+    assert _gather(tmp_path, monkeypatch, reg)[0].lanes == before
+
+    text = reg.read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if ln.startswith("| E-") and "row-a" in ln)
+    assert line.endswith("|  |"), line
+    reg.write_text(
+        text.replace(line, line[: -len("|  |")] + "| a cell note |"),
+        encoding="utf-8", newline=chr(10),
+    )
+    row = next(iter(registry.parse_registry(reg.read_text(encoding="utf-8")).queue.values()))
+    assert row.notes == "a cell note", "the row notes cell was not edited"
+    assert _gather(tmp_path, monkeypatch, reg)[0].lanes == before
+
+
+def test_an_unreadable_registry_blinds_lanes_alone(tmp_path, monkeypatch, checkout: Path):
+    """A missing or damaged board is `blind=lanes` with a note, never a crash and never a known
+    empty Queue - and `refs` and `queue` are still read, because each probe has its own guard."""
+    board = tmp_path / "projects" / "demo-project" / "status" / "registry.md"
+    marker, notes = _gather(tmp_path, monkeypatch, board, repo=checkout)
+    assert marker.lanes is None
+    assert marker.refs is not None and marker.queue is not None, notes
+    assert any(n.startswith("lanes: FileNotFoundError") for n in notes), notes
+    assert backoff.blind_line(backoff.compare(None, marker)) == "blind=lanes"
+
+    board.parent.mkdir(parents=True)
+    board.write_text("# a board with no sections\n", encoding="utf-8")
+    marker, notes = _gather(tmp_path, monkeypatch, board, repo=checkout)
+    assert marker.lanes is None
+    assert marker.refs is not None and marker.queue is not None, notes
+    assert any(n.startswith("lanes: RegistryError") for n in notes), notes
+
+
+def test_an_env_registry_naming_another_board_blinds_lanes(tmp_path, monkeypatch):
+    """`$AGENTFLOW_REGISTRY` pointing elsewhere is the board conflict the registry CLI refuses
+    under `--project`; fingerprinting the derived board would read a board nobody writes as frozen."""
+    reg, _ = _board(tmp_path)
+    monkeypatch.setenv("AGENTFLOW_REGISTRY", str(tmp_path / "elsewhere" / "registry.md"))
+    marker, notes = _gather(tmp_path, monkeypatch, reg)
+    assert marker.lanes is None
+    assert any(n.startswith("lanes: registry_board_conflict") for n in notes), notes
+
+    monkeypatch.setenv("AGENTFLOW_REGISTRY", str(reg))
+    marker, notes = _gather(tmp_path, monkeypatch, reg)
+    assert marker.lanes == backoff.lanes_signal(()), notes
+
+
+def test_a_lanes_note_is_one_line(tmp_path, monkeypatch):
+    """The CLI prints each note as one `note:` line; a newline in the error would print a bare
+    continuation line that no reader attributes to a note."""
+    board = tmp_path / "projects" / "demo-project" / "status" / "registry.md"
+    board.parent.mkdir(parents=True)
+    board.write_text("# a board with no sections\n", encoding="utf-8")
+    _, notes = _gather_clean(tmp_path, monkeypatch, board)
+    lanes_notes = [n for n in notes if n.startswith("lanes:")]
+    assert lanes_notes and all("\n" not in n for n in lanes_notes), notes
+
+
+def test_an_empty_queue_table_is_a_measurement_not_an_absence(tmp_path, monkeypatch):
+    """The `queue_signal` rule again, for `lanes`: zero Queue rows is a known zero that can drive
+    backoff; only an unreadable board is None."""
+    reg, _ = _board(tmp_path)
+    marker, _ = _gather(tmp_path, monkeypatch, reg)
+    assert marker.lanes == backoff.lanes_signal(())
+    assert backoff.lanes_signal(None) is None
+
+
+def test_a_marker_logged_before_lanes_existed_blinds_one_wake_only(tmp_path):
+    """The shared log holds rows written without `lanes`. The first wake after the change compares
+    against one and reads UNKNOWN, naming the previous marker as the blind side; that wake records
+    a marker that carries `lanes`, so the second wake reaches an ordinary verdict and the streak
+    opens again. Blind forever would disable the backoff on every fleet with an old log."""
+    path = _log(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps({
+            "at": "2026-09-22T05:00:00Z", "actor": "steward", "verdict": backoff.STILL,
+            "moved": [], "unreadable": [], "marker": {"refs": "r", "queue": "q"},
+        }) + "\n")
+    current = backoff.Marker("r", "q", "l")
+
+    first, _ = backoff.observe(path, current, "jr-dev-1", now=T0)
+    assert first.verdict == backoff.UNKNOWN
+    assert first.blind_previous == ("lanes",)
+    assert first.blind_now == ()
+    assert backoff.blind_line(first) == "blind=-", "the old row is not this wake's probe"
+
+    second, plan = backoff.observe(path, current, "jr-dev-2", now=T0 + timedelta(minutes=8))
+    assert second.verdict == backoff.STILL
+    assert backoff.still_streak(path) == 1
+    assert plan.action == backoff.SCHEDULE and plan.intended_s == 2 * backoff.BASE_WAKE_S
+
+
+# --------------------------------------------------------------------------- #
+# 9. THE QUEUE SIGNAL - what lead-dev selects, not what it may dispatch
+# --------------------------------------------------------------------------- #
+def _epic(tmp_path: Path, slug: str, state: str, extra: str = "") -> None:
+    """One spec under the demo project's `design/specs`, the path `survey_epics` globs.
+
+    It declares `## Files` only so the survey's promotability warning stays out of the log."""
+    spec = tmp_path / "projects" / "demo-project" / "design" / "specs" / f"{slug}.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        f"---\nslug: {slug}\ntitle: {slug}\ncurrent_state: {state}\n{extra}---\n\n# {slug}\n\n"
+        "## Files\n\n- `agentflow/backoff.py`\n",
+        encoding="utf-8", newline="\n",
+    )
+
+
+@pytest.mark.parametrize("finished", ["done", "archived"])
+def test_a_prerequisite_outside_the_dispatchable_set_finishing_moves_the_queue(
+    tmp_path, monkeypatch, finished
+):
+    """An `on-server-ops` prerequisite is never dispatchable, so a fingerprint of the
+    dispatchable rows holds only its dependent, on both sides - and reads STILL while that
+    dependent becomes claimable. The selectable set is dependency-ready, so the dependent enters
+    it when the prerequisite finishes, and the queue signal has to see that.
+
+    `archived` is the case that pins the full survey: a default survey deletes the archived
+    prerequisite before readiness is computed, so its dependent never becomes ready there."""
+    reg, _ = _board(tmp_path)
+    _epic(tmp_path, "prereq-ops", "approved-for-autonomous", "queue_class: on-server-ops\n")
+    _epic(
+        tmp_path, "dependent", "approved-for-autonomous",
+        "queue_class: fleet-buildable\ndepends_on: [prereq-ops]\n",
+    )
+    before, notes = _gather_clean(tmp_path, monkeypatch, reg)
+    assert before.queue is not None, notes
+
+    _epic(tmp_path, "prereq-ops", finished, "queue_class: on-server-ops\n")
+    after, notes = _gather_clean(tmp_path, monkeypatch, reg)
+
+    movement = backoff.compare(before, after)
+    assert movement.verdict == backoff.MOVED, (before, after, notes)
+    assert movement.moved == ("queue",)
+
+
+def test_a_change_inside_the_selectable_set_still_moves_the_queue(tmp_path, monkeypatch):
+    """A claimable epic leaving approval moves the queue, and an unchanged board does not. The
+    blocked `waits` is dispatchable but not selectable, so the queue is empty - not merely
+    different - once `ready-one` is done: what is fingerprinted is the selectable set exactly."""
+    reg, _ = _board(tmp_path)
+    _epic(tmp_path, "ready-one", "approved-for-autonomous", "queue_class: fleet-buildable\n")
+    _epic(tmp_path, "pending-dep", "drafted")
+    _epic(
+        tmp_path, "waits", "approved-for-autonomous",
+        "queue_class: fleet-buildable\ndepends_on: [pending-dep]\n",
+    )
+    before, notes = _gather_clean(tmp_path, monkeypatch, reg)
+    assert before.queue != backoff.queue_signal(()), "the ready epic must be in the queue"
+    again, _ = _gather_clean(tmp_path, monkeypatch, reg)
+    assert again.queue == before.queue, "an unchanged board must not move the queue"
+
+    _epic(tmp_path, "ready-one", "done", "queue_class: fleet-buildable\n")
+    after, _ = _gather_clean(tmp_path, monkeypatch, reg)
+    assert after.queue == backoff.queue_signal(())
+    assert backoff.compare(before, after).moved == ("queue",)

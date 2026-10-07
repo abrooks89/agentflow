@@ -780,9 +780,15 @@ function addFrontmatterDefaults(text, defaults) {
 }
 
 // autoFix(report, {pagesDir, date}) -> { fixed, residual }
-// Applies ONLY the two safe fix classes, then re-runs checkGraph for residual.
+// Applies ONLY the six safe fix classes below, each only when exactly one answer
+// exists, then re-runs checkGraph for residual.
 // (a) single-candidate (fuzzy, edit-distance<=1) broken link -> rewrite in-file.
 // (b) missing universal frontmatter field -> add status:active / updated:<date>.
+// (c) unresolved endpoint-form frontmatter link matching exactly one endpoint
+//     page -> rewrite to that page's slash-form alias (its title when none).
+// (d) one-way contract_with pair -> add the reciprocal entry on the other side.
+// (e) route-family alias gap -> add the slash-form alias from the routes entry.
+// (f) sanitized title with no alias -> add the full title as an alias.
 // Never touches: ambiguous links (>1 candidate), 0-candidate links, missing
 // pages, missingSourcePaths, orphans, or any non-safe frontmatter field.
 //
@@ -957,13 +963,27 @@ export function autoFix(report, { pagesDir, date, repoPath, inventoryPath, dryRu
 //                         request_model/response_model frontmatter (class: 'blocker'
 //                         on the report entry) — the endpoint contract is undocumented.
 //   - missingSourcePath : a page source_paths entry that does not exist in the repo.
+//   - frontmatterLinkUnresolved : a frontmatter relational link that does not resolve.
+//   - diagramSourceMissing      : a diagram `%% source:` path absent from the clone.
 // warnings (reported, non-fatal): advisory gap-markers / style —
-//   - brokenLink           : a plain broken link with zero candidates (advisory
-//                            gap-marker per taxonomy; entries without a `class`
-//                            field — older reports — default here).
-//   - brokenLinkCandidate  : a broken link that still has candidates (left unfixed).
+//   - brokenLink           : a plain broken link (advisory gap-marker per taxonomy;
+//                            entries without a `class` field — older reports —
+//                            default here). checkGraph records no candidates, so
+//                            every non-model broken link lands here.
+//   - brokenLinkCandidate  : a broken link whose report entry carries candidates;
+//                            checkGraph never produces one.
 //   - orphan               : a page with no inbound links.
 //   - missingFrontmatter   : a page still missing a required field (unfixed).
+//   - contractAsymmetry    : a page missing the reciprocal contract_with link.
+//   - aliasParity          : a route with no matching alias.
+//   - aliasCollision       : one alias shared by several pages.
+//   - selfLink             : a wikilink that resolves to its own page.
+//   - titleAliasMissing    : a title with no full-title alias.
+//   - diagramCommentOutsideFence : a `%%` comment outside a mermaid fence.
+//   - diagramDuplicate     : an identical mermaid fence on several pages.
+//   - diagramOverBudget    : a diagram over the node/entity budget.
+//   - fieldFormat          : a frontmatter field whose value is malformed.
+//   - exposesAsymmetry     : an endpoint missing from its service's exposes_endpoints.
 export function classify(report = {}) {
   const blockers = [];
   const warnings = [];

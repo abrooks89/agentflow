@@ -67,7 +67,7 @@ STRIP_ANCHORS = {
 }
 
 #: EACH LOOP'S OWN FALLBACK when the backoff helper cannot answer, because there are three
-#: different answers across the six loops and the previous version of this gate pinned none of
+#: different answers across the six self-waking loops and the previous version of this gate pinned none of
 #: them. It asserted the trigger phrase "non-zero exit" and nothing else, so rewriting a loop's
 #: `**On a non-zero exit use delaySeconds=3600**` into `**On a non-zero exit do whatever**` left
 #: it green - proven by mutation, 2026-09-22. A fallback nobody pins is a fallback that can be
@@ -92,9 +92,12 @@ _WS = re.compile(r"\s+")
 
 #: How far past the backoff call a loop's instructions for its three actions may run. Wide enough
 #: for the longest loop's (the auditor's, whose schedule and stand-down bullets each carry the
-#: reason its own dial does not govern them, and whose stand-down carries its literal row write),
-#: narrow enough that a phrase elsewhere in the file cannot satisfy it.
-_CALL_WINDOW = 3200
+#: reason its own dial does not govern them, and whose stand-down carries its literal row write,
+#: all after the paragraph naming the marker's three signals and what `blind=lanes` means),
+#: narrow enough that a phrase elsewhere in the file cannot satisfy it. The auditor's fallback
+#: line sits about 3.7k characters past its call, so a longer backoff paragraph there needs this
+#: widened first; the symptom is a fallback test saying the loop 'never names it'.
+_CALL_WINDOW = 4000
 
 
 def _skill(loop: str) -> str:
@@ -521,7 +524,7 @@ def test_every_loop_states_the_fallback_when_the_helper_cannot_answer(loop: str)
     rule, and so it held nothing: mutating `**On a non-zero exit use delaySeconds=3600**` into
     `**On a non-zero exit do whatever**` left it green. What the docstring claimed it held is the
     FALLBACK, so the fallback is what it asserts - each loop's own, from `FALLBACK_DELAYS`,
-    because the six loops have three different ones.
+    because the six self-waking loops have three different ones.
     """
     text = _skill(loop)
     call = f"python -m agentflow.backoff --actor {loop} --project <name>"
@@ -620,7 +623,13 @@ def test_no_loop_still_promises_the_marker_reads_merged_PRs(loop: str):
     text = _skill(loop)
     call = f"python -m agentflow.backoff --actor {loop} --project <name>"
     window = _flat(_window(text, call, _CALL_WINDOW))
-    assert "both local reads, no network call" in window, loop
+    assert "all three local reads, no network call" in window, loop
+    # The three signals by name, so a lane can read a `blind=lanes` line and knows a Queue-row
+    # publish into its lane moves the marker. `both local reads` was the two-signal wording.
+    assert "both local reads" not in window, loop
+    for signal in ("`refs`", "`queue`", "`lanes`"):
+        assert signal in window, (loop, signal)
+    assert "`blind=lanes` means the registry board could not be read" in window, loop
     assert "merged PRs" not in window, (
         f"{loop}/SKILL.md still tells the lane the marker reads merged PRs; that leg was a "
         "network round-trip per lane per wake and it was removed"
@@ -816,3 +825,93 @@ def test_the_auditor_writes_its_idle_row_on_every_empty_pass():
     head = _window(flat, lead, 600)
     assert "--actor auditor --project <name> --state idle" in head
     assert '--phase "idle <marker>" --eta <the wake you take>' in head
+
+
+def test_the_steward_writes_its_idle_row_on_every_clean_sweep():
+    """The steward's last row write before the backoff helper is a phase-boundary touch, whose eta
+    was declared before the helper answered. If the end-of-pass write rides only on the `blind=`
+    branch, the commonest clean sweep (`action=schedule`, `blind=-`) keeps that eta and is paged as
+    a missed wake while it idles. Same shape as the auditor's: the write is stated
+    unconditionally, ahead of the `blind=` paragraph."""
+    flat = _flat(_skill("steward"))
+    lead = "**On every clean sweep, write your end-of-pass row before you schedule — whatever the action.**"
+    assert lead in flat
+    assert flat.index(lead) < flat.index("**Whatever the action, read the `blind=` line just above it.**")
+    head = _window(flat, lead, 600)
+    assert "--actor steward --project <name> --state idle" in head
+    assert '--phase "clean sweep, idle-wake" --eta <the wake you take>' in head
+    # The `blind=` paragraph amends that same row; it no longer reads as the only write.
+    para = _window(flat, "**Whatever the action, read the `blind=` line just above it.**", 600)
+    assert "that same row's `phase` has to carry it" in para
+
+
+#: The junior builders, derived from the product roster so a fourth junior is pinned the day it
+#: is added rather than the day someone remembers this list.
+JUNIOR_LOOPS = tuple(a for a in AGENTS if a.startswith("jr-dev-"))
+
+
+def test_the_junior_roster_is_not_empty():
+    """A prefix filter that matches nothing parametrizes to nothing and reports as a pass."""
+    assert len(JUNIOR_LOOPS) >= 3, JUNIOR_LOOPS
+
+
+@pytest.mark.parametrize("loop", JUNIOR_LOOPS)
+def test_every_junior_writes_its_idle_row_on_every_empty_lane_pass(loop: str):
+    """A junior's last row write before the backoff helper is its wake-read `status` stamp, whose
+    eta was declared before the helper answered. If the empty-lane write rides only on the
+    `blind=` branch, the commonest empty pass (`action=schedule`, `blind=-`) keeps that eta and is
+    paged as a missed wake while it idles. Same shape as the auditor's and the steward's: the
+    write is stated unconditionally, in its own paragraph ahead of the `blind=` paragraph, and
+    the `blind=` paragraph only amends that row."""
+    flat = _flat(_skill(loop))
+    lead = (
+        "**On every empty-lane pass, write your end-of-pass row before you schedule — whatever "
+        "the action.**"
+    )
+    blind = "**Whatever the action, read the `blind=` line just above it.**"
+    assert lead in flat, loop
+    assert flat.index(lead) < flat.index(blind), loop
+    # The lead paragraph itself, bounded by the `blind=` paragraph rather than a width, so the
+    # write cannot be satisfied by the conditional command that follows.
+    head = flat[flat.index(lead):flat.index(blind)]
+    assert f"--actor {loop} --project <name> --state idle" in head, loop
+    assert '--phase "lane empty, idle-wake" --eta <the wake you take>' in head, loop
+    assert "now plus the delay you schedule, or the stand-down's `eta=` value" in head, loop
+    assert "On a stand-down this is the bullet's write above, not a second one" in head, loop
+    para = _window(flat, blind, 600)
+    assert "that same row's `phase` has to carry it" in para, loop
+    assert "Write it before you schedule" not in para, (
+        f"{loop}/SKILL.md's `blind=` paragraph still prescribes its own write instead of "
+        "amending the end-of-pass row"
+    )
+
+
+def test_lead_dev_writes_its_idle_row_on_every_empty_queue_pass():
+    """lead-dev's empty-queue step 2 writes the `idle` row before the backoff helper answers, so
+    its eta is a guess. If the end-of-pass write rides only on the stand-down bullet and the
+    `blind=` branch, the commonest empty pass (`action=schedule`, `blind=-`) keeps that guess and
+    is paged as a missed wake while it idles. Same shape as the juniors': the write is stated
+    unconditionally, in its own paragraph ahead of the `blind=` paragraph, and the `blind=`
+    paragraph only amends that row."""
+    flat = _flat(_skill("lead-dev"))
+    lead = (
+        "**On every empty-queue pass, write your end-of-pass row before you schedule — whatever "
+        "the action.**"
+    )
+    blind = "**Whatever the action, read the `blind=` line just above it.**"
+    assert lead in flat
+    assert flat.index(lead) < flat.index(blind)
+    head = flat[flat.index(lead):flat.index(blind)]
+    assert "--actor lead-dev --project <name> --state idle" in head
+    assert '--phase "no work available; idle-wake" --eta <the wake you take>' in head
+    assert "now plus the delay you schedule, or the stand-down's `eta=` value" in head
+    assert "On a stand-down this is the bullet's write above, not a second one" in head
+    para = _window(flat, blind, 600)
+    assert "that same row's `phase` has to carry it" in para
+    assert "write it again" not in para, (
+        "lead-dev's `blind=` paragraph still prescribes its own write instead of amending the "
+        "end-of-pass row"
+    )
+    # Step 2's pre-helper eta is declared provisional, never as the wake the lane will take.
+    assert "--eta <the time you will next wake>" not in flat
+    assert "step 3 always replaces it with the wake you take" in flat

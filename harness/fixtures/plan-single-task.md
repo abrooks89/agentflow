@@ -3,6 +3,7 @@ title: "Toy calc.py single-task plan"
 date: 2026-07-17
 epic: "Toy calc single task"
 slug: toy-calc-single-task
+project: harness-toy
 spec: "harness/fixtures/refine-toy.md"
 current_state: approved-for-autonomous
 per_wave_worktrees: true
@@ -36,6 +37,11 @@ tasks:
 
 A minimal, behavior-frozen fixture plan that parses clean via the current
 `lib.plan_parser.parse_plan`. Exactly one task, one phase, valid acyclic DAG.
+
+`project: harness-toy` is the plan's target tree: with no `worktree:` field the
+orchestrator resolves `<worktree_root>/<project>/<slug>`, and its status board,
+wave scripts and vault mirror key off the same name. There is deliberately no
+`worktree:` field, because a tracked fixture cannot name a machine path.
 
 ## Task 1 — implement add()
 

@@ -18,13 +18,20 @@ by running pytest itself and gitignored, was inside a live gate corpus.
 
 WHAT IT DOES NOT CLAIM, stated because a gate that overstates itself is worse than none.
 
-*Its corpus is `skills/_shared/tests/**.py`, recursively, and nothing else.* Two other first-party
-test trees run in CI and are NOT examined here. `skills/autodoc-init/references/graph/tests/`
-installs `pytest` and its own two dependencies and never `agentflow`, so nothing there can import
-this helper -- and it holds a live instance of this defect
-(`test_query_no_storage_import.py`, `eval_dir.glob("*.py")`, reddened by one untracked file).
-`harness/*.py` holds six more. Both are out of scope for gh#175 and tracked separately; naming
-them is what keeps the first paragraph from reading as a claim about the whole repository.
+*Its corpus is every tracked `.py` under the three CI pytest trees -- `skills/_shared/tests/`,
+`skills/autodoc-init/references/graph/tests/`, `install/` -- plus `harness/`, recursively, and
+nothing else* (gh#410 widened it from `_shared` alone). Shipped package code outside those trees
+is not examined. The gate only parses files and never imports them, so a tree whose suite cannot
+import `agentflow` is still in reach: the graph suite carries its own stdlib `tracked_files`
+(`graph/tests/tracked.py`), which the detector does not need to recognise because a converted
+site has no walk left to flag. A walk WRAPPED rather than replaced is recognised only as a
+bare-name call to `only_tracked`/`tracked_files`.
+
+*One check (C3) reads the working tree on purpose: two walks, `harness/check.py`'s before and
+after `FIXTURES_DIR.rglob('*')` snapshots, exempted by expression AND count, not by module*. C3
+diffs them to catch a status board the parse CREATED -- a file that is untracked by
+construction, so an index-derived snapshot would make that diff permanently empty and C3 a
+guaranteed PASS. A third copy of the same expression anywhere in the module is a finding.
 
 *It is a static check over walk EXPRESSIONS*, so it proves a repo-rooted walk is handed to
 `only_tracked`/`tracked_files`, not that the result is then used.
@@ -46,7 +53,15 @@ from agentflow.tracked_paths import tracked_paths
 
 SKILLS_ROOT = Path(__file__).resolve().parents[2]
 SUITE_ROOT = SKILLS_ROOT.parent
-TESTS_PREFIX = "skills/_shared/tests/"
+
+#: The trees this gate examines: the three CI pytest trees (`.github/workflows/ci.yml`) plus
+#: `harness/`, whose scripts CI runs as gates of their own.
+CORPUS_PREFIXES = (
+    "skills/_shared/tests/",
+    "skills/autodoc-init/references/graph/tests/",
+    "install/",
+    "harness/",
+)
 
 #: The two call shapes that make a walk a statement about the commit.
 WRAPPERS = frozenset({"only_tracked", "tracked_files"})
@@ -60,13 +75,27 @@ _OS_WALKS = frozenset({"walk", "listdir", "scandir"})
 #: Modules allowed to keep a raw repo-rooted walk, each with the reason it is still here.
 #: An entry whose module no longer has a raw walk is refused below -- an exemption that outlives
 #: its reason is how a list stops describing the tree it guards.
+#: Keys are repo-relative paths.
 EXEMPT = {
-    "test_skill_call_sites.py": (
+    "skills/_shared/tests/test_skill_call_sites.py": (
         "ten raw walks, and this file is held by another epic's uncommitted work at the time "
         "gh#175 shipped (lead's E-0743 seam). It is the one site the issue names as ALREADY "
         "scanning an untracked file, so the entry is a debt with an owner, not a decision: "
         "converting it is the gh#175 remainder and this exemption is what makes that visible."
     ),
+}
+
+#: Walk EXPRESSIONS that must read the working tree because observing it is their job, each with
+#: the exact number of sites allowed to carry it. Narrower than EXEMPT on purpose: any other raw
+#: walk in the same module is still a finding, and so is one copy too many of an exempted
+#: expression -- keyed on text alone, a new copy pasted anywhere in the module would pass.
+EXEMPT_SITES = {
+    ("harness/check.py", "FIXTURES_DIR.rglob('*')"): (2, (
+        "C3's before/after snapshot of the fixtures tree. It exists to catch a status board the "
+        "malformed parse CREATED, and a created file is untracked by construction -- an "
+        "index-derived snapshot would make `created` permanently empty and C3 a guaranteed PASS. "
+        "The working tree is the thing under observation here, not a corpus."
+    )),
 }
 
 
@@ -168,15 +197,14 @@ def raw_walks(source: str) -> list[tuple[int, str]]:
 
 
 def _test_modules(root: Path = SUITE_ROOT) -> list[str]:
-    """Every tracked test module, relative to the tests dir. This gate's corpus is the index too.
+    """Every tracked module in the corpus trees, repo-relative. This gate's corpus is the index too.
 
     RECURSIVE, and the parameter exists so that is provable: pytest recurses under `testpaths`,
     so a gate module one directory down is a live gate and must be examined.
     """
     return sorted(
-        rel[len(TESTS_PREFIX):]
-        for rel in tracked_paths(root)
-        if rel.startswith(TESTS_PREFIX) and rel.endswith(".py")
+        rel for rel in tracked_paths(root)
+        if rel.endswith(".py") and rel.startswith(CORPUS_PREFIXES)
     )
 
 
@@ -186,14 +214,23 @@ def _test_modules(root: Path = SUITE_ROOT) -> list[str]:
 def test_no_unexempted_module_derives_a_gate_corpus_from_the_working_tree() -> None:
     offenders = []
     examined = 0
-    for name in _test_modules():
-        if name in EXEMPT:
+    for rel in _test_modules():
+        if rel in EXEMPT:
             continue
         examined += 1
-        for lineno, expr in raw_walks((SKILLS_ROOT / "_shared" / "tests" / name).read_text(
-                encoding="utf-8")):
-            offenders.append(f"{name}:{lineno}  {expr}")
-    assert examined > 40, (
+        seen: dict[str, list[int]] = {}
+        for lineno, expr in raw_walks((SUITE_ROOT / rel).read_text(encoding="utf-8")):
+            seen.setdefault(expr, []).append(lineno)
+        for expr, lines in seen.items():
+            allowed = EXEMPT_SITES.get((rel, expr), (0, ""))[0]
+            if len(lines) > allowed:
+                # Every line is reported: which copy is the "extra" one is not knowable here.
+                offenders.extend(
+                    f"{rel}:{lineno}  {expr}"
+                    + (f"  ({len(lines)} sites, {allowed} exempted)" if allowed else "")
+                    for lineno in lines
+                )
+    assert examined > 100, (
         f"only {examined} modules were examined - a gate whose exemptions have eaten its corpus "
         "reports the same green as one with nothing to find"
     )
@@ -201,7 +238,9 @@ def test_no_unexempted_module_derives_a_gate_corpus_from_the_working_tree() -> N
         "these walk a path derived from __file__ -- a REPO root, not a tmp_path fixture -- and "
         "so make the verdict a function of this checkout rather than of the commit:\n  "
         + "\n  ".join(offenders)
-        + "\n\nWrap the walk: `only_tracked(<root>, <the walk>)` from agentflow.tracked_paths. "
+        + "\n\nDerive the corpus from the index: `tracked_files(<root>, <predicate>)` or "
+        "`only_tracked(<root>, <the walk>)` from agentflow.tracked_paths (in the graph suite, "
+        "which never installs agentflow: `tests.tracked.tracked_files`). "
         "Do NOT reach for a git pathspec instead: git's globbing is fnmatch without FNM_PATHNAME, "
         "so `skills/*/SKILL.md` crosses `/` and returns the vendored tree as well."
     )
@@ -210,8 +249,17 @@ def test_no_unexempted_module_derives_a_gate_corpus_from_the_working_tree() -> N
 def test_the_corpus_of_this_gate_is_not_empty() -> None:
     """A gate that scans nothing passes, and reads exactly like a gate that works."""
     modules = _test_modules()
-    assert len(modules) > 40, f"only {len(modules)} test modules discovered - scanning a stub"
-    assert "test_config.py" in modules and "test_skill_call_sites.py" in modules
+    assert len(modules) > 100, f"only {len(modules)} modules discovered - scanning a stub"
+    # One named module per corpus tree: a prefix that silently stopped matching would shrink
+    # the corpus while the count above stayed comfortably over its floor.
+    for rel in (
+        "skills/_shared/tests/test_config.py",
+        "skills/_shared/tests/test_skill_call_sites.py",
+        "skills/autodoc-init/references/graph/tests/test_query_no_storage_import.py",
+        "install/test_install_surface.py",
+        "harness/check.py",
+    ):
+        assert rel in modules, f"{rel} is missing from this gate's corpus"
 
 
 @pytest.mark.parametrize("name, why", sorted(EXEMPT.items()))
@@ -221,11 +269,31 @@ def test_every_exemption_still_names_a_real_raw_walk(name: str, why: str) -> Non
     If the named module is gone, or has been converted, this entry survives as a permanent hole
     that a future raw walk in that same file would fall straight through.
     """
-    path = SKILLS_ROOT / "_shared" / "tests" / name
+    path = SUITE_ROOT / name
     assert path.is_file(), f"{name} is exempted but does not exist - delete the entry"
     assert raw_walks(path.read_text(encoding="utf-8")), (
         f"{name} no longer has a raw repo-rooted walk, so its exemption is now a hole rather "
         f"than a debt. Delete the entry. Its stated reason was: {why}"
+    )
+    assert len(why) > 80, "an exemption without a real reason is an exclusion list"
+
+
+@pytest.mark.parametrize(
+    "site, count, why", sorted((site, n, why) for site, (n, why) in EXEMPT_SITES.items())
+)
+def test_every_site_exemption_still_names_a_real_raw_walk(
+    site: tuple[str, str], count: int, why: str
+) -> None:
+    """Same ledger rule, per expression, at the exact count: a site that has moved or been
+    converted must leave, and a lowered count must be lowered here too -- a slack count is room
+    for a new copy to land unseen."""
+    rel, expr = site
+    path = SUITE_ROOT / rel
+    assert path.is_file(), f"{rel} is exempted but does not exist - delete the entry"
+    found = sum(1 for _line, e in raw_walks(path.read_text(encoding="utf-8")) if e == expr)
+    assert found == count, (
+        f"{rel} has {found} raw walk(s) `{expr}`, but the exemption allows exactly {count}. "
+        f"Fix the count (or delete the entry if none remain). Its stated reason was: {why}"
     )
     assert len(why) > 80, "an exemption without a real reason is an exclusion list"
 
@@ -437,4 +505,7 @@ def test_the_corpus_reaches_a_test_module_one_directory_down(tmp_path) -> None:
     _git(root, "init", "-q")
     _git(root, "add", "-A")
 
-    assert _test_modules(root) == ["gates/test_nested.py", "test_flat.py"]
+    assert _test_modules(root) == [
+        "skills/_shared/tests/gates/test_nested.py",
+        "skills/_shared/tests/test_flat.py",
+    ]

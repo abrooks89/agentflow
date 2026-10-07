@@ -29,15 +29,17 @@ from __future__ import annotations
 
 import argparse
 import os
-from agentflow import atomic_io
+from agentflow import atomic_io, lock_file
 import re
+import socket
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Optional
+from typing import Callable, Optional
 
 # --------------------------------------------------------------------------- #
 # Vocabulary
@@ -65,6 +67,13 @@ QUEUE_STATES = ("ready", "building", "parked", "review", "done", "withdrawn")
 #: those rows entirely alone and tallies them separately. `review` is deliberately absent from
 #: this tuple: it is in-flight, not terminal.
 TERMINAL_QUEUE_STATES = ("done", "withdrawn")
+#: An issue reference as the held predicate (`issue_intake.held_refs`) reads a board cell:
+#: `gh#N` in any case, or a bare `#N` (gh#909). A row citing `GH#14` or `#12` used to go
+#: unheld and be offered a second time; holding too much costs one skipped pick, holding too
+#: little costs a double build. A bare `#` glued to a word (`PR#12`, `x#12`) or written as
+#: `PR #12` is a pull request or not a reference at all, and does not hold. Lives here so
+#: `publish` warns on exactly the forms the predicate reads. Bounded: int() refuses >4300 digits.
+HELD_REF_RE = re.compile(r"(?:gh|(?<![\w#])(?<!\bpr\s))#(\d{1,9})(?!\d)", re.I | re.ASCII)
 #: The only states `reap` will return to the pool. AN ALLOWLIST, and that is the whole point:
 #: `state` is raw text on every mutation path -- only `validate` checks it against the enum, and
 #: `reap` is BY DESIGN the verb you run on a board already known to be broken. Classifying as
@@ -149,7 +158,7 @@ MISSED_WAKE_GRACE_MIN = 30.0
 LAPSED_ETA_GRACE_MIN = 120.0
 
 #: `read --stranded` default: how long a halted lane may wait on an unanswered question
-#: before the fleet is told. 4h is the number the five loop skills already carried in prose, kept
+#: before the fleet is told. 4h is the number the loop skills already carried in prose, kept
 #: rather than re-derived so the code and the instruction cannot drift apart.
 STRAND_THRESHOLD_HOURS = 4.0
 
@@ -241,7 +250,7 @@ NOTE_BURST_WINDOW_MIN = 15
 NOTE_BURST_BYTES = NOTE_MAX_BYTES * NOTE_BURST_MAX
 
 #: Note bodies the CLI writes on its OWN behalf (reap, and the two stale-lock steals), never on
-#: an author's. The burst tally skips them: a steward that reaps three dead lanes wrote no
+#: an author's. The burst tally skips them: a steward that reaps dead lanes wrote no
 #: notes of its own, and must not find its next real broadcast refused as a "split note".
 #: Skipping them also keeps the tally honest about what is on DISK — `_run_mutation` folds the
 #: edit-lock steal note into the in-memory text BEFORE the command runs, so counting it would
@@ -298,12 +307,16 @@ STRANDED_NOTE_SAMPLE = 3
 #: The name is lowercase `a-z0-9` tokens joined by single hyphens -- exactly what `_short_name`
 #: emits -- so a hand-typed `E-0001-Bad_Case` is refused rather than quietly becoming a second
 #: spelling of one epic's id.
-_E_ID = re.compile(r"^E-\d{3,}(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$")
+#:
+#: Digits are `[0-9]`, never `\d`: `\d` takes any Unicode decimal digit, so `E-0200` spelled in
+#: Arabic-Indic digits passed every check yet compared unequal to its ASCII spelling, and `int()`
+#: read it as 200 in the allocator. Every id pattern in this module follows the same rule.
+_E_ID = re.compile(r"^E-[0-9]{3,}(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$")
 #: The name half of an id, or no match at all for a legacy bare id.
-_E_NAME = re.compile(r"^E-\d{3,}-([a-z0-9]+(?:-[a-z0-9]+)*)$")
-_Q_ID = re.compile(r"^Q-\d{3,}$")
-_B_ID = re.compile(r"^B-\d{3,}$")
-_ANY_ID = re.compile(r"^[QB]-\d{3,}$")
+_E_NAME = re.compile(r"^E-[0-9]{3,}-([a-z0-9]+(?:-[a-z0-9]+)*)$")
+_Q_ID = re.compile(r"^Q-[0-9]{3,}$")
+_B_ID = re.compile(r"^B-[0-9]{3,}$")
+_ANY_ID = re.compile(r"^[QB]-[0-9]{3,}$")
 
 #: Question fields `repair` may never rewrite — the human-decision record (gh#132).
 #:
@@ -448,8 +461,11 @@ RULES = {
     "q_answered_by_enum": "REGISTRY.md #Questions: answered_by is human|dev-manager|steward",
     "q_apply_raiser": "REGISTRY.md #Questions: only the raiser flips answered -> applied",
     "q_apply_answered": "REGISTRY.md #Questions: apply requires state answered",
+    # One key for apply, retract and resolve-blocker: the recovery is the same for all three.
+    "waited_on_live": "REGISTRY.md #Queue: a question or blocker a Queue row still waits on is not consumed until that row is unparked",
     "blocker_owner_resolves": "REGISTRY.md #Blockers: the assigned owner resolves the blocker",
     "blocker_assign_manager": "REGISTRY.md #Blockers: a manager role (steward or dev-manager) assigns blocker ownership",
+    "blocker_assign_steward_owned": "REGISTRY.md #Blockers: the steward assigns only a blocker it owns or one with no owner; dev-manager assigns any",
     "blocker_open": "REGISTRY.md #Blockers: only an open blocker can be resolved/assigned",
     "directive_devmanager": "REGISTRY.md #Directives: written ONLY by dev-manager",
     "repair_boilerplate_line": "REGISTRY.md #What-repair-may-not-touch: a table header or separator, the Deploy lock / Notes line, or a section comment is never a repair target",
@@ -471,14 +487,21 @@ RULES = {
     # key until gh#134, and the single message told an operator staring at a full registry to
     # run `init` — the one action that must never be taken while the real content is on disk.
     "file_missing": "REGISTRY.md: registry file absent — run `registry init --project <name>` (or provision)",
+    # Exit 3, not 2: nothing about the call was wrong, and re-running it (which re-reads the board
+    # under a fresh lock) is the whole recovery.
+    "edit_lock_stolen": "REGISTRY.md #Concurrency: the edit-lock was stolen, or the board changed on disk, while this command held it — nothing was written; re-run the command",
     "file_unreadable": "REGISTRY.md: registry file present but unreadable — truncated, half-synced, not a regular file, or --file/$AGENTFLOW_REGISTRY points at the wrong thing",
     # Deliberately NOT "run init": the file decoded and the content is still there, so init
     # would refuse (it never clobbers) and, if it did not, would destroy the only copy. The
-    # detail line names the missing section, which is the one thing the operator can act on.
-    "file_damaged": "REGISTRY.md: registry file readable but structurally damaged — a required section/table is missing; restore it (git history, or re-add the heading), never `init`",
+    # rule names no particular defect, because the key covers two with different fixes: a lost
+    # section or table (its detail carries `_MISSING_STRUCTURE_ADVICE`) and a damaged row (its
+    # detail names the row). Advising a heading restore over a duplicated row sent the
+    # operator hunting a defect the board did not have.
+    "file_damaged": "REGISTRY.md: registry file readable but structurally damaged — the detail below names the defect",
     # gh#715. Both deliberately NOT "run init": a typo'd project told to init got a phantom
     # board no builder reads, and a board conflict is resolved by choosing a board, not making one.
     "project_unconfigured": "REGISTRY.md #Board-resolution: --project must name a project whose config loads (<config-home>/projects/<name>.md) -- fix the config error below, never `init` a board for it",
+    "lock_name_empty": "REGISTRY.md #Concurrency: the edit-lock is named by the project directory above the board's status/ directory, and this board's resolved path has none -- move the board under <project>/status/",
     "registry_board_conflict": "REGISTRY.md #Board-resolution: $AGENTFLOW_REGISTRY and --project name different boards -- unset the env var, or pass --file to choose the board explicitly",
     "eta_iso": "REGISTRY.md #Agents: eta must be an ISO-8601 timestamp",
     "eta_too_far": (
@@ -505,9 +528,19 @@ RULES = {
         "REGISTRY.md #Agents: a stood-down lane was stopped by a human on purpose; reaping it is "
         "dev-manager's decision, carried out with --override-stand-down"
     ),
+    "reap_exempt_seat": (
+        "REGISTRY.md #Liveness-sweep: the human's seat (ETA_HORIZON_EXEMPT) holds no claims or "
+        "lock, so a reap recovers nothing; a stale row there is away past its declared return"
+    ),
     "stand_down_steward": "REGISTRY.md #Ownership: only the steward stands a lane down (the human is not a writer)",
     "stand_down_needs_reason": "REGISTRY.md #Agents: stand-down requires --reason, so the row says WHY it is excluded",
     "stand_down_heartbeat_only": "REGISTRY.md #Agents: a stood-down row needs a full status write to come back, not a heartbeat",
+    "stand_down_reaped": "REGISTRY.md #Agents: a reaped row holds no claims and is already excluded; standing it down would erase the reap mark",
+    "stand_down_self": "REGISTRY.md #Liveness-sweep: a loop never stands down its own row",
+    "stand_down_exempt_seat": (
+        "REGISTRY.md #Liveness-sweep: the human's seat (ETA_HORIZON_EXEMPT) is never alarmed as a "
+        "missed wake, so there is nothing to stand down"
+    ),
     "repair_steward": "REGISTRY.md #Ownership: malformed-row repair is steward only",
     "repair_no_match": "REGISTRY.md #Ownership: repair --old-line matched no line in the section",
     "repair_blank_old_line": (
@@ -517,9 +550,26 @@ RULES = {
     "repair_corrupt": "REGISTRY.md: repair must leave the registry parseable — the replacement did not",
     "repair_queue_owned": (
         "REGISTRY.md #Queue: repair may not rewrite a Queue row `validate` already accepts unless "
-        "its id is on more than one Queue line; every cell of a well-formed row has an owning verb "
-        "(publish/relane/withdraw for lead-dev, claim/release for the claimant, reap for a dead "
-        "claimant)"
+        "its id is on more than one Queue line, and on a row `validate` rejects it may change only "
+        "the cells `validate` flags, a flagged claimed_by or waiting_on only to '-'; where '-' "
+        "alone would strand the row (a flagged claimed_by on a building/parked/review row, a "
+        "dead waiting_on on a parked one) it takes exactly what reap or `release --state "
+        "building` writes, and no mend may leave an in-flight row unclaimed; every cell has an "
+        "owning verb (publish/relane/withdraw for lead-dev, claim/release for the claimant, "
+        "reap for a dead claimant)"
+    ),
+    "repair_blocker_owned": (
+        "REGISTRY.md #Blockers: repair may not rewrite a Blockers row `validate` already accepts "
+        "unless its id is on more than one Blockers line, and on a row `validate` rejects it may "
+        "change only the cells `validate` flags, a flagged owner only to '-' and state only to "
+        "'open'; every cell has an owning verb (raise-blocker, assign-blocker, resolve-blocker, "
+        "cull)"
+    ),
+    "repair_agents_owned": (
+        "REGISTRY.md #Agents: repair may not rewrite an Agents row `validate` already accepts "
+        "unless its agent is on more than one Agents line, and on a row `validate` rejects it "
+        "may change only the flagged status, and only to 'idle'; every cell has an owning verb "
+        "(status for the lane itself, stand-down and reap for the steward)"
     ),
     "repair_fails_validate": (
         "REGISTRY.md #Ownership: repair may not add a `validate` violation the board did not "
@@ -528,6 +578,16 @@ RULES = {
     "repair_heading_skeleton": (
         "REGISTRY.md #Questions: repair fixes a malformed LINE; it may not add, remove or rename "
         "a section or block heading (the registry's heading skeleton), in any declared section"
+    ),
+    "repair_not_a_row": (
+        "REGISTRY.md #What-repair-may-not-touch: a --new-line written into a table section "
+        "(Agents, Queue, Blockers) must be a row of that table, or blank; in Queue the Deploy "
+        "lock / Notes line is allowed too, when no intact one is already there"
+    ),
+    "repair_note_line": (
+        "REGISTRY.md #What-repair-may-not-touch: a Queue Note bullet is never a repair target "
+        "(except to restore a mangled Deploy lock / Notes line); Notes are owned by "
+        "`note --strike` and the cull, not by repair"
     ),
     # BUILT FROM THE TUPLE, never hand-copied (same reason as queue_state_enum above).
     "repair_question_field": (
@@ -599,7 +659,8 @@ class Capability:
     #: guard raised before it moved here -- a lane that greps its own transcript for a refusal
     #: it has seen before must still find it.
     denial: str = ""
-    #: Prose the guard cannot enforce: the ownership gate the verb ALSO applies, if any.
+    #: The ownership gate the verb ALSO applies, if any. Enforced at the verb's own site, which
+    #: may read ``janitors`` from here (`note`, `assign-blocker`); this string is the report's.
     bound_by: str = ""
     #: Loops exempt from ``bound_by`` because the fleet made them janitors of that surface.
     #: Read by the guard that applies the binding, so this stays the single source too.
@@ -751,7 +812,16 @@ ACTOR_CAPABILITY: dict[str, Capability] = {
         actors=("steward", "dev-manager"),
         rule="blocker_assign_manager",
         denial="{actor} may not assign blocker ownership",
-        bound_by="only an OPEN blocker",
+        # The exemption below covers the OWNERSHIP clause only; the open-state rule is stated
+        # inside the same string as applying to every actor, because the report prints the
+        # janitor line straight after this one and would otherwise read as exempting it too.
+        bound_by=(
+            "only a blocker the actor owns or one with no owner "
+            "(and, for every actor including the exempt one, only an OPEN blocker)"
+        ),
+        # dev-manager re-assigns any blocker; the steward re-pointing another seat's would
+        # override that seat's call.
+        janitors=("dev-manager",),
         spellings=("assign the blocker", "assign blocker ownership", "registry assign-blocker"),
     ),
     "directive": Capability(
@@ -1008,7 +1078,21 @@ class RegistryError(Exception):
 
 
 class LockHeldError(RuntimeError):
-    """The registry edit-lock is held by a live holder within the stale window."""
+    """The registry edit-lock is held by a holder not yet judged dead (exit 3)."""
+
+
+class EditLockStolenError(LockHeldError):
+    """This command's own edit-lock was stolen, or the board changed under it, before its write.
+
+    A LockHeldError because the recovery is the same retry (exit 3), but it carries a refusal
+    key so a caller can tell "someone else is writing" from "my write was discarded".
+    """
+
+    rule_key = "edit_lock_stolen"
+
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(f"refused [{self.rule_key}]: {RULES[self.rule_key]}\n  {detail}")
 
 
 class DirectiveAckError(Exception):
@@ -1096,13 +1180,26 @@ def _section_bounds(text: str) -> dict[str, tuple[int, int]]:
     return out
 
 
+#: The recovery for a lost section or table, and ONLY for that: row damage names its row instead.
+_MISSING_STRUCTURE_ADVICE = (
+    "a required section/table is missing; restore it (git history, or re-add the heading), "
+    "never `init`"
+)
+
+
+def _section_missing(name: str) -> RegistryError:
+    return RegistryError(
+        "file_damaged", f"section '## {name}' not found in registry - {_MISSING_STRUCTURE_ADVICE}"
+    )
+
+
 def _get_body(text: str, name: str) -> str:
     bounds = _section_bounds(text)
     if name not in bounds:
         # `file_damaged`, never `file_missing`: the file is right here and full of content.
         # The old key's advice — "run registry init" — was the single action an operator
         # must not take while the real content is still on disk (gh#134).
-        raise RegistryError("file_damaged", f"section '## {name}' not found in registry")
+        raise _section_missing(name)
     start, end = bounds[name]
     return text[start:end]
 
@@ -1110,7 +1207,7 @@ def _get_body(text: str, name: str) -> str:
 def _replace_body(text: str, name: str, new_body: str) -> str:
     bounds = _section_bounds(text)
     if name not in bounds:
-        raise RegistryError("file_damaged", f"section '## {name}' not found in registry")
+        raise _section_missing(name)
     start, end = bounds[name]
     return text[:start] + new_body + text[end:]
 
@@ -1159,7 +1256,9 @@ def _separator_index(body: str) -> Optional[int]:
 def _table_lost(section: str) -> RegistryError:
     """The section survived but its table did not: damage, not absence. Defined once so the
     two raisers stay byte-identical for the operator."""
-    return RegistryError("file_damaged", f"table in section '## {section}' not found")
+    return RegistryError(
+        "file_damaged", f"table in section '## {section}' not found - {_MISSING_STRUCTURE_ADVICE}"
+    )
 
 
 def _require_intact_table(text: str, section: str) -> str:
@@ -1352,9 +1451,69 @@ class Registry:
     notes: list[str] = field(default_factory=list)
 
 
-_QBLOCK_RE = re.compile(r"^### (Q-\d{3,})[ \t]*$", re.M)
+#: The row key each table's parser keeps, as (predicate, finding label, why). ONE copy, read by
+#: `parse_registry` (which drops a row whose key fails) and by `_table_row_problems` (which
+#: reports it), so validate and the parse can never disagree about which rows exist. A dropped
+#: Queue row took its claim with it: the held set never saw it and its issue read as free.
+_ROW_KEY_RULES = {
+    "Agents": (
+        lambda key: key in AGENTS, "bad agent", f"not one of the fleet's loops ({', '.join(AGENTS)})"
+    ),
+    "Queue": (lambda key: bool(_E_ID.match(key)), "bad id", "not an E-NNNN[-name] row id"),
+    "Blockers": (lambda key: bool(_B_ID.match(key)), "bad id", "not a B-NNNN row id"),
+}
+
+
+def _row_key_ok(section: str, key: str) -> bool:
+    return _ROW_KEY_RULES[section][0](key)
+
+
+_QBLOCK_RE = re.compile(r"^### (Q-[0-9]{3,})[ \t]*$", re.M)
 _QFIELD_RE = re.compile(r"^- ([a-z_]+):[ \t]*(.*)$")
-_DEPLOY_RE = re.compile(r"\*\*Deploy lock\*\*.*?holder:\s*([^,]+?),\s*taken-at:\s*(.+?)\s*$", re.M)
+#: The Queue's ``- **Deploy lock**`` field line, matched at LINE START. One spelling for the
+#: field predicate (`_DEPLOY_FIELD_RE`) and the holder parse/rewrite (`_DEPLOY_RE`): an
+#: unanchored parse read the holder out of any Note that merely quoted the field when the real
+#: line was damaged or gone, and the rewrite then edited that Note in place.
+#: Every separator is `[ \t]`, never `\s`: under re.M `\s` crosses newlines, so a hand-written
+#: bare `-` line followed by field-shaped text on the next line read as the field. The trailing
+#: lookahead stops the match at its own line end: a trailing `\s*` swallowed the newline of a
+#: blank line after the field, so the rewrite deleted that line.
+_DEPLOY_FIELD_PREFIX = r"^[ \t]*[-*][ \t]+\*\*Deploy lock\*\*"
+_DEPLOY_RE = re.compile(
+    _DEPLOY_FIELD_PREFIX
+    + r".*?holder:[ \t]*([^,\n]+?),[ \t]*taken-at:[ \t]*(.+?)[ \t]*(?=\r?$)",
+    re.M,
+)
+_DEPLOY_LINE_CANONICAL = "- **Deploy lock** — holder: none, taken-at: -"
+#: Two recoveries, so two messages. A line that is gone cannot come back through `repair`
+#: (a blank --old-line is refused), so naming repair alone sent every lane to a dead end. A
+#: line whose prefix was mangled ("Deploy lok") is indistinguishable from a gone one here,
+#: and `repair` CAN mend that one, so the message names both cases rather than guessing.
+_DEPLOY_LINE_MISSING = (
+    "Deploy lock line missing from Queue section - restore the `**Deploy lock**` line from git "
+    f"history or the registry template (`{_DEPLOY_LINE_CANONICAL}`): `repair` cannot insert "
+    "a line, and mends one only when a mangled copy is still on the board (steward `repair "
+    "--section Queue --old-line <that line>`); never `init`"
+)
+_DEPLOY_LINE_UNREADABLE = (
+    "Deploy lock line unreadable (no `holder: <lane>, taken-at: <ISO>`): {line!r} - steward "
+    "`repair --section Queue --old-line <that line> --new-line <the line restored, e.g. "
+    f"`{_DEPLOY_LINE_CANONICAL}`>`, never `init`"
+)
+
+
+def _deploy_line_problem(queue_body: str) -> Optional[str]:
+    """None when *queue_body* has a readable Deploy lock line; else the damage and its recovery.
+
+    "Unreadable" is a line the field predicate still names the Deploy lock line but the holder
+    parse cannot read; "missing" is no such line at all. They differ in what can mend them.
+    """
+    if _DEPLOY_RE.search(queue_body) is not None:
+        return None
+    garbled = next((ln for ln in queue_body.split("\n") if _is_deploy_lock_field(ln)), None)
+    if garbled is None:
+        return _DEPLOY_LINE_MISSING
+    return _DEPLOY_LINE_UNREADABLE.format(line=garbled.rstrip("\r"))
 
 
 def parse_registry(text: str) -> Registry:
@@ -1363,7 +1522,7 @@ def parse_registry(text: str) -> Registry:
 
     agents_body = _get_body(text, "Agents")
     for cells in _table_rows(agents_body, "agent"):
-        if len(cells) >= 7 and cells[0] in AGENTS:
+        if len(cells) >= 7 and _row_key_ok("Agents", cells[0]):
             reg.agents[cells[0]] = AgentRow(*cells[:7])
 
     queue_body = _get_body(text, "Queue")
@@ -1372,7 +1531,7 @@ def parse_registry(text: str) -> Registry:
         reg.deploy_holder = m.group(1).strip()
         reg.deploy_taken_at = m.group(2).strip()
     for cells in _table_rows(queue_body, "id"):
-        if len(cells) >= 7 and _E_ID.match(cells[0]):
+        if len(cells) >= 7 and _row_key_ok("Queue", cells[0]):
             reg.queue[cells[0]] = QueueRow(*cells[:7])
     reg.notes = list(_iter_note_bodies(queue_body))
 
@@ -1387,7 +1546,7 @@ def parse_registry(text: str) -> Registry:
 
     blockers_body = _get_body(text, "Blockers")
     for cells in _table_rows(blockers_body, "id"):
-        if len(cells) >= 6 and _B_ID.match(cells[0]):
+        if len(cells) >= 6 and _row_key_ok("Blockers", cells[0]):
             reg.blockers[cells[0]] = Blocker(*cells[:6])
 
     directives_body = _get_body(text, "Directives")
@@ -1415,7 +1574,7 @@ def _is_struck_note(content: str) -> bool:
 
 
 _NOTES_HEADER_RE = re.compile(r"^(\s*[-*]\s+\*\*Notes\*\*)(\s*[—–-]\s*)?(.*)$")
-_DEPLOY_FIELD_RE = re.compile(r"^\s*[-*]\s+\*\*Deploy lock\*\*")
+_DEPLOY_FIELD_RE = re.compile(_DEPLOY_FIELD_PREFIX)
 
 
 def _is_notes_header(line: str) -> bool:
@@ -1450,7 +1609,7 @@ def _is_deploy_lock_field(line: str) -> bool:
 
     That half is worse under a header that reports a NUMBER than it was under a constant. A
     header stuck at "(none)" made no claim about any particular note; a count that silently
-    omits one is a specific false statement on the surface all six loops read at every wake,
+    omits one is a specific false statement on the surface every loop reads at every wake,
     and it under-reports, so a lane drains what it can see and concludes it is done.
     """
     return _DEPLOY_FIELD_RE.match(line) is not None
@@ -1467,6 +1626,11 @@ def _iter_note_bodies(queue_body: str):
         if not stripped.startswith("- ") or _is_notes_header(line) or _is_deploy_lock_field(line):
             continue
         yield stripped[2:]
+
+
+def _is_note_bullet(line: str) -> bool:
+    """True when *line* is a coordination Note by `_iter_note_bodies`' rule (struck or live)."""
+    return next(_iter_note_bodies(line), None) is not None
 
 
 def _iter_qblocks(questions_body: str):
@@ -1638,6 +1802,23 @@ def directive_containment_hits(new_text: str, active: list[str]) -> list[str]:
         if needle in other or other in needle:
             hits.append(d)
     return hits
+
+
+def publish_title_warning(title: str) -> str | None:
+    """A warning when a `publish --title` cites an issue other than as lowercase `gh#N`, or None.
+
+    WARNS, never refuses: the held predicate reads `GH#N` and a bare `#N` too (`HELD_REF_RE`),
+    so the row is held either way, and refusing would break a publisher mid-wake over spelling.
+    The canonical form is still what the other board readers and a grep expect.
+    """
+    odd = [m.group(0) for m in HELD_REF_RE.finditer(title or "")
+           if not m.group(0).startswith("gh#")]
+    if not odd:
+        return None
+    return (
+        f"warning: --title cites {', '.join(odd)}; write an issue reference as lowercase "
+        "gh#<N> (e.g. gh#12, not GH#12 or #12). The row WAS published and is held."
+    )
 
 
 def directive_containment_warning(new_text: str, active: list[str]) -> str | None:
@@ -1814,6 +1995,11 @@ def stale_rows(registry, now: datetime, threshold_hours: float = DEFAULT_STALE_H
             continue
         if row.phase.strip().startswith(STOOD_DOWN_PHASE):
             mark = STALE_STOOD_DOWN
+        elif agent in ETA_HORIZON_EXEMPT:
+            # The human's seat stays listed, because a seat away past its declared return is
+            # worth reporting, but it is never due the life probe: it holds no claims or lock,
+            # so a reap recovers nothing, and `reap` refuses it (`reap_exempt_seat`).
+            mark = STALE_FLAG
         elif _has_live_stale_note(reg.notes, agent, since=hb):
             mark = STALE_REAP_ELIGIBLE
         else:
@@ -2169,8 +2355,9 @@ def unjudgeable_halts(registry, now: Optional[datetime] = None):
     The reasons are ``UNJUDGEABLE_REASONS``; read them there rather than from a count in prose.
 
     **NOT all of these mean "no live referent".** An earlier draft said so and it was false in
-    one case that matters: ``waiting_on`` is a ``Q-`` **or** ``B-`` id (``_ANY_ID``, and
-    ``_live_ids`` unions questions with unresolved blockers), so a lane halted on a live blocker
+    one case that matters: ``waiting_on`` is a ``Q-`` **or** ``B-`` id
+    (``_require_live_waiting_on``, and ``_live_ids`` unions questions with unresolved blockers),
+    so a lane halted on a live blocker
     is a fully sanctioned write. Reporting it as ``question-missing ... can never be answered``
     was wrong twice over -- the referent is not missing, and a blocker has an owner and a verb
     that resolves it. It gets its own reason, and the reason says the wait is real.
@@ -2377,7 +2564,7 @@ _ID_SITES = {
     # The parser's OWN pattern, not a restatement of it, so the two cannot drift apart.
     "Q": _QBLOCK_RE,
     # Mirrors `_cells`: `line.strip().startswith("|")`.
-    "B": re.compile(r"^[ \t]*\|[ \t]*B-(\d{3,})[ \t]*\|", re.M),
+    "B": re.compile(r"^[ \t]*\|[ \t]*B-([0-9]{3,})[ \t]*\|", re.M),
     # Epic ids (E-0260). Same `_cells`-mirroring leading-whitespace tolerance as `B`, and it must
     # find BOTH shapes: the new `| E-0708-some-name |` that `publish` writes today, and the bare
     # legacy `| E-0220 |` rows that predate the allocator. Missing the legacy half would be REUSE
@@ -2386,7 +2573,7 @@ _ID_SITES = {
     # other epics. The name is matched loosely (`[a-z0-9-]*`, so even a malformed `E-0708-` still
     # counts) on the docstring's own rule: over-counting is inflation, under-counting is reuse,
     # so when in doubt match more. The capture stays the DIGITS, which is what `_max_id` compares.
-    "E": re.compile(r"^[ \t]*\|[ \t]*E-(\d{3,})(?:-[a-z0-9-]*)?[ \t]*\|", re.M),
+    "E": re.compile(r"^[ \t]*\|[ \t]*E-([0-9]{3,})(?:-[a-z0-9-]*)?[ \t]*\|", re.M),
 }
 
 
@@ -2465,7 +2652,7 @@ def _strip_overflow(text: str) -> str:
 
 def _mentioned_ids(prefix: str, *texts: str) -> set[str]:
     """Every *prefix*-id appearing anywhere in *texts*, prose included. A VETO input only."""
-    pat = re.compile(rf"\b{prefix}-\d{{3,}}\b")
+    pat = re.compile(rf"\b{prefix}-[0-9]{{3,}}\b")
     out: set[str] = set()
     for t in texts:
         out.update(pat.findall(t))
@@ -2559,6 +2746,40 @@ def _render_qblock(qid: str, d: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def _qblock_count(questions_body: str, qid: str) -> int:
+    """How many ``### qid`` headers the Questions body carries, read off the RAW headers.
+
+    The parse is a dict keyed by id, so a duplicate is already gone by the time it exists.
+    """
+    return sum(1 for m in _QBLOCK_RE.finditer(questions_body) if m.group(1) == qid)
+
+
+# `repair` cannot mend every duplicated question: `--old-line` always matches the FIRST block, and
+# renaming or blanking a heading that carries an answer is refused as a decision-record or
+# skeleton change. So the message names what actually clears each shape instead of "repair".
+_QDUP_REMEDY = (
+    "the cull sweeps an applied or retracted twin; steward repair can rename the first heading "
+    "only when neither twin carries an answer; a twin carrying an answer needs a human hand edit"
+)
+
+
+def _require_unique_qid(text: str, qid: str) -> None:
+    """Refuse `id_duplicate` when ``### qid`` heads more than one block, BEFORE a verb judges it.
+
+    The Questions twin of `_require_unique_key`. `parse_registry` keeps the LAST block of a
+    duplicated id and `_edit_qfield` wrote the FIRST, so `retract` and `answer` judged an open
+    twin and then overwrote a block a human had already answered, rc 0. Asking first makes the
+    refusal the one the write would give, and `_edit_qfield` asks again for any other caller.
+    """
+    n = _qblock_count(_get_body(text, "Questions"), qid)
+    if n > 1:
+        raise RegistryError(
+            "id_duplicate",
+            f"{qid!r} heads {n} blocks of ## Questions; the parser keeps the last block and "
+            f"every write refuses until the duplicate is removed ({_QDUP_REMEDY})",
+        )
+
+
 def _edit_qfield(questions_body: str, qid: str, updates: dict[str, str]) -> str:
     """Set the named fields on the ``### qid`` block, ADDING any the block does not yet carry.
 
@@ -2575,6 +2796,9 @@ def _edit_qfield(questions_body: str, qid: str, updates: dict[str, str]) -> str:
     ``_Q_FIELD_ORDER`` position so a migrated block is byte-identical in shape to a fresh one,
     and a key outside that order is appended after the known fields rather than dropped.
     """
+    if _qblock_count(questions_body, qid) > 1:
+        # First-match write under a last-wins parse: never pick one twin silently.
+        raise RegistryError("id_duplicate", f"{qid!r} heads more than one block of ## Questions")
     matches = list(_QBLOCK_RE.finditer(questions_body))
     for i, m in enumerate(matches):
         if m.group(1) != qid:
@@ -2700,7 +2924,7 @@ def _is_safe_overflow_name(name: str) -> bool:
     """True only for a bare `.md` basename that can name a file inside the overflow directory.
 
     This gate exists because the cull path DELETES what it collects, and a Note body is
-    attacker-adjacent text: six loops write it, and a pointer is never validated when it is
+    attacker-adjacent text: every loop writes it, and a pointer is never validated when it is
     written. A traversal accepted here deletes an arbitrary file with the steward's hands.
 
     Rejected: anything with a path separator on EITHER platform (a POSIX host still has to
@@ -3057,7 +3281,7 @@ def _refresh_notes_header(text: str) -> str:
     The header carries a value slot and nothing ever updated it: `templates/registry.md` ships
     it reading "(none)" and `_append_note` only ever inserted CHILD bullets beneath it, so a
     board holding a hundred live notes still announced an empty inbox (gh#101). That line sits
-    on the one surface all six loops read at every wake, which is what made a cosmetic-looking
+    on the one surface every loop reads at every wake, which is what made a cosmetic-looking
     staleness expensive: a lane that trusts the header skips its own routed instructions, and
     nothing anywhere reports that it did.
 
@@ -3113,17 +3337,93 @@ class EditLock:
     path: Path
     stole_from: Optional[str] = None
     stole_age: float = 0.0
+    #: Identifies this one acquire. A lock whose holder file no longer carries it was stolen.
+    nonce: Optional[str] = None
 
-    def release(self) -> None:
+    def still_ours(self) -> bool:
+        # A denied read (an AV scanner, a reader mid-open on Windows) is retried, so a holder
+        # that still owns the lock is not refused as "now held by unknown".
+        if self.nonce is None:
+            return False
+        return _lock_holder(self.path, denied_retry=_HOLDER_DENIED_RETRY).nonce == self.nonce
+
+    def release(self) -> bool:
+        """Remove the lock only while it is still this acquire's; True for a clean release.
+
+        A holder paused past the stale window can have its lock stolen. Removing the dir then
+        would free the thief's lock for a third writer, so a lock that no longer carries this
+        nonce is left in place and reported. The read and the rmdir are two steps; nothing but a
+        stealer rewrites a held lock, and that is the window this narrows rather than closes.
+        """
+        if not self.still_ours():
+            print(
+                f"registry: not releasing {self.path}: the edit-lock is no longer ours "
+                f"(now held by {_lock_holder(self.path).actor})",
+                file=sys.stderr,
+            )
+            return False
         _rmdir_retry(self.path)
+        return True
 
 
-def _lock_holder(path: Path) -> str:
+@dataclass
+class _Holder:
+    """What the holder file says. Locks written before the nonce existed carry only the actor."""
+
+    actor: str
+    raw: Optional[str] = None
+    nonce: Optional[str] = None
+    pid: int = 0
+    host: Optional[str] = None
+    pidns: Optional[str] = None
+
+
+#: How long an ownership check rides out a denied holder read before calling it lost.
+_HOLDER_DENIED_RETRY = 1.0  # seconds
+
+
+def _read_holder_text(path: Path, denied_retry: float) -> str:
+    deadline = time.monotonic() + denied_retry
+    while True:
+        try:
+            return (path / "holder").read_text(encoding="utf-8")
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_ACQUIRE_POLL)
+
+
+def _lock_holder(path: Path, *, denied_retry: float = 0.0) -> _Holder:
+    """Parse ``<lock>/holder``: the actor and stamp lines, then ``KEY=value`` lines.
+
+    The actor stays on line one so a reader that knows only the old two-line body still finds
+    it. An unreadable or absent file is a holder nobody can be judged by. *denied_retry* keeps
+    re-reading through a PermissionError for that long; the acquire loop passes none, since it
+    polls anyway, but an ownership check that gave up at once would refuse a write it owns.
+    """
     try:
-        text = (path / "holder").read_text(encoding="utf-8")
+        text = _read_holder_text(path, denied_retry)
     except OSError:
-        return "unknown"
-    return text.splitlines()[0].strip() if text.strip() else "unknown"
+        return _Holder(actor="unknown")
+    lines = text.splitlines()
+    holder = _Holder(actor=lines[0].strip() if text.strip() else "unknown", raw=text)
+    for line in lines[1:]:
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        value = value.strip()
+        if key == "NONCE":
+            holder.nonce = value or None
+        elif key == "PID":
+            try:
+                holder.pid = int(value)
+            except ValueError:
+                holder.pid = 0  # torn mid-write: judged by age alone
+        elif key == "HOST":
+            holder.host = value or None
+        elif key == "PIDNS":
+            holder.pidns = value or None
+    return holder
 
 
 def _lock_age(path: Path) -> Optional[float]:
@@ -3133,9 +3433,105 @@ def _lock_age(path: Path) -> Optional[float]:
         return None
 
 
-def _write_holder(path: Path, actor: str) -> None:
+def _this_host() -> str:
+    return socket.gethostname()
+
+
+def _pid_alive(pid: int) -> bool:
+    """Portable, non-signalling liveness probe; ``lock_file`` owns the Windows and POSIX halves."""
+    return lock_file._is_pid_alive(pid)
+
+
+def _this_pid_namespace() -> str:
+    """Which PID space ``os.getpid()`` numbers processes in, beyond what the hostname says.
+
+    A hostname is not a PID space: WSL takes the Windows computer name, a host-network
+    container shares the host's name, and an MSYS or Cygwin Python numbers processes apart
+    from a native one on the same machine. The platform separates the Windows-side cases and
+    the Linux PID-namespace link separates the containers; a PID from any other space names
+    an unrelated process here, so probing it could call a live holder dead.
+    """
     try:
-        (path / "holder").write_text(f"{actor}\n{_now_iso()}\n", encoding="utf-8", newline="\n")
+        ns = os.readlink("/proc/self/ns/pid")
+    except (OSError, NotImplementedError):  # no /proc here: the platform is the whole answer
+        return sys.platform
+    return f"{sys.platform}:{ns}"
+
+
+def _holder_is_dead(holder: _Holder) -> bool:
+    """True only when the holder provably died: its PID is gone and it ran in OUR PID space.
+
+    A PID recorded on another host, or in another PID space on this one, names nothing here,
+    and a lock with no PID or no PID space (torn, or written before they were recorded) can
+    only be judged by age.
+    """
+    return (
+        holder.pid > 0
+        and holder.host == _this_host()
+        and holder.pidns is not None
+        and holder.pidns == _this_pid_namespace()
+        and not _pid_alive(holder.pid)
+    )
+
+
+def _breakable(path: Path, stale_seconds: float) -> tuple[bool, Optional[float], _Holder]:
+    age = _lock_age(path)
+    holder = _lock_holder(path)
+    if age is None:
+        return False, age, holder  # gone meanwhile: the next mkdir takes it
+    return age > stale_seconds or _holder_is_dead(holder), age, holder
+
+
+def _steal_guard_path(path: Path) -> Path:
+    return Path(str(path) + ".steal")
+
+
+#: The steal guard is held for one re-judge, one break and one mkdir: milliseconds. One older
+#: than this was left by a stealer that died inside it, whatever its PID now says.
+_STEAL_GUARD_STALE = 60.0  # seconds
+
+
+def _clear_aged_steal_guard(guard: Path) -> None:
+    """Remove a steal guard past `_STEAL_GUARD_STALE`, even if its PID still looks alive.
+
+    ``lock_file`` frees a guard whose PID is dead, but a hard-killed stealer's PID can be
+    reused by a long-lived process, and then the guard reads alive forever. If the edit-lock
+    is breakable too, as it usually is when a steal was under way, every writer would find
+    the lock breakable, fail to take the guard, and exit 3 until someone deleted it by hand.
+
+    Stat, then unlink only the body that was judged old: a guard re-created meanwhile carries
+    a fresh nonce. The re-read and the unlink are still two steps; the same residual
+    ``lock_file`` accepts for its own inner guard.
+    """
+    try:
+        observed = guard.read_text(encoding="utf-8")
+        age = time.time() - guard.stat().st_mtime
+    except OSError:  # absent, or mid-removal on Windows: nothing aged to clear
+        return
+    if age < _STEAL_GUARD_STALE:
+        return
+    try:
+        if guard.read_text(encoding="utf-8") != observed:
+            return
+        guard.unlink()
+    except OSError:  # another contender removed or holds it: the acquire below decides
+        return
+    print(
+        f"registry: cleared steal guard {guard} ({age:.0f}s old; its stealer died inside it)",
+        file=sys.stderr,
+    )
+
+
+def _holder_body(actor: str, nonce: str) -> str:
+    return (
+        f"{actor}\n{_now_iso()}\nNONCE={nonce}\nPID={os.getpid()}\nHOST={_this_host()}\n"
+        f"PIDNS={_this_pid_namespace()}\n"
+    )
+
+
+def _write_holder(path: Path, body: str) -> None:
+    try:
+        (path / "holder").write_text(body, encoding="utf-8", newline="\n")
     except OSError as e:  # fail loud — a lock we cannot attribute is not safely held
         raise RuntimeError(f"could not record edit-lock holder at {path}: {e}") from e
 
@@ -3176,6 +3572,52 @@ def _force_break(path: Path) -> None:
         pass
 
 
+def _steal(path: Path, observed: _Holder, stale_seconds: float, body: str) -> Optional[float]:
+    """Break the lock at *path* and take it, one stealer at a time; its age if we now hold it.
+
+    None means "not now": another stealer is inside the guard, the lock changed since it was
+    judged, or a fresh writer re-took it during the break. The caller re-judges from scratch.
+
+    Every stealer first takes ``<lock>.steal`` through ``lock_file`` (O_EXCL, with a PID and a
+    nonce, so a guard left by a crashed stealer is itself breakable, and one older than
+    `_STEAL_GUARD_STALE` is cleared even when its PID has been reused). Inside it the lock is
+    judged again: only a holder file byte-identical to the one judged, and still breakable, is
+    broken. Without that second look, two lanes that both read one stale age would each break
+    the lock in turn, the second breaking the first one's fresh hold. Breakable alone is not
+    enough: a lock re-taken by a holder that has since died is breakable too, but it is not
+    the hold this caller judged, and the steal Note would name the wrong holder.
+
+    Residual: the second look and the break are two steps. A paused holder releasing its own
+    lock, and a fresh writer taking it, both inside that gap, would be broken. The holder's
+    pre-write nonce check then refuses the robbed write, so the cost is a retry, not a loss.
+    """
+    guard_path = _steal_guard_path(path)
+    _clear_aged_steal_guard(guard_path)
+    try:
+        guard = lock_file.acquire(guard_path)
+    except (lock_file.LockHeldError, PermissionError):
+        # PermissionError: on Windows the previous stealer's guard can be delete-pending, which
+        # is contention like a held guard, not a permission fault to report as exit 1.
+        return None
+    try:
+        breakable, age, current = _breakable(path, stale_seconds)
+        if not breakable or current.raw != observed.raw:
+            return None
+        _force_break(path)
+        try:
+            path.mkdir()
+        except (FileExistsError, PermissionError):  # PermissionError: gh#582, see the caller
+            return None
+        try:
+            _write_holder(path, body)
+        except Exception:
+            _force_break(path)  # do not leak a lock we could not attribute
+            raise
+        return age
+    finally:
+        guard.release()
+
+
 def acquire_edit_lock(
     lock_dir,
     project: str,
@@ -3189,10 +3631,13 @@ def acquire_edit_lock(
 
     REGISTRY.md "Concurrency": target hold is seconds; reads are lock-free; a lock older
     than five minutes is breakable, and the breaker appends a note to the shared surface.
+    A lock whose recorded PID is dead on this host is breakable at once.
     """
     lock_dir = Path(lock_dir)
     lock_dir.mkdir(parents=True, exist_ok=True)
     path = lock_dir / f"{project}-registry.lock"
+    nonce = uuid.uuid4().hex
+    body = _holder_body(actor, nonce)
     deadline = time.monotonic() + timeout
     while True:
         try:
@@ -3211,40 +3656,38 @@ def acquire_edit_lock(
                 except PermissionError:  # a delete-pending dir denies stat too: still contention
                     held = True
                 if held:
-                    raise LockHeldError(f"registry edit-lock contended (access denied until the deadline): {path}")
+                    raise LockHeldError(
+                        f"registry edit-lock contended (access denied until the deadline): {path}"
+                    )
                 raise
             time.sleep(poll)
             continue
         except FileExistsError:
-            age = _lock_age(path)
-            if age is not None and age > stale_seconds:
-                prev = _lock_holder(path)
-                _force_break(path)
-                try:
-                    path.mkdir()
-                except (FileExistsError, PermissionError):  # PermissionError: gh#582, as above
-                    if time.monotonic() >= deadline:
-                        raise LockHeldError(f"registry edit-lock re-taken during steal: {path}")
-                    time.sleep(poll)
-                    continue
-                try:
-                    _write_holder(path, actor)
-                except Exception:
-                    _force_break(path)  # do not leak a lock we could not attribute
-                    raise
-                return EditLock(path, stole_from=prev, stole_age=age)
+            breakable, age, observed = _breakable(path, stale_seconds)
+            if breakable:
+                stolen_age = _steal(path, observed, stale_seconds, body)
+                if stolen_age is not None:
+                    return EditLock(
+                        path, stole_from=observed.actor, stole_age=stolen_age, nonce=nonce
+                    )
+                if time.monotonic() >= deadline:
+                    raise LockHeldError(f"registry edit-lock re-taken during steal: {path}")
+                time.sleep(poll)
+                continue
             if time.monotonic() >= deadline:
+                shown = "?" if age is None else f"{age:.0f}"
                 raise LockHeldError(
-                    f"registry edit-lock held (age {age:.0f}s < {stale_seconds:.0f}s stale): {path}"
+                    f"registry edit-lock held by {observed.actor} "
+                    f"(age {shown}s < {stale_seconds:.0f}s stale): {path}"
                 )
             time.sleep(poll)
         else:
             try:
-                _write_holder(path, actor)
+                _write_holder(path, body)
             except Exception:
                 _force_break(path)  # do not leak a lock we could not attribute
                 raise
-            return EditLock(path)
+            return EditLock(path, nonce=nonce)
 
 
 # --------------------------------------------------------------------------- #
@@ -3289,6 +3732,34 @@ def _require_agent(name: str, flag: str = "--actor") -> None:
         raise RegistryError("agent_known", f"{flag} {name!r} is not one of {list(AGENTS)}")
 
 
+def _refuse_if_waited_on(reg: "Registry", id_: str, verb: str) -> None:
+    """Refuse consuming *id_* while a Queue row still names it in `waiting_on`.
+
+    Consuming the id (apply, retract, resolve-blocker) takes it out of `_live_ids`, and
+    `_queue_row_findings` then rejects every Queue row still pointing at it -- so the very next
+    `validate` fails and every lane's wake read fails closed. Queue rows ONLY, because they are the
+    only rows `validate` rejects for this: an `## Agents` row halted on a dead id is reported by
+    `read --stranded`, not refused, and refusing on a row `validate` accepts would be a new rule.
+    """
+    waiting = [r for r in reg.queue.values() if _queue_ref(r) == id_]
+    if waiting:
+        rows = ", ".join(f"{r.id} (claimed_by {r.claimed_by or '-'}, state {r.state})" for r in waiting)
+        raise RegistryError(
+            "waited_on_live",
+            f"{verb} {id_} refused: Queue row(s) still waiting on it: {rows}. Route each claimant "
+            "a Note (unless it is you) and consume the id once no row waits on it. The claimant "
+            "resumes a parked row (release --state building) or re-parks it on a successor id "
+            "(release --state parked --waiting-on <new id>). A done or review row is never "
+            "resumed: its claimant clears the cell (release --state <its state>, no --waiting-on), "
+            "and a done row is also swept by the steward's cull.",
+        )
+
+
+def _queue_ref(r: "QueueRow") -> str:
+    """A Queue row's `waiting_on` as `validate` and the consuming verbs both read it."""
+    return (r.waiting_on or "-").strip()
+
+
 def _require_live_waiting_on(reg: "Registry", waiting_on: str) -> None:
     """Refuse a waiting_on that is not a live Q-/B- id -- the check `validate` runs at every wake.
 
@@ -3296,7 +3767,7 @@ def _require_live_waiting_on(reg: "Registry", waiting_on: str) -> None:
     writes cleanly and then fails the NEXT `validate`, which every loop runs fail-closed at wake,
     so one bad write by one lane stops the whole fleet.
     """
-    if not _ANY_ID.match(waiting_on):
+    if not (_q_id_ok(waiting_on) or _blocker_key_ok(waiting_on)):
         raise RegistryError("agent_waiting_on", f"waiting_on {waiting_on!r} is not a Q-/B- id")
     if waiting_on not in _live_ids(reg):
         raise RegistryError("agent_waiting_on", f"waiting_on {waiting_on} is not a live question/blocker")
@@ -3313,8 +3784,24 @@ def _epic_name(epic_id: str) -> str:
     return m.group(1) if m else ""
 
 
-def _require_id(value: str, pat: re.Pattern, kind: str) -> None:
-    if not pat.match(value):
+def _queue_key_ok(key: str) -> bool:
+    return _row_key_ok("Queue", key)
+
+
+def _blocker_key_ok(key: str) -> bool:
+    return _row_key_ok("Blockers", key)
+
+
+def _q_id_ok(key: str) -> bool:
+    return bool(_Q_ID.match(key))
+
+
+def _require_id(value: str, ok: Callable[[str], bool], kind: str) -> None:
+    """*ok* is the table's own key rule, so an argument names exactly the rows a table keeps.
+
+    A table cell never holds a line break, but the rules end in `$`, which also matches before a
+    trailing newline -- so the break is refused here, where only an argument can carry one."""
+    if "\n" in value or "\r" in value or not ok(value):
         raise RegistryError("id_format", f"{kind} id {value!r} is malformed")
 
 
@@ -3328,7 +3815,7 @@ _INLINE_FIELDS = (
     "answer", "description", "text", "waiting_on", "work",
     # `reason` rides into the Agents row's phase cell via stand-down, so it needs the same
     # newline/pipe guard every other free-text field gets. A '|' here silently corrupts the
-    # markdown table for all six loops.
+    # markdown table for every loop.
     "reason",
 )
 
@@ -3353,7 +3840,7 @@ _PROJECT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _require_project_slug(project: Optional[str]) -> None:
-    """--project routes into a filesystem path + the lock name; keep it a bare slug (no '..'/'/')."""
+    """--project routes into a filesystem path; keep it a bare slug (no '..'/'/')."""
     if project is not None and not _PROJECT_RE.match(project):
         raise RegistryError("bad_project", f"project {project!r} must match [A-Za-z0-9_-]+ (no path separators or '..')")
 
@@ -3375,6 +3862,47 @@ def _stamp_agent_row(text: str, actor: str, cells: list[str]) -> str:
     """Rewrite ONE Agents row — the single row-stamping path (status, and directive's heartbeat)."""
     body = _replace_data_row(text, "Agents", 0, actor, "agent", cells)
     return _replace_body(text, "Agents", body)
+
+
+#: Verbs that already write the actor's own heartbeat, so the exempt-seat stamp skips them:
+#: `status` stamps the row it rewrites, `directive` stamps dev-manager's row itself.
+_SELF_STAMPING_VERBS = frozenset({"status", "directive"})
+
+
+def _stamp_exempt_heartbeat(text: str, actor: str) -> str:
+    """Refresh the heartbeat cell of an ``ETA_HORIZON_EXEMPT`` actor's own row, nothing else.
+
+    The human's seat runs no firing contract, so it never issues the `status` write that moves
+    its heartbeat; it coordinates through note, answer, resolve-blocker and the rest. Without
+    this its row aged out of every liveness detector while the seat was visibly writing the
+    board. Keyed on the actor, not on a verb list, so a verb added later cannot be the one that
+    leaves the row ageing. Same shape as `_cmd_directive`'s stamp: status, work, phase, eta and
+    waiting_on stay whatever the row owner last wrote.
+
+    Skipped, never refused, when there is nothing honest to stamp: no row (the write is the
+    payload and must not be lost for a side effect), an unreadable eta (see below), or a
+    stood-down or reaped phase (a fresh
+    heartbeat under a phase that says the lane is stopped is the row `stand_down_heartbeat_only`
+    exists to prevent; a full `status` write is what brings such a row back).
+    """
+    if actor not in ETA_HORIZON_EXEMPT:
+        return text
+    try:
+        row = parse_registry(text).agents.get(actor)
+    except RegistryError:
+        # Same reasoning as `_cmd_directive`: parse_registry validates every section, and a
+        # board missing one must not take the verb's own write down with it.
+        return text
+    if row is None or _row_is_excluded_phase(row.phase):
+        return text
+    # An unreadable eta (a fresh board's '-') is skipped for `--heartbeat-only`'s `eta_required`
+    # reason: a fresh heartbeat beside it turns a never-started row into one the missed-wake
+    # alarm reports INVISIBLE. The seat's first `status` write declares its eta; stamps start
+    # after that.
+    if _parse_iso(row.eta) is None and row.status != "halted":
+        return text
+    cells = [row.agent, row.status, row.work, row.phase, _now_iso(), row.eta, row.waiting_on]
+    return _stamp_agent_row(text, actor, cells)
 
 
 def _status_argv_checks(a) -> None:
@@ -3428,7 +3956,7 @@ def _status_argv_checks(a) -> None:
     if a.state not in AGENT_STATES:
         raise RegistryError("agent_state_enum", f"state {a.state!r} not in {list(AGENT_STATES)}")
     work = a.work or "-"
-    if work != "-" and not _E_ID.match(work):
+    if work != "-" and not _queue_key_ok(work):
         raise RegistryError("id_format", f"work {work!r} is not an E- id or '-'")
     eta = a.eta or "-"
     if eta != "-" and _parse_iso(eta) is None:
@@ -3642,7 +4170,7 @@ def _send_halted_ping(actor: str, work: str, waiting_on: str, prior_status: str 
 def _claim_argv_checks(a) -> None:
     """`claim`'s refusals that argv alone decides; run PRE-LOCK too (gh#656, `_ARGV_CHECKS`)."""
     _require_agent(a.actor)
-    _require_id(a.id, _E_ID, "work")
+    _require_id(a.id, _queue_key_ok, "work")
     _require_capability("claim", a.actor)
 
 
@@ -3667,7 +4195,7 @@ def _cmd_claim(text: str, a) -> str:
 def _release_argv_checks(a) -> None:
     """`release`'s refusals that argv alone decides; run PRE-LOCK too (gh#656, `_ARGV_CHECKS`)."""
     _require_agent(a.actor)
-    _require_id(a.id, _E_ID, "work")
+    _require_id(a.id, _queue_key_ok, "work")
     if a.state not in RELEASE_STATES:
         raise RegistryError("queue_state_enum", f"release state {a.state!r} not in {list(RELEASE_STATES)}")
     # Resuming asserts the row is moving again, so it cannot also assert what it is still
@@ -3783,6 +4311,9 @@ def _cmd_publish(text: str, a, log_text: str) -> str:
             "the spec's priority in disguise, and a reband then renames the epic.",
         )
     name = _short_name(getattr(a, "slug", "") or "")
+    # Decided here, printed by the dispatcher after the write lands, like the Directive
+    # containment warning. Set UNCONDITIONALLY so a previous call's warning is never reprinted.
+    _cmd_publish.last_title_warning = publish_title_warning(a.title)
     if a.lane not in LANES:
         raise RegistryError("queue_lane_enum", f"lane {a.lane!r} not in {list(LANES)}")
     reg = parse_registry(text)
@@ -3846,7 +4377,7 @@ def _publisher_argv_checks(a, verb: str) -> str:
     """`relane` / `withdraw` refusals that argv alone decides, returning the reason; run
     PRE-LOCK too (gh#656, `_ARGV_CHECKS`)."""
     _require_capability(verb, a.actor)
-    _require_id(a.id, _E_ID, "work")
+    _require_id(a.id, _queue_key_ok, "work")
     reason = (getattr(a, "reason", None) or "").strip()
     if not reason:
         raise RegistryError(
@@ -4010,7 +4541,7 @@ def _cmd_ask(text: str, a, log_text: str) -> str:
             "provide --assumption (what you assumed and proceeded on); use --urgency waiting to park instead",
         )
     work = a.work or "-"
-    if work != "-" and not _E_ID.match(work):
+    if work != "-" and not _queue_key_ok(work):
         raise RegistryError("id_format", f"work {work!r} is not an E- id or '-'")
     qid = _alloc_id("Q", text, log_text)
     d = {
@@ -4034,7 +4565,7 @@ def _cmd_ask(text: str, a, log_text: str) -> str:
 
 def _cmd_answer(text: str, a) -> str:
     _require_capability("answer", a.actor)
-    _require_id(a.id, _Q_ID, "question")
+    _require_id(a.id, _q_id_ok, "question")
     if a.by not in ANSWERED_BY:
         raise RegistryError("q_answered_by_enum", f"--by {a.by!r} not in {list(ANSWERED_BY)}")
     # `--by` is a CLAIM ABOUT WHO DECIDED, so it is bound to who is writing. Enum membership
@@ -4048,6 +4579,7 @@ def _cmd_answer(text: str, a) -> str:
     condition = f"--by {a.by}"
     if condition in ACTOR_CAPABILITY["answer"].conditions:
         _require_capability("answer", a.actor, condition=condition)
+    _require_unique_qid(text, a.id)
     reg = parse_registry(text)
     q = reg.questions.get(a.id)
     if q is None:
@@ -4067,7 +4599,8 @@ def _cmd_answer(text: str, a) -> str:
 
 def _cmd_apply(text: str, a) -> str:
     _require_agent(a.actor)
-    _require_id(a.id, _Q_ID, "question")
+    _require_id(a.id, _q_id_ok, "question")
+    _require_unique_qid(text, a.id)
     reg = parse_registry(text)
     q = reg.questions.get(a.id)
     if q is None:
@@ -4076,6 +4609,7 @@ def _cmd_apply(text: str, a) -> str:
         raise RegistryError("q_apply_raiser", f"{a.id} was raised by {q.fields.get('raised_by')!r}, not {a.actor}")
     if q.fields.get("state") != "answered":
         raise RegistryError("q_apply_answered", f"{a.id} is state={q.fields.get('state')}, not answered")
+    _refuse_if_waited_on(reg, a.id, "apply")
     body = _edit_qfield(_get_body(text, "Questions"), a.id, {"state": "applied"})
     return _replace_body(text, "Questions", body)
 
@@ -4084,7 +4618,7 @@ def _retract_argv_checks(a) -> str:
     """`retract`'s refusals that argv alone decides, returning the reason; run PRE-LOCK too
     (gh#656, `_ARGV_CHECKS`)."""
     _require_agent(a.actor)
-    _require_id(a.id, _Q_ID, "question")
+    _require_id(a.id, _q_id_ok, "question")
     reason = (getattr(a, "reason", None) or "").strip()
     if _field_is_absent(reason):
         raise RegistryError(
@@ -4119,6 +4653,7 @@ def _cmd_retract(text: str, a) -> str:
     inconvenient question.
     """
     reason = _retract_argv_checks(a)
+    _require_unique_qid(text, a.id)
     reg = parse_registry(text)
     q = reg.questions.get(a.id)
     if q is None:
@@ -4142,6 +4677,7 @@ def _cmd_retract(text: str, a) -> str:
             Q_RETRACTED: "it is already retracted. Nothing further to do.",
         }.get(st, "only an OPEN question can be retracted.")
         raise RegistryError("q_retract_open_only", f"{a.id} is state={st!r}, not open: {why}")
+    _refuse_if_waited_on(reg, a.id, "retract")
     body = _edit_qfield(_get_body(text, "Questions"), a.id, {
         "state": Q_RETRACTED,
         "retracted_at": _now_iso(),
@@ -4153,7 +4689,7 @@ def _cmd_retract(text: str, a) -> str:
 def _cmd_raise_blocker(text: str, a, log_text: str) -> str:
     _require_agent(a.actor)
     work = a.work or "-"
-    if work != "-" and not _E_ID.match(work):
+    if work != "-" and not _queue_key_ok(work):
         raise RegistryError("id_format", f"work {work!r} is not an E- id or '-'")
     bid = _alloc_id("B", text, log_text)
     owner = a.owner or "-"
@@ -4167,7 +4703,7 @@ def _cmd_raise_blocker(text: str, a, log_text: str) -> str:
 
 def _cmd_resolve_blocker(text: str, a) -> str:
     _require_agent(a.actor)
-    _require_id(a.id, _B_ID, "blocker")
+    _require_id(a.id, _blocker_key_ok, "blocker")
     reg = parse_registry(text)
     b = reg.blockers.get(a.id)
     if b is None:
@@ -4176,6 +4712,7 @@ def _cmd_resolve_blocker(text: str, a) -> str:
         raise RegistryError("blocker_open", f"{a.id} is state={b.state}, not open")
     if b.owner != a.actor:
         raise RegistryError("blocker_owner_resolves", f"{a.id} owner is {b.owner!r}, not {a.actor}")
+    _refuse_if_waited_on(reg, a.id, "resolve-blocker")
     new_cells = [b.id, b.raised_by, b.owner, b.work, "resolved", b.description]
     body = _replace_data_row(text, "Blockers", 0, a.id, "id", new_cells)
     return _replace_body(text, "Blockers", body)
@@ -4183,7 +4720,7 @@ def _cmd_resolve_blocker(text: str, a) -> str:
 
 def _cmd_assign_blocker(text: str, a) -> str:
     _require_capability("assign-blocker", a.actor)
-    _require_id(a.id, _B_ID, "blocker")
+    _require_id(a.id, _blocker_key_ok, "blocker")
     _require_agent(a.owner, "--owner")
     reg = parse_registry(text)
     b = reg.blockers.get(a.id)
@@ -4191,6 +4728,17 @@ def _cmd_assign_blocker(text: str, a) -> str:
         raise RegistryError("id_exists", f"{a.id} not found")
     if b.state != "open":
         raise RegistryError("blocker_open", f"{a.id} is state={b.state}, not open")
+    # The steward hands away only what it holds or what nobody holds: re-assigning another
+    # seat's blocker would override that seat's call, which is dev-manager's to make. The
+    # exemption is read from the map so `read --capabilities` cannot drift from this guard.
+    if (
+        a.actor not in ACTOR_CAPABILITY["assign-blocker"].janitors
+        and b.owner not in (a.actor, "-")
+    ):
+        raise RegistryError(
+            "blocker_assign_steward_owned",
+            f"{a.id} owner is {b.owner!r}; {a.actor} assigns only its own or unowned blockers",
+        )
     new_cells = [b.id, b.raised_by, a.owner, b.work, b.state, b.description]
     body = _replace_data_row(text, "Blockers", 0, a.id, "id", new_cells)
     return _replace_body(text, "Blockers", body)
@@ -4374,9 +4922,9 @@ def _cmd_cull(text: str, a) -> tuple[str, str, dict[str, int], list[str]]:
     # the same reason done is: the Queue means claimable work, and a terminal row that stays is
     # a row every lane re-reads every wake.
     q_body = _get_body(text, "Queue")
-    new_q, removed_rows = _drop_table_rows(q_body, "id", state_index=4, drop_state="done", id_ok=_E_ID)
+    new_q, removed_rows = _drop_table_rows(q_body, "Queue", state_index=4, drop_state="done")
     new_q, removed_withdrawn = _drop_table_rows(
-        new_q, "id", state_index=4, drop_state="withdrawn", id_ok=_E_ID
+        new_q, "Queue", state_index=4, drop_state="withdrawn"
     )
     removed_rows = removed_rows + removed_withdrawn
     culled.extend(removed_rows)
@@ -4419,7 +4967,7 @@ def _cmd_cull(text: str, a) -> tuple[str, str, dict[str, int], list[str]]:
 
     # Blockers: drop resolved rows.
     b_body = _get_body(text, "Blockers")
-    new_b, removed_b = _drop_table_rows(b_body, "id", state_index=4, drop_state="resolved", id_ok=_B_ID)
+    new_b, removed_b = _drop_table_rows(b_body, "Blockers", state_index=4, drop_state="resolved")
     culled.extend(removed_b)
     if removed_b:
         text = _replace_body(text, "Blockers", new_b)
@@ -4646,12 +5194,17 @@ def _withdrawal_receipts(rows: list[str]) -> list[str]:
     return out
 
 
-def _drop_table_rows(body: str, header0: str, state_index: int, drop_state: str, id_ok: re.Pattern) -> tuple[str, list[str]]:
+def _drop_table_rows(body: str, section: str, state_index: int, drop_state: str) -> tuple[str, list[str]]:
+    """Drop *section*'s rows in *drop_state*. Only a row whose key `_row_key_ok` accepts is a
+    candidate: a malformed key is `repair`'s to mend, never cull's to sweep. The key is the only
+    gate -- a short row the parser drops on column count is still swept once its state cell is
+    reached."""
+    header0 = TABLE_SHAPES[section][1]
     lines = body.split("\n")
     kept, removed = [], []
     for line in lines:
         cells = _cells(line)
-        if cells and not _is_separator(cells) and cells[0] not in (header0,) and id_ok.match(cells[0]):
+        if cells and not _is_separator(cells) and cells[0] not in (header0,) and _row_key_ok(section, cells[0]):
             if len(cells) > state_index and cells[state_index] == drop_state:
                 removed.append(line.strip())
                 continue
@@ -4670,8 +5223,21 @@ def _set_deploy_line(text: str, holder: str, taken_at: str) -> str:
         count=1,
     )
     if n == 0:
-        raise RegistryError("file_damaged", "Deploy lock line not found in Queue section")
+        # Lost structure, so the rule text (which names no defect) gives no recovery: say it here.
+        raise RegistryError("file_damaged", _deploy_line_problem(body) or _DEPLOY_LINE_MISSING)
     return _replace_body(text, "Queue", new_body)
+
+
+def _require_deploy_line(text: str) -> None:
+    """Refuse `file_damaged` when the Queue has no readable Deploy lock field line.
+
+    `release` and `assert` need this before their holder check: with the line gone the parse
+    reports the default holder "none", and the caller would be told someone else holds the
+    lock, or that it is FREE to take, rather than that the board is damaged.
+    """
+    problem = _deploy_line_problem(_get_body(text, "Queue"))
+    if problem is not None:
+        raise RegistryError("file_damaged", problem)
 
 
 def _require_directive_acks(reg: Registry, acks) -> None:
@@ -4861,6 +5427,7 @@ def _cmd_deploy_take(text: str, a) -> str:
 
 def _cmd_deploy_release(text: str, a) -> str:
     _require_agent(a.actor)
+    _require_deploy_line(text)
     reg = parse_registry(text)
     if reg.deploy_holder != a.actor:
         raise RegistryError("deploy_holder", f"deploy lock held by {reg.deploy_holder!r}, not {a.actor}")
@@ -4870,9 +5437,13 @@ def _cmd_deploy_release(text: str, a) -> str:
 # --------------------------------------------------------------------------- #
 # init (create-if-missing) + read (lock-free)
 # --------------------------------------------------------------------------- #
-def _template_text(project: str) -> str:
+def _template_text(project: str, lock_name: Optional[str] = None) -> str:
     tpl = _find_template()
     text = tpl.read_text(encoding="utf-8")
+    if lock_name is not None:
+        # The header's lock comment must name the lock every later write takes, which follows
+        # the board, not init's --project; stamp it before the generic <project> fill.
+        text = text.replace("<project>-registry.lock", f"{lock_name}-registry.lock")
     return text.replace("<project>", project)
 
 
@@ -4885,7 +5456,7 @@ def _find_template() -> Path:
     raise RegistryError("file_missing", f"templates/registry.md not found near {candidate}")
 
 
-def _do_init(registry_path: Path, project: str) -> int:
+def _do_init(registry_path: Path, project: str, lock_name: str) -> int:
     """Create-if-missing. Absence is the NORMAL input, so this cannot use the read guard.
 
     `_require_readable_registry` raises `file_missing` on absence, which is precisely the
@@ -4916,7 +5487,7 @@ def _do_init(registry_path: Path, project: str) -> int:
         )
         return 0
     registry_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(registry_path, _template_text(project))
+    _atomic_write(registry_path, _template_text(project, lock_name))
     print(f"initialized registry: {registry_path}")
     return 0
 
@@ -5278,6 +5849,32 @@ def _read_registry_text(registry_path: Path) -> str:
         raise RegistryError("file_unreadable", f"{type(exc).__name__} reading the registry") from exc
 
 
+def read_registry_checked(
+    registry_path: Path, tables: tuple = ("Agents", "Queue"), rows: tuple = (),
+) -> Registry:
+    """Parse the registry at ``registry_path``, refusing when any of ``tables`` lost its table.
+
+    For readers outside this module that draw a conclusion from what a table does NOT contain.
+    ``parse_registry`` alone reads a section whose table is gone as zero rows, which is what an
+    idle board looks like, so a damaged board would pass as a free one. Raises
+    ``RegistryError`` (``file_missing``, ``file_unreadable`` or ``file_damaged``).
+
+    ``rows`` names tables whose raw rows must also pass validate's row-shape checks
+    (``_table_row_problems``): the parser silently drops a row with the wrong cell count and
+    keeps only the last of a duplicated key, so a reader of what a table does NOT contain
+    would see a lost row as absent work. Any finding raises ``file_damaged``.
+    """
+    text = _read_registry_text(Path(registry_path))
+    for section in tables:
+        _require_intact_table(text, section)
+    problems = [
+        p for section in rows for p in _table_row_problems(_get_body(text, section), section)
+    ]
+    if problems:
+        raise RegistryError("file_damaged", "; ".join(problems))
+    return parse_registry(text)
+
+
 def _deploy_age(seconds: float) -> str:
     """Render an age for a human deciding whether to wait or to break the lock."""
     return "never stamped" if seconds == float("inf") else f"{seconds:.0f}s"
@@ -5314,7 +5911,11 @@ def _do_deploy_assert(registry_path: Path, a) -> int:
     # non-builder asking "do I hold it?" is a malformed call (2), not the answer "no" (5).
     # The read verb and the write verb must agree on who can even BE an answer.
     _require_capability("deploy-lock assert", a.actor)
-    reg = parse_registry(_read_registry_text(registry_path))
+    text = _read_registry_text(registry_path)
+    # A damaged lock line reads as holder "none", which would answer FREE and send the lane to
+    # a `take` that refuses `file_damaged`. Report the damage here instead (still fails closed).
+    _require_deploy_line(text)
+    reg = parse_registry(text)
     holder = reg.deploy_holder
     # Name the board the answer came from. --file and $AGENTFLOW_REGISTRY both outrank
     # --project, so a lane that inherited a registry path from an earlier project switch
@@ -5424,6 +6025,28 @@ def _resolve_project(a, registry_path: Path) -> str:
         return a.project
     # <data_root>/projects/<name>/status/registry.md  ->  <name>
     return registry_path.parent.parent.name
+
+
+def _edit_lock_name(registry_path: Path) -> str:
+    """The edit-lock name: the project directory that owns the board, read from its RESOLVED path.
+
+    The lock must be one per BOARD, so it cannot come from how the caller spelled the path: a
+    junction, a relative ``registry.md`` or a ``--project`` that disagrees with ``--file`` would
+    each take a different lock for the same file, and two writers would both get in. For every
+    ``--project`` call the board is ``<data_root>/projects/<name>/status/registry.md``, so this
+    is still ``<name>`` there. An empty name is refused: a board whose resolved path has no
+    directory two levels above it (at a filesystem root or one level under it) would otherwise
+    share the one ``-registry.lock`` with every other such board.
+    """
+    resolved = registry_path.resolve()
+    name = resolved.parent.parent.name
+    if not name:
+        raise RegistryError(
+            "lock_name_empty",
+            f"{registry_path} resolves to {resolved}, which has no project directory above its "
+            "parent to name the edit-lock; nothing was locked, read or written",
+        )
+    return name
 
 
 # --------------------------------------------------------------------------- #
@@ -5575,7 +6198,21 @@ def _cmd_stand_down(text: str, a) -> str:
     phase = _stand_down_argv_checks(a)
     target = a.agent
     reg = parse_registry(text)
+    # Same refusal reap gives: a missing row is not a write that failed to land (exit 1, retry),
+    # it is one that can never land, and the KeyError it used to raise read as the former.
+    if target not in reg.agents:
+        raise RegistryError("id_exists", f"{target} has no Agents row to stand down")
     row = reg.agents[target]
+    # A reaped row is idle and already returned its claims. Standing it down erased the reap
+    # mark and sent a lane holding nothing back into `read --stale` as an escalation, which
+    # `reap` then refused as stood down.
+    if is_reaped_phase(row.phase):
+        raise RegistryError(
+            "stand_down_reaped",
+            f"{target} is already reaped ({row.phase.strip()!r}): it holds no claims and is "
+            "excluded from the missed-wake alarm. Nothing to stand down; its next full `status` "
+            "write brings it back.",
+        )
     # NOT reap: claims and the deploy lock are left exactly as the lane left them, because a
     # lane stopped mid-epic may be resumed with its work intact. But the deploy lock serializes
     # every merge for every builder, so a stood-down holder wedges the fleet silently --
@@ -5603,6 +6240,19 @@ def _stand_down_argv_checks(a) -> str:
     too (gh#656, `_ARGV_CHECKS`)."""
     _require_capability("stand-down", a.actor)
     _require_agent(a.agent, "--agent")
+    # reap's two seat refusals, for the same reasons: the actor is plainly running, and the
+    # human's seat holds no claims and is never in the missed-wake alarm to begin with.
+    if a.agent == a.actor:
+        raise RegistryError(
+            "stand_down_self",
+            f"{a.actor} cannot stand down its own row; it is plainly running",
+        )
+    if a.agent in ETA_HORIZON_EXEMPT:
+        raise RegistryError(
+            "stand_down_exempt_seat",
+            f"{a.agent} is the human's seat (ETA_HORIZON_EXEMPT): it is never alarmed as a "
+            "missed wake, so there is nothing to stand down.",
+        )
     reason = (getattr(a, "reason", None) or "").strip()
     if not reason:
         raise RegistryError(
@@ -5655,6 +6305,15 @@ def _cmd_reap(text: str, a) -> str:
     if target not in reg.agents:
         raise RegistryError("id_exists", f"{target} has no Agents row to reap")
     row = reg.agents[target]
+    # The human's seat holds no claims or deploy lock, so a reap returns nothing and only
+    # rewrites its row as dead. Refused before every override: neither --force nor
+    # --override-stand-down changes what a reap of this row could recover.
+    if target in ETA_HORIZON_EXEMPT:
+        raise RegistryError(
+            "reap_exempt_seat",
+            f"{target} is the human's seat (ETA_HORIZON_EXEMPT): report it as away past its "
+            "declared return, never reap it.",
+        )
     # gh#683: stand-down promises the lane finds its row as it left it, and a stood-down lane
     # always fails the life probe because a human stopped it -- so the ping-then-reap procedure
     # would undo a deliberate pause. Refused unless the caller says the decision was made.
@@ -5726,7 +6385,7 @@ def _cmd_reap(text: str, a) -> str:
         # board's readers see -- no more (a line too malformed to parse is `repair`'s problem,
         # not reap's) and no fewer (a row reap skipped would keep a dead lane's claim alive with
         # nothing on the board saying so).
-        if cells is None or len(cells) < 7 or not _E_ID.match(cells[0]):
+        if cells is None or len(cells) < 7 or not _row_key_ok("Queue", cells[0]):
             continue
         if cells[3] != target:
             continue
@@ -5829,9 +6488,15 @@ def _repair_target(section: str, lines: list[str], i: int, old_line: str) -> str
             if qm:
                 fm = _QFIELD_RE.match(line) or _QFIELD_RE.match(old_line)
                 return f"{qm.group(1)} {fm.group(1)}" if fm else f"{qm.group(1)} line {i + 1}"
-    cells = _cells(line)
-    if cells and (_E_ID.match(cells[0]) or _ANY_ID.match(cells[0])):
-        return cells[0]
+    # A blank --new-line deletes the row, so the name comes from the line it replaced. Only a
+    # cell matching an id pattern or the agent enum is ever printed, never free caller text.
+    for cells in (_cells(line), _cells(old_line)):
+        if not cells:
+            continue
+        if _E_ID.match(cells[0]) or _ANY_ID.match(cells[0]):
+            return cells[0]
+        if section == "Agents" and cells[0] in AGENTS:
+            return cells[0]
     return f"line {i + 1}"
 
 
@@ -5933,7 +6598,7 @@ def _guard_decision_record(text: str, new_text: str) -> None:
             )
 
 
-_QHDR_SHAPE_RE = re.compile(r"^#*[ \t]*Q-\d")
+_QHDR_SHAPE_RE = re.compile(r"^#*[ \t]*Q-[0-9]")
 
 
 def _heading_key(line: str) -> str | None:
@@ -6023,7 +6688,7 @@ def _violation_set(text: str) -> tuple[set[str], set[str]]:
     return {f"[{e.rule_key}] {e.detail}" for e in damage}, set(problems)
 
 
-_DUP_COUNT_RE = re.compile(r"appears on \d+ rows")
+_DUP_COUNT_RE = re.compile(r"appears on [0-9]+ rows")
 
 
 def _relabel_key(problem: str) -> str:
@@ -6122,12 +6787,15 @@ def _boilerplate_kind(section: str, line: str) -> Optional[str]:
     Only INTACT boilerplate: a mangled separator no longer parses as one, so it stays
     repairable -- which is the repair this verb exists for. The Deploy lock / Notes lines are
     judged by the parser's own predicates, so every spelling the parser reads as the real line
-    (a `*` bullet, extra spaces) is refused too.
+    (a `*` bullet, extra spaces) is refused too. The Deploy lock line counts only when the
+    holder parse can READ it: one that kept its prefix but lost `holder:` / `taken-at:` is the
+    damage `validate` reports, and calling it intact made it unrepairable and its restoration
+    a "second" lock line, leaving the wake gate red with no mediated way out.
     """
     s = line.strip()
     if s.startswith("<!--") or s.endswith("-->"):
         return "HTML comment"
-    if section == "Queue" and _is_deploy_lock_field(line):
+    if section == "Queue" and _DEPLOY_RE.match(line) is not None:
         return "Deploy lock line"
     if section == "Queue" and _is_notes_header(line):
         return "Notes heading line"
@@ -6147,10 +6815,12 @@ def _guard_repair_new_line(section: str, body_lines: Optional[list[str]], new_li
     line (the intact one is gone) IS the repair, so it stays allowed; separators and headers
     stay writable for the same reason -- mending a mangled one writes exactly that shape.
 
-    *body_lines* None is the pre-lock pass: only what argv alone decides (the comment).
+    *body_lines* None is the pre-lock pass: only what argv alone decides (the comment, and a
+    line that is no row of a table section's table).
     """
     kind = _boilerplate_kind(section, new_line)
     if kind is None or kind in ("table separator", "table header"):
+        _guard_table_row(section, new_line, headings=False)
         return
     if kind in _SINGLETON_BOILERPLATE and (body_lines is None or not any(
         _boilerplate_kind(section, ln) == kind for ln in body_lines
@@ -6163,6 +6833,35 @@ def _guard_repair_new_line(section: str, body_lines: Optional[list[str]], new_li
     raise RegistryError(
         "repair_boilerplate_line",
         f"--new-line is a {kind}; repair may not plant boilerplate ({why})",
+    )
+
+
+def _guard_table_row(section: str, new_line: str, *, headings: bool) -> None:
+    """Refuse a --new-line in a table section that is not a row of that table.
+
+    A non-row line is inert to every parser, so writing one over a real row deleted that row
+    with rc=0 and `validate` green, and a run of them planted a question block line by line
+    inside `## Blockers`, every step but the crown landing. What a table section may receive:
+    a pipe-table line (its column count is `_guard_validate_delta`'s to judge), a blank line
+    (removing a stray line writes nothing), and in `## Queue` the Deploy lock / Notes line,
+    whose duplicates `_guard_repair_new_line` already refuses.
+
+    *headings* False is the pass before the parse: heading-shaped lines are left to
+    `_guard_heading_skeleton`, whose refusal names the structural change. The pass after it
+    (True) refuses the heading-shaped lines that left the skeleton unchanged.
+    """
+    if section not in TABLE_SHAPES or not new_line.strip() or _cells(new_line) is not None:
+        return
+    # Only a READABLE lock line: an unreadable one is inert to the parse like any non-row line.
+    if section == "Queue" and (_DEPLOY_RE.match(new_line) is not None or _is_notes_header(new_line)):
+        return
+    if not headings and _heading_key(new_line) is not None:
+        return
+    raise RegistryError(
+        "repair_not_a_row",
+        f"--new-line is not a row of the ## {section} table; a line written into a table "
+        f"section must be a `| ... |` row of that table (or blank, to remove a stray line). "
+        f"Any other line is inert there, so writing one over a row deletes that row unseen.",
     )
 
 
@@ -6195,6 +6894,21 @@ def _repair_argv_checks(a) -> None:
             "repair_boilerplate_line",
             f"--old-line is the section's {kind}; repair mends a damaged line and may not "
             f"replace one every registry carries (doing so inserts a row, or drops the lock)",
+        )
+    # A Note bullet is another lane's message, struck by its addressee and removed by the cull
+    # with a log receipt. Writing a row over one minted a Queue row and deleted the Note, rc=0
+    # and validate green. The striker's own recognition rule decides what a Note is, and by that
+    # rule a mangled Deploy lock / Notes line IS a Note bullet -- so restoring the line it was
+    # stays allowed (a duplicate of an intact one is refused under the lock).
+    if (
+        a.section == "Queue"
+        and _is_note_bullet(a.old_line)
+        and _boilerplate_kind(a.section, a.new_line) not in _SINGLETON_BOILERPLATE
+    ):
+        raise RegistryError(
+            "repair_note_line",
+            "--old-line is a coordination Note; repair may not replace or remove one. Notes "
+            "are owned by `note --strike` (the addressee) and the cull, not by repair",
         )
     # Field policy, layer 1 of 2: the NAMED field. Redundant for safety now that the effect check
     # below closes the class, and kept anyway because it fires BEFORE the match scan — so the
@@ -6277,6 +6991,9 @@ def _cmd_repair(text: str, a) -> str:
             # of. Last on purpose, so every refusal those layers already name keeps its key; this
             # one owns what they let through -- a heading planted where no decision is displaced.
             _guard_heading_skeleton(text, new_text, a.old_line, a.new_line)
+            # Row shape, second pass: a heading-shaped line the skeleton check let through (it
+            # replaced one of the same key) is still no row of a table section's table.
+            _guard_table_row(a.section, a.new_line, headings=True)
             # Validate policy (gh#681): the row checks the wake gate runs. Last, so every refusal
             # above keeps its more specific key. `lines` holds the replacement; the original body
             # is what the ownership probe deletes the target from.
@@ -6285,6 +7002,10 @@ def _cmd_repair(text: str, a) -> str:
             # one owns the valid -> valid rewrite of a row whose cells other verbs own.
             if a.section == "Queue":
                 _guard_queue_ownership(text, body.split("\n"), a.old_line, a.new_line)
+            elif a.section == "Blockers":
+                _guard_blocker_ownership(body.split("\n"), a.old_line, a.new_line)
+            elif a.section == "Agents":
+                _guard_agents_ownership(body.split("\n"), a.old_line, a.new_line)
             # Audit trail. A repair is the one sanctioned write of a row its actor does not own,
             # and until now it left NO trace anywhere — no log entry, no Note — so the fleet could
             # not tell a repaired row from one that was always that way. Same mechanism as the
@@ -6319,32 +7040,61 @@ def validate_violations(text: str) -> list[str]:
     return problems
 
 
-def _queue_row_problems(rid: str, r: QueueRow, reg: Registry) -> list[str]:
-    """`validate`'s checks on ONE Queue row. ONE copy, read by `_validation_findings` and by
-    `repair`'s ownership guard (gh#334), so "a row validate accepts" means the same thing to both.
+def _queue_row_findings(rid: str, r: QueueRow, reg: Registry) -> list[tuple[int, str]]:
+    """The row checks `validate` runs, which `repair` reads off the raw line, each paired with
+    the ONE column it judges.
+
+    The column is returned, never recovered from the message, because `repair`'s ownership guard
+    reads it (gh#811): on a row these checks reject, repair may change only the cells named here.
+    Every check below reads exactly one cell, so that mapping is exact, not a heuristic -- save
+    the in-flight-with-no-claimant check, which reads state and claimed_by and is filed under
+    claimed_by, the missing cell (its coupled mend, reap's write, moves state with it).
+
+    The id check never fires from `validate` through this function: the parser drops a row whose
+    id fails `_row_key_ok("Queue", ...)`, so it never reaches here, and `_table_row_problems`
+    reports it off the raw line instead. It is here for the guard, which reads the raw line.
     """
-    problems: list[str] = []
-    if not _E_ID.match(rid):
-        problems.append(f"Queue: bad id {rid!r}")
+    findings: list[tuple[int, str]] = []
+    if not _row_key_ok("Queue", rid):
+        findings.append((0, f"Queue: bad id {rid!r}"))
     if r.lane not in LANES:
-        problems.append(f"Queue[{rid}]: bad lane {r.lane!r}")
+        findings.append((2, f"Queue[{rid}]: bad lane {r.lane!r}"))
     if r.state not in QUEUE_STATES:
-        problems.append(f"Queue[{rid}]: bad state {r.state!r}")
+        findings.append((4, f"Queue[{rid}]: bad state {r.state!r}"))
     if r.claimed_by not in AGENTS and r.claimed_by not in ("-", ""):
-        problems.append(f"Queue[{rid}]: bad claimed_by {r.claimed_by!r}")
+        findings.append((3, f"Queue[{rid}]: bad claimed_by {r.claimed_by!r}"))
+    # AN IN-FLIGHT ROW WITH NO CLAIMANT IS STRANDED: `claim` takes only a `ready` row, `release`
+    # only the claimant's, and `reap` matches an agent, so nothing ever moves it. No verb writes
+    # this shape (each writes `ready`/`withdrawn` with '-', or an in-flight state with an agent),
+    # so only a hand edit or a future verb could; reported so every reader fails closed. The
+    # check reads two cells and is filed under claimed_by: that is the missing cell, and repair's
+    # coupled mend for a flagged claimed_by on an in-flight row is already reap's write.
+    elif r.state in RETURNABLE_QUEUE_STATES and r.claimed_by in ("-", ""):
+        findings.append((3,
+            f"Queue[{rid}]: state {r.state!r} with claimed_by {r.claimed_by!r} - in flight with "
+            "no claimant, so no verb moves it (repair to reap's write: claimed_by '-', state "
+            "'ready', waiting_on '-')"
+        ))
     # A PARKED ROW POINTING AT A DEAD REFERENT IS ORPHANED, and nothing reported it.
     # `_cmd_release` checks `--waiting-on` at write time (gh#648, gh#707), but the referent
     # can die afterwards: after a retract (or an apply) the Queue row sits `parked`, still
     # claimed, pointing at an id in neither section -- and the strand alarm cannot see it,
     # because that alarm reads Agents rows. Reported rather than refused: this is the
     # backstop, not the write path.
-    ref = (r.waiting_on or "-").strip()
+    ref = _queue_ref(r)
     if ref not in ("-", "") and ref not in _live_ids(reg):
-        problems.append(
+        findings.append((5,
             f"Queue[{rid}]: waiting_on {ref} is not a live question/blocker "
             "(consumed or missing) - the row is parked on nothing"
-        )
-    return problems
+        ))
+    return findings
+
+
+def _queue_row_problems(rid: str, r: QueueRow, reg: Registry) -> list[str]:
+    """`_queue_row_findings` without the columns, for `_validation_findings`. `repair`'s ownership
+    guard reads `_queue_row_findings` itself, so "a row validate accepts" means the same to both.
+    """
+    return [msg for _, msg in _queue_row_findings(rid, r, reg)]
 
 
 #: Queue columns in table order, for naming what a refused repair would have changed.
@@ -6355,55 +7105,405 @@ _QUEUE_LEAD_COLS = frozenset({0, 1, 2, 6})
 _QUEUE_CLAIMANT_COLS = frozenset({3, 4, 5})
 
 
+def _queue_col_names(cols) -> str:
+    return ", ".join(_QUEUE_COLUMNS[j] for j in sorted(cols))
+
+
+def _queue_owner_routes(cols: set[int]) -> list[str]:
+    """The owning verbs for *cols*, one clause per owner naming only those columns, for a
+    `repair_queue_owned` refusal."""
+    routes = []
+    lead, claimant = cols & _QUEUE_LEAD_COLS, cols & _QUEUE_CLAIMANT_COLS
+    if lead:
+        routes.append(f"{_queue_col_names(lead)} belong(s) to lead-dev: `publish`, `relane` or "
+                      "`withdraw`")
+    if claimant:
+        routes.append(f"{_queue_col_names(claimant)} belong(s) to the claimant: `claim` or "
+                      "`release`; a dead claimant is cleared by `reap` (steward)")
+    return routes
+
+
+#: Blockers / Agents columns in table order, for naming what a refused repair would change.
+_BLOCKER_COLUMNS = ("id", "raised_by", "owner", "work", "state", "description")
+_AGENTS_COLUMNS = ("agent", "status", "work", "phase", "heartbeat", "eta", "waiting_on")
+
+
+def _blocker_owner_routes(cols: set[int]) -> list[str]:
+    """The owning verbs for Blockers *cols*, for a `repair_blocker_owned` refusal."""
+    routes = []
+    raiser = cols & {0, 1, 3, 5}
+    if raiser:
+        routes.append(f"{', '.join(_BLOCKER_COLUMNS[j] for j in sorted(raiser))} belong(s) to "
+                      "the raiser: `raise-blocker` writes them once")
+    if 2 in cols:
+        routes.append("owner belongs to `assign-blocker`")
+    if 4 in cols:
+        routes.append("state belongs to the owner: `resolve-blocker`, then `cull` (steward)")
+    return routes
+
+
+def _agents_owner_routes(cols: set[int]) -> list[str]:
+    """The owning verbs for Agents *cols*, for a `repair_agents_owned` refusal."""
+    return [f"{', '.join(_AGENTS_COLUMNS[j] for j in sorted(cols))} belong(s) to the lane "
+            "itself: `status` (which stamps the heartbeat); `stand-down` (steward) marks a lane "
+            "a human stopped and `reap` (steward) idles a dead one"]
+
+
+#: Per table: (column names, owner routes) for a cell-scoped mend's refusal.
+_MEND_TABLES = {
+    "Queue": (_QUEUE_COLUMNS, _queue_owner_routes),
+    "Blockers": (_BLOCKER_COLUMNS, _blocker_owner_routes),
+    "Agents": (_AGENTS_COLUMNS, _agents_owner_routes),
+}
+
+#: The OWNER-HELD cells a cell-scoped mend may only clear, per table: column -> (the neutral
+#: values, the owning verbs for any other). A flagged cell says the old value is garbage, not
+#: what the owner meant, so the steward may blank it but not choose its next value: pointing a
+#: claimant, a park, a blocker owner or a lane state at a live value is a decision those verbs
+#: gate (`claim`'s lane, `release`'s live referent, `assign-blocker`'s ownership limit,
+#: `resolve-blocker`'s owner check), and repair would take it with none of their checks.
+#: Neutral is the value that grants nothing: '-' holds no claim and parks on nothing; an `open`
+#: blocker still needs its owner to close it (a mended `resolved` would fake a resolution the
+#: cull then logs); `idle` is reap's value and is never excluded from the liveness alarms
+#: (`halted` silences the missed-wake alarm, so it is no neutral). Not owner-held: a Queue lane
+#: (lead-dev's `relane` reads no claim) and state (no state is neutral: each one is a
+#: different claimant's position), and a blocker's raised_by (provenance no verb reads for
+#: authority, and validate refuses '-' there).
+_NEUTRAL_MENDS = {
+    "Queue": {
+        3: (("-", ""), "a claim is taken by the claimant's `claim` and dropped by its "
+                       "`release`; a dead claimant's is cleared by `reap` (steward)"),
+        5: (("-", ""), "a park is pointed by the claimant's `release` (--state parked "
+                       "--waiting-on <id>); a dead claimant's is cleared by `reap` (steward)"),
+    },
+    "Blockers": {
+        2: (("-", ""), "a blocker's owner is moved by `assign-blocker`"),
+        4: (("open",), "a blocker is closed by its owner's `resolve-blocker` and swept by "
+                       "`cull` (steward)"),
+    },
+    "Agents": {
+        1: (("idle",), "a lane's status is declared by the lane itself with `status`; "
+                       "`stand-down` (steward) marks a lane a human stopped"),
+    },
+}
+
+
+def _guard_flagged_mend(section: str, key: str, cells: list[str], new_line: str,
+                        findings: list[tuple[int, str]],
+                        coupled: frozenset[int] = frozenset()) -> list[str]:
+    """Refuse a repair of a row the row checks reject unless it changes only the FLAGGED cells,
+    and an owner-held flagged cell only to its neutral value (`_NEUTRAL_MENDS`). Returns the new
+    cells. ONE copy for all three tables, so the Queue rule and its twins cannot drift.
+
+    *coupled* names unflagged cells the caller lets move WITH the mend, because clearing the
+    flagged cell alone would leave a shape no verb can move (the Queue's coupled mends); the
+    caller pins their exact values. A blank --new-line (a deletion) removes every unflagged cell
+    too, so it is refused; a row no verb can reach never gets here, its table's guard returns
+    before this.
+    """
+    columns, routes = _MEND_TABLES[section]
+    ncol = len(columns)
+
+    def names(cols) -> str:
+        return ", ".join(columns[j] for j in sorted(cols))
+
+    new = _cells(new_line)
+    changed = (
+        {j for j in range(ncol) if cells[j] != new[j]}
+        if new is not None and len(new) == ncol else None
+    )
+    flagged = {j for j, _ in findings}
+    if changed is None:
+        stray = set(range(ncol)) - flagged
+        what = f"Deleting the row would also remove: {names(stray)}"
+    else:
+        stray = changed - flagged - coupled
+        what = f"It would also change: {names(stray)}"
+    if stray or changed is None:
+        also = f" (with {names(coupled)} coupled to that mend)" if coupled else ""
+        raise RegistryError(
+            key,
+            f"--old-line is a {section} row the row checks `validate` runs reject ({cells[0]}: "
+            + "; ".join(msg for _, msg in findings)
+            + f"); repair may only mend the flagged cell(s): {names(flagged)}{also}. "
+            f"{what}, which those checks did not flag. Those cells keep their owners: "
+            + "; ".join(routes(stray)) + ". Mend the flagged cell(s) alone, then "
+            "use the owning verb for anything else.",
+        )
+    for j in sorted(changed):
+        neutral = _NEUTRAL_MENDS[section].get(j)
+        if neutral is not None and new[j] not in neutral[0]:
+            raise RegistryError(
+                key,
+                f"--new-line would set {section} row {cells[0]}'s {columns[j]} to {new[j]!r}. "
+                f"{columns[j]} is owner-held, and repair may only clear a flagged owner-held "
+                f"cell, to {neutral[0][0]!r}: {neutral[1]}. Mend it to {neutral[0][0]!r} and "
+                "leave its next value to that verb.",
+            )
+    return new
+
+
 def _guard_queue_ownership(text: str, body_lines: list[str], old_line: str, new_line: str) -> None:
-    """Refuse a repair of a Queue row `validate` already accepts (gh#334).
+    """Refuse a repair that rewrites a Queue cell some other verb owns (gh#334, gh#811).
 
     repair is the steward's exact-line write and it holds no lane authority: on master it moved a
     healthy row to another lane, claimed it for a builder and set it `building`, rc=0 with
-    `validate` green -- every one of those a cell some other verb owns. A row validate REJECTS
-    (wrong cell count, bad enum, corrupted id, dead waiting_on) stays repairable: that is what
-    the verb is for. So does a well-formed row whose id is on more than one Queue line, because
-    every owning verb refuses `id_duplicate` there and repair is the only way back.
+    `validate` green -- every one of those a cell some other verb owns. So:
+
+    * A row validate ACCEPTS is refused outright.
+    * A row the row checks reject for a cell (bad enum, dead waiting_on) may have exactly the
+      flagged cells changed and no other (gh#811): mending a bad `state` was also rewriting lane,
+      claimant and notes at rc=0, because this guard used to step aside for the whole row. Each
+      flag names one cell (`_queue_row_findings`), so "flagged" is exact. A blank --new-line (a
+      deletion) changes every cell and is refused; a reshaped line never gets here, it is
+      refused earlier as `repair_fails_validate`. A flagged claimed_by or waiting_on may only
+      be cleared to '-' (`_NEUTRAL_MENDS`), and where '-' alone would strand the row the mend
+      is pinned to the owning verb's own write, state included (`_queue_coupled_mend`). Nor
+      may a mend leave the row `parked` on nothing, a shape `release` refuses and `validate`
+      cannot see. In-flight with no claimant, a shape no verb moves, is not judged here:
+      `validate` flags it (`_queue_row_findings`), so `_guard_validate_delta`, which runs
+      first, refuses any mend that makes or keeps it as `repair_fails_validate`.
+    * A row with the wrong cell count, a duplicated id or a bad id stays fully repairable.
     """
     cells = _cells(old_line)
     ncol, header0 = TABLE_SHAPES["Queue"]
     if cells is None or len(cells) != ncol:
         return
-    if _queue_row_problems(cells[0], QueueRow(*cells), parse_registry(text)):
+    # Every owning verb refuses `id_duplicate`, so repair is the only way back from a duplicate.
+    if _raw_id_count(body_lines, header0, cells[0]) > 1:
         return
-    # Same row filter as validate's duplicate check, read off the RAW lines for the same reason:
-    # the parsed queue is a dict, so a duplicate is already gone by the time it exists.
-    same_id = 0
-    for ln in body_lines:
-        c = _cells(ln)
-        if c is None or _is_separator(c) or (c and c[0] == header0):
-            continue
-        if c and c[0] == cells[0]:
-            same_id += 1
-    if same_id > 1:
+    # A bad id: the parser drops the row, so no owning verb and no cull can reach it -- they all
+    # address rows by id through the parsed board (`validate` reports it off the raw line).
+    # Holding it to cell-scoped mends left only one way to delete one: invent an id, withdraw
+    # and cull it, which fabricates a log record and receipt Notes. So it stays wholly repair's.
+    if not _row_key_ok("Queue", cells[0]):
         return
+    findings = _queue_row_findings(cells[0], QueueRow(*cells), parse_registry(text))
     new = _cells(new_line)
     changed = (
         {j for j in range(ncol) if cells[j] != new[j]}
-        if new is not None and len(new) == ncol else set()
+        if new is not None and len(new) == ncol else None
     )
-    # Unknown or no cell-level change (a reshaped or whitespace-only line): name every owner.
+    if findings:
+        flagged = {j for j, _ in findings}
+        pinned, verb = _queue_coupled_mend(cells, flagged)
+        new = _guard_flagged_mend("Queue", "repair_queue_owned", cells, new_line, findings,
+                                  frozenset(pinned) - flagged)
+        if new[4] == "parked" and new[5].strip() in ("-", ""):
+            raise RegistryError(
+                "repair_queue_owned",
+                f"--new-line would leave Queue row {cells[0]} `parked` and waiting on nothing "
+                "(waiting_on '-'), a shape `release` refuses and `validate` cannot see. A "
+                "row's park belongs to its claimant: `release` it to another state, or, for a "
+                "dead claimant, `reap` (steward)."
+                + (f" The one mend repair takes here is what {verb} writes: "
+                   + _queue_cells_phrase(pinned) + "." if pinned else ""),
+            )
+        # '' and '-' are the same "nothing" in claimed_by and waiting_on.
+        if pinned and any((new[j].strip() or "-") != v for j, v in pinned.items()):
+            raise RegistryError(
+                "repair_queue_owned",
+                f"--new-line would set Queue row {cells[0]} to "
+                + _queue_cells_phrase({j: new[j].strip() for j in pinned})
+                + f". With {_queue_col_names(flagged & {3, 5})} flagged on a "
+                f"`{cells[4]}` row, clearing it alone leaves a row no verb can move, so repair "
+                f"takes exactly one mend, what {verb} writes: {_queue_cells_phrase(pinned)}.",
+            )
+        return  # the mend repair is for: only flagged cells move
+    # Unknown or no cell-level change (a deletion or whitespace-only line): name every owner.
     touched = changed or set(range(ncol))
-    routes = []
-    if touched & _QUEUE_LEAD_COLS:
-        routes.append("id, work item, lane and notes belong to lead-dev: `publish`, `relane` or "
-                      "`withdraw`")
-    if touched & _QUEUE_CLAIMANT_COLS:
-        routes.append("claimed_by, state and waiting_on belong to the claimant: `claim` or "
-                      "`release`; a dead claimant is cleared by `reap` (steward)")
-    what = ", ".join(_QUEUE_COLUMNS[j] for j in sorted(changed)) if changed else "the row"
+    what = _queue_col_names(changed) if changed else "the row"
     raise RegistryError(
         "repair_queue_owned",
         f"--old-line is a Queue row `validate` already accepts ({cells[0]}); repair mends a "
         f"MALFORMED row and may not rewrite a well-formed one (would change: {what}). "
-        + "; ".join(routes) + ". The one well-formed row repair may touch is a duplicate id "
-        "(the same id on more than one Queue line), which every owning verb refuses.",
+        + "; ".join(_queue_owner_routes(touched)) + ". The one well-formed row repair may touch "
+        "is a duplicate id (the same id on more than one Queue line), which every owning verb "
+        "refuses.",
     )
+
+
+def _queue_coupled_mend(cells: list[str], flagged: set[int]) -> tuple[dict[int, str], str]:
+    """The exact mend a flagged owner-held Queue cell must take when clearing it ALONE would
+    strand the row, as ({column: value}, the verb that writes that shape), or ({}, "").
+
+    * claimed_by flagged on an in-flight row: '-' alone leaves `building`/`parked`/`review` with
+      no claimant, which `claim` (ready only), `release` (claimant only) and `reap` (matches an
+      agent) all skip, and `validate` flags it. So the mend is reap's write: claimant '-',
+      state `ready`, waiting_on '-'.
+    * waiting_on flagged on a `parked` row (a dead referent): '-' alone is parked on nothing,
+      and the claimant's wake gate fails closed on the invalid board, so it never `release`s.
+      So the mend is `release --state building`'s write: the claim stays, state `building`,
+      waiting_on '-', and the claimant re-parks if it must. With no claimant to keep, reap's.
+    """
+    reap = ({3: "-", 4: "ready", 5: "-"}, "`reap`")
+    if 3 in flagged and cells[4] in RETURNABLE_QUEUE_STATES:
+        return reap
+    if 5 in flagged and cells[4] == "parked":
+        if cells[3].strip() in ("-", ""):
+            return reap
+        return {4: "building", 5: "-"}, "`release --state building`"
+    return {}, ""
+
+
+def _queue_cells_phrase(values: dict[int, str]) -> str:
+    """'claimed_by '-', state 'ready'' for a refusal naming a coupled mend's cells."""
+    return ", ".join(f"{_QUEUE_COLUMNS[j]} {v!r}" for j, v in sorted(values.items()))
+
+
+def _raw_id_count(body_lines: list[str], header0: str, rid: str) -> int:
+    """How many data rows of a table body carry *rid* in their first cell.
+
+    Same row filter as validate's duplicate check, read off the RAW lines for the same reason:
+    the parsed table is a dict, so a duplicate is already gone by the time it exists.
+    """
+    count = 0
+    for ln in body_lines:
+        c = _cells(ln)
+        if c is None or _is_separator(c) or (c and c[0] == header0):
+            continue
+        if c and c[0] == rid:
+            count += 1
+    return count
+
+
+def _blocker_row_findings(bid: str, b: Blocker) -> list[tuple[int, str]]:
+    """`validate`'s checks on ONE Blockers row, each paired with the ONE column it judges (the
+    guard reads the column, as `_queue_row_findings`' does). ONE copy, read by
+    `_validation_findings` and by `repair`'s Blockers ownership guard, so "a row validate
+    accepts" means the same to both.
+
+    The id check is unreachable today: validate passes only parsed rows (the parser drops a row
+    whose id fails `_ROW_KEY_RULES["Blockers"]`), and the guard returns before calling this on
+    such a row. It stays so that if either caller ever loosens, the shared rule is still the gate
+    and a bad id is reported rather than accepted.
+    """
+    findings: list[tuple[int, str]] = []
+    if not _row_key_ok("Blockers", bid):
+        findings.append((0, f"Blockers: bad id {bid!r}"))
+    if b.state not in BLOCKER_STATES:
+        findings.append((4, f"Blockers[{bid}]: bad state {b.state!r}"))
+    if b.raised_by not in AGENTS:
+        findings.append((1, f"Blockers[{bid}]: bad raised_by {b.raised_by!r}"))
+    if b.owner not in AGENTS and b.owner not in ("-", ""):
+        findings.append((2, f"Blockers[{bid}]: bad owner {b.owner!r}"))
+    return findings
+
+
+def _blocker_row_problems(bid: str, b: Blocker) -> list[str]:
+    """`_blocker_row_findings` without the columns, for `_validation_findings`."""
+    return [msg for _, msg in _blocker_row_findings(bid, b)]
+
+
+def _agents_row_findings(agent: str, r: AgentRow) -> list[tuple[int, str]]:
+    """`validate`'s checks on ONE parsed Agents row, with the column each judges. ONE copy, read
+    by `_validation_findings` and by `repair`'s Agents ownership guard."""
+    if r.status not in AGENT_STATES:
+        return [(1, f"Agents[{agent}]: bad status {r.status!r}")]
+    return []
+
+
+def _guard_blocker_ownership(body_lines: list[str], old_line: str, new_line: str) -> None:
+    """Refuse a repair that rewrites a Blockers cell some other verb owns.
+
+    The Queue guard's twin. Without it repair rewrote a healthy row's owner (lead-dev ->
+    steward), rc=0, and the steward then resolved a blocker it was never assigned -- walking
+    round `assign-blocker`'s ownership limit and `resolve-blocker`'s owner check in two steps.
+    So, as on the Queue: a row validate accepts is refused outright; on a row the row checks
+    reject only the flagged cells may change, an owner-held one only to its neutral value
+    (`_guard_flagged_mend`); and a row no verb can reach -- a wrong cell count, a duplicate id,
+    an id the parser drops -- stays wholly repair's, deletion included.
+    """
+    cells = _cells(old_line)
+    ncol, header0 = TABLE_SHAPES["Blockers"]
+    if cells is None or len(cells) != ncol:
+        return
+    if _raw_id_count(body_lines, header0, cells[0]) > 1:
+        return
+    # The parser drops a non-`B-NNN` id, so no verb and no cull can address the row.
+    if not _row_key_ok("Blockers", cells[0]):
+        return
+    findings = _blocker_row_findings(cells[0], Blocker(*cells))
+    if findings:
+        _guard_flagged_mend("Blockers", "repair_blocker_owned", cells, new_line, findings)
+        return
+    raise RegistryError(
+        "repair_blocker_owned",
+        f"--old-line is a Blockers row `validate` already accepts ({cells[0]}); repair mends a "
+        "MALFORMED row and may not rewrite a well-formed one. Its cells have owning verbs: "
+        "`raise-blocker` (the raiser) creates it, `assign-blocker` moves its owner, "
+        "`resolve-blocker` (the owner) closes it, `cull` (steward) sweeps it once resolved. The "
+        "one well-formed row repair may touch is a duplicate id (the same id on more than one "
+        "Blockers line).",
+    )
+
+
+def _guard_agents_ownership(body_lines: list[str], old_line: str, new_line: str) -> None:
+    """Refuse a repair that rewrites an Agents cell the lane or the steward's verbs own.
+
+    The Queue and Blockers guards' twin. Without it repair rewrote a stale row's heartbeat and
+    eta to fresh ones, rc 0 with `validate` green, and `read --stale` stopped reporting a dead
+    lane: a faked heartbeat. A row with a bad status was rewritable in every cell the same way,
+    so the Queue rule applies: only the flagged cell may change, and status only to `idle`
+    (`_guard_flagged_mend`). A row no verb can reach -- a wrong cell count, an agent the parser
+    drops, a duplicated agent every owning verb refuses as `id_duplicate` -- stays wholly
+    repair's, deletion included.
+    """
+    cells = _cells(old_line)
+    ncol, header0 = TABLE_SHAPES["Agents"]
+    if cells is None or len(cells) != ncol:
+        return
+    if not _row_key_ok("Agents", cells[0]):
+        return
+    if _raw_id_count(body_lines, header0, cells[0]) > 1:
+        return
+    findings = _agents_row_findings(cells[0], AgentRow(*cells))
+    if findings:
+        _guard_flagged_mend("Agents", "repair_agents_owned", cells, new_line, findings)
+        return
+    raise RegistryError(
+        "repair_agents_owned",
+        f"--old-line is an Agents row `validate` already accepts ({cells[0]}); repair mends a "
+        "MALFORMED row and may not rewrite a well-formed one. Its cells have owning verbs: "
+        "`status` (the lane itself) writes every cell and stamps the heartbeat, `stand-down` "
+        "(steward) marks a lane a human stopped, `reap` (steward) idles a dead one. The one "
+        "well-formed row repair may touch is a duplicated agent (the same agent on more than one "
+        "Agents line).",
+    )
+
+
+def _table_row_problems(body: str, name: str) -> list[str]:
+    """validate's raw-line row checks on ONE table *body*: a wrong cell count (the parser drops
+    the row), a key the parser does not keep (`_ROW_KEY_RULES`; it drops the row) and a key on
+    more than one row (the parser keeps the last). ONE copy, read by `_validation_findings` and
+    by `read_registry_checked(rows=...)`, so a reader refusing a board for lost rows means
+    exactly what `validate` means.
+    """
+    ncol, header0 = TABLE_SHAPES[name]
+    key_rule = _ROW_KEY_RULES.get(name)
+    problems: list[str] = []
+    seen: dict[str, int] = {}
+    for line in body.split("\n"):
+        cells = _cells(line)
+        if cells is None or _is_separator(cells) or (cells and cells[0] == header0):
+            continue
+        if len(cells) != ncol:
+            problems.append(f"{name}: row has {len(cells)} cells, expected {ncol}: {line.strip()!r}")
+        if cells and key_rule is not None and not key_rule[0](cells[0]):
+            problems.append(
+                f"{name}: {key_rule[1]} {cells[0]!r} is {key_rule[2]} - the parser drops the row, "
+                f"so no reader sees it; mend or remove it (steward repair): {line.strip()!r}"
+            )
+        if cells:
+            seen[cells[0]] = seen.get(cells[0], 0) + 1
+    for key, count in sorted(seen.items()):
+        if count > 1:
+            problems.append(
+                f"{name}: {key!r} appears on {count} rows - the parser keeps only the "
+                f"last row and every write refuses until the duplicate is repaired "
+                f"(steward repair)"
+            )
+    return problems
 
 
 def _validation_findings(text: str) -> tuple[list[RegistryError], list[str]]:
@@ -6433,30 +7533,35 @@ def _validation_findings(text: str) -> tuple[list[RegistryError], list[str]]:
     # The duplicate check reads the RAW rows, not `reg`: the parse collapses a section
     # into a dict, so by the time `reg` exists the second row is already gone. A check
     # written against the parsed view could not see the thing it is looking for.
-    for name, (ncol, header0) in TABLE_SHAPES.items():
+    for name in TABLE_SHAPES:
         body = _get_body(text, name)
         if _separator_index(body) is None:
             damage.append(_table_lost(name))
-        seen: dict[str, int] = {}
-        for line in body.split("\n"):
-            cells = _cells(line)
-            if cells is None or _is_separator(cells) or (cells and cells[0] == header0):
-                continue
-            if len(cells) != ncol:
-                problems.append(f"{name}: row has {len(cells)} cells, expected {ncol}: {line.strip()!r}")
-            if cells:
-                seen[cells[0]] = seen.get(cells[0], 0) + 1
-        for key, count in sorted(seen.items()):
-            if count > 1:
-                problems.append(
-                    f"{name}: {key!r} appears on {count} rows - the parser keeps only the "
-                    f"last row and every write refuses until the duplicate is repaired "
-                    f"(steward repair)"
-                )
+        problems.extend(_table_row_problems(body, name))
+    # Questions are blocks, not table rows, so the loop above cannot see a duplicated `### Q-`
+    # header -- and the parse keeps the last block while `_edit_qfield` wrote the first.
+    q_seen: dict[str, int] = {}
+    for qm in _QBLOCK_RE.finditer(_get_body(text, "Questions")):
+        q_seen[qm.group(1)] = q_seen.get(qm.group(1), 0) + 1
+    for qid, count in sorted(q_seen.items()):
+        if count > 1:
+            problems.append(
+                f"Questions: {qid!r} appears on {count} blocks - the parser keeps only the "
+                f"last block and every write refuses until the duplicate is removed "
+                f"({_QDUP_REMEDY})"
+            )
+    # A block ends only at the next readable header and fields are last-wins, so a header the
+    # parser cannot read hands its fields to the question above it -- a live halted question
+    # then reads as applied, and cull would sweep it. Flag the header rather than the merge.
+    for line in _get_body(text, "Questions").split("\n"):
+        if (line.startswith("#") or _QHDR_SHAPE_RE.match(line)) and not _QBLOCK_RE.match(line):
+            problems.append(
+                f"Questions: unreadable block header {line[:40]!r} - its fields merge into the "
+                f"block above it; restore it to `### Q-NNNN` (ASCII digits) or remove it"
+            )
     # Vocabulary / enums.
     for ag, r in reg.agents.items():
-        if r.status not in AGENT_STATES:
-            problems.append(f"Agents[{ag}]: bad status {r.status!r}")
+        problems.extend(msg for _, msg in _agents_row_findings(ag, r))
     for rid, r in reg.queue.items():
         problems.extend(_queue_row_problems(rid, r, reg))
     for qid, q in reg.questions.items():
@@ -6483,14 +7588,14 @@ def _validation_findings(text: str) -> tuple[list[RegistryError], list[str]]:
         if answered_by not in ANSWERED_BY and answered_by not in ("-", ""):
             problems.append(f"Questions[{qid}]: bad answered_by {answered_by!r}")
     for bid, b in reg.blockers.items():
-        if b.state not in BLOCKER_STATES:
-            problems.append(f"Blockers[{bid}]: bad state {b.state!r}")
-        if b.raised_by not in AGENTS:
-            problems.append(f"Blockers[{bid}]: bad raised_by {b.raised_by!r}")
-        if b.owner not in AGENTS and b.owner not in ("-", ""):
-            problems.append(f"Blockers[{bid}]: bad owner {b.owner!r}")
+        problems.extend(_blocker_row_problems(bid, b))
     if reg.deploy_holder not in AGENTS and reg.deploy_holder not in ("none", "-"):
         problems.append(f"Queue: bad deploy-lock holder {reg.deploy_holder!r}")
+    # Without the field line every lock verb refuses and the holder reads "none", so a board
+    # that lost it would otherwise pass the wake gate while no lane can take the lock.
+    lock_problem = _deploy_line_problem(_get_body(text, "Queue"))
+    if lock_problem is not None:
+        problems.append(f"Queue: {lock_problem}")
     return damage, problems
 
 
@@ -6553,8 +7658,34 @@ _MUTATORS = {
 }
 
 
+def _refuse_unless_still_held(lock: "EditLock", registry_path: Path, read: str) -> None:
+    """Refuse the write unless this command still holds its lock over the board it read.
+
+    A holder paused past the stale window (a suspended laptop, a stalled disk) has its lock
+    broken by the next writer, which then writes its own change. Writing anyway would put this
+    command's edit, computed from a board that no longer exists, over the thief's. So the lock
+    must still carry this acquire's nonce AND the board on disk must still be the copy read
+    under it; the second catches a writer the nonce cannot, one that never took the lock.
+    Checked immediately before the write; the check and the replace are still two steps.
+    """
+    if not lock.still_ours():
+        raise EditLockStolenError(
+            f"the edit-lock at {lock.path} is now held by {_lock_holder(lock.path).actor}: "
+            "another writer judged this hold stale or dead and broke it"
+        )
+    if _read_registry_text(registry_path) != read:
+        raise EditLockStolenError(
+            f"{registry_path.name} on disk is no longer the copy this command read under the lock"
+        )
+
+
+def _locked_write(lock: "EditLock", registry_path: Path, read: str, text: str) -> None:
+    _refuse_unless_still_held(lock, registry_path, read)
+    _atomic_write(registry_path, text)
+
+
 @contextmanager
-def _steal_note_survives_refusal(lock: "EditLock", registry_path: Path, text: str):
+def _steal_note_survives_refusal(lock: "EditLock", registry_path: Path, read: str, text: str):
     """On a refusal under the lock, write the stale-lock steal Note alone, then re-raise (gh#656).
 
     The steal already happened -- the other lane's lock is gone whatever the verb decides -- and
@@ -6567,7 +7698,7 @@ def _steal_note_survives_refusal(lock: "EditLock", registry_path: Path, text: st
         yield
     except RegistryError:
         if lock.stole_from:
-            _atomic_write(registry_path, text)
+            _locked_write(lock, registry_path, read, text)
         raise
 
 
@@ -6598,7 +7729,8 @@ def _run_mutation(a, timeout: float) -> int:
     registry_path = _resolve_registry_path(a)
     _require_readable_registry(registry_path)  # pre-lock: never queue the fleet behind a bad path
     lock_dir = _resolve_lock_dir(a)
-    project = _resolve_project(a, registry_path)
+    # The board's own project names the lock, never --project: see `_edit_lock_name`.
+    lock_name = _edit_lock_name(registry_path)
     log_path = registry_path.parent / "registry-log.md"
     # gh#656: the argv-only refusals of the verbs in `_ARGV_CHECKS` run before the lock. After
     # the path checks, so a missing or unreadable board still names itself first.
@@ -6606,17 +7738,18 @@ def _run_mutation(a, timeout: float) -> int:
     if argv_checks is not None:
         argv_checks(a)
 
-    lock = acquire_edit_lock(lock_dir, project, a.actor, timeout=timeout)
+    lock = acquire_edit_lock(lock_dir, lock_name, a.actor, timeout=timeout)
     ping_prior_status = None  # decided under the lock, sent after it (see the finally)
     try:
         text = _read_registry_text(registry_path)  # re-read UNDER the lock (lost-update guard)
+        read = text  # what the pre-write check compares the board on disk against
         if lock.stole_from:
             text = _append_note(
                 text,
                 f"{a.actor} -> fleet: broke stale registry edit-lock (prev {lock.stole_from}, {lock.stole_age:.0f}s)",
             )
         if a.command == "cull":
-            with _steal_note_survives_refusal(lock, registry_path, text):
+            with _steal_note_survives_refusal(lock, registry_path, read, text):
                 new_text, log_add, counts, overflow = _cmd_cull(text, a)
             collected: list[Path] = []
             stranded: list[tuple[str, str]] = []   # (name, why) — left on disk, recorded below
@@ -6657,6 +7790,8 @@ def _run_mutation(a, timeout: float) -> int:
                     log_add += _overflow_block(name, content)
                     collected.append(path)
             if log_add:
+                # A robbed holder must not archive notes its registry write will never drop.
+                _refuse_unless_still_held(lock, registry_path, read)
                 # Log FIRST, registry SECOND — and the log's DATA durable before the registry
                 # is replaced. A crash between the two then costs a duplicate log entry
                 # (harmless: id allocation is a max-scan over registry + log) rather than
@@ -6673,7 +7808,7 @@ def _run_mutation(a, timeout: float) -> int:
                     f.write(log_add)
                     f.flush()
                     os.fsync(f.fileno())
-            _atomic_write(registry_path, new_text)
+            _locked_write(lock, registry_path, read, new_text)
             # INVARIANT: delete only AFTER the inlined content is durably in the log AND the
             # registry that drops the note is written. The whole ordering exists so a crash
             # costs a duplicate rather than a loss: a delete before the log's fsync turns a
@@ -6726,13 +7861,17 @@ def _run_mutation(a, timeout: float) -> int:
             )
             return 0
         edit_fn, needs_log = _MUTATORS[a.command]
-        with _steal_note_survives_refusal(lock, registry_path, text):
+        with _steal_note_survives_refusal(lock, registry_path, read, text):
             if needs_log:
                 log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
                 new_text = edit_fn(text, a, log_text)
             else:
                 new_text = edit_fn(text, a)
-        _atomic_write(registry_path, new_text)
+        # The single choke point every mediated verb passes, so any write by the human's seat
+        # is also its proof of life (`_stamp_exempt_heartbeat`). Same locked write.
+        if a.command not in _SELF_STAMPING_VERBS:
+            new_text = _stamp_exempt_heartbeat(new_text, getattr(a, "actor", ""))
+        _locked_write(lock, registry_path, read, new_text)
         # AFTER the write, never before it: announcing an expiry that a failed write then did
         # not perform is exactly the false report the `expired:` line was added to prevent.
         if a.command == "publish":
@@ -6741,6 +7880,9 @@ def _run_mutation(a, timeout: float) -> int:
             # verb's RESULT, not a diagnostic. After the write for the same reason the expiry
             # line below is -- announcing an id a failed write never recorded is a false report.
             print(f"published: {_cmd_publish.last_id}")
+            title_warning = getattr(_cmd_publish, "last_title_warning", None)
+            if title_warning:
+                print(title_warning, file=sys.stderr)
         # Same contract for the other two allocating verbs (gh#649). The id is taken under the
         # lock by a max-scan, so the caller cannot predict it -- and the next documented step
         # (`release --waiting-on`, `status --waiting-on`) needs it. Guessing it off the board
@@ -6793,7 +7935,8 @@ def _build_parser() -> argparse.ArgumentParser:
     #   registry status --actor X --file Y --lock-dir Z
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--file", help="explicit registry.md path (wins over env/--project)")
-    common.add_argument("--project", help="project routing key (derives path via config + names the lock)")
+    common.add_argument("--project", help="project routing key (derives the board via config); the edit-lock "
+                        "is named by the resolved board's own project directory, never by this flag")
     common.add_argument("--lock-dir", help="edit-lock directory (else config env lock_dir)")
     common.add_argument("--timeout", type=float, default=DEFAULT_ACQUIRE_TIMEOUT, help="edit-lock acquire timeout (s)")
     sub = p.add_subparsers(dest="command", required=True)
@@ -7044,8 +8187,14 @@ def _build_parser() -> argparse.ArgumentParser:
              "CHANGES a human-decision field (" + "|".join(_Q_PROTECTED_FIELDS) + "), a "
              "raiser-owned field (" + "|".join(_Q_RAISER_FIELDS) + ") or the "
              "parsed decision record by any route, or the heading skeleton; refuses rewriting a "
-             "Queue row `validate` already accepts unless its id is duplicated "
-             "(repair_queue_owned). Leaves an audit "
+             "Queue row `validate` already accepts unless its id is duplicated, or any cell "
+             "`validate` did not flag on a Queue row it rejects (repair_queue_owned), and the "
+             "same for Blockers (repair_blocker_owned) and Agents (repair_agents_owned) rows, "
+             "keyed by id or agent; a flagged owner-held cell (Queue claimed_by/waiting_on, "
+             "Blockers owner/state, Agents status) may only be cleared to its neutral value, "
+             "and a Queue row that clearing would strand takes exactly what reap or "
+             "`release --state building` writes. "
+             "Leaves an audit "
              "Note on success",
     )
     actor(sp)
@@ -7071,7 +8220,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             if not (getattr(a, "file", None) or os.environ.get("AGENTFLOW_REGISTRY") or getattr(a, "project", None)):
                 raise RegistryError("file_missing", "init needs --project (or --file / $AGENTFLOW_REGISTRY)")
             registry_path = _resolve_registry_path(a)
-            return _do_init(registry_path, a.project or registry_path.parent.parent.name)
+            # Derived before anything is created: a board no write could ever lock is refused
+            # here rather than made and then refused on its first write.
+            lock_name = _edit_lock_name(registry_path)
+            return _do_init(registry_path, a.project or registry_path.parent.parent.name, lock_name)
         if a.command == "read":
             if getattr(a, "capabilities", False):
                 return _do_capabilities(a)
@@ -7127,6 +8279,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     except RegistryError as e:
         print(str(e), file=sys.stderr)
         return 2
+    except EditLockStolenError as e:
+        print(str(e), file=sys.stderr)
+        return 3
     except LockHeldError as e:
         print(f"lock-held: {e}", file=sys.stderr)
         return 3

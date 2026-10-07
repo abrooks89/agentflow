@@ -89,11 +89,12 @@ agentflow checkout) so the user gets a command they can paste.
 **Set `AUTODOC_PROJECT` before you run the first block, whenever more than one project profile is
 installed under `~/.agentflow/config/projects/`.** The block below REFUSES to start in that case
 (see its ambiguity check) rather than refreshing whichever project the SESSION happens to default
-to — that default is the session's project, not the corpus's. So export it first:
-
-```bash
-export AUTODOC_PROJECT=<the project whose corpus this run refreshes>
-```
+to — that default is the session's project, not the corpus's. So put
+`export AUTODOC_PROJECT=<name>`, where `<name>` is the project whose corpus this run refreshes, as
+the first line of the same shell command that runs the Step 1 block below. An export in a
+separate call does not survive: every fenced block, and every Bash tool call, is its own shell, so
+an export run on its own is gone before the block reads it. The block's own first line restates
+this.
 
 On a single-project box it is optional and the default is unambiguous. `ls ~/.agentflow/config/projects/*.md`
 is how you find out which case you are in, and the refusal names the installed set if you skip it.
@@ -110,6 +111,7 @@ value. **Do not fall back to the corpus id (`${source_path##*/}`)** — a projec
 and a wrong attribution is worse than an absent one.
 
 ```bash
+# PREPEND export AUTODOC_PROJECT=<name> above this line, in this same command, on a multi-profile box (see above).
 # INVALIDATE THE POINTER FIRST — before anything here can fail. Every exit path below this line
 # (the project-ambiguity refusal, the three `[ -n ... ] || exit 1` guards, the missing-manifest
 # guard) would otherwise leave the PREVIOUS run's pointer on disk, still aimed at a fully
@@ -314,16 +316,19 @@ with no `project` field is refused: re-run `/autodoc-init` rather than guessing 
 ```bash
 . "$(cat /tmp/autodoc-env.current)" || exit 1   # AUTODOC, source_path, source_branch, env_put
 SRC="$AUTODOC/${source_path}"            # from manifest, e.g. .source/app
-git -C "$SRC" fetch origin "$source_branch"   # not $branch: never assigned, and not a manifest field
-FROM=$(python -c "import json;print(json.load(open('$AUTODOC/.manifest.json'))['last_sha'])")
-TO=$(git -C "$SRC" rev-parse "origin/$source_branch")
+git -C "$SRC" fetch origin "$source_branch" || { echo "FATAL: git fetch origin $source_branch failed in $SRC - network, auth or a moved remote. Without the fetch, origin/$source_branch is the stale ref, which equals last_sha and reads as Already current while origin has commits the wiki never recorded." >&2; exit 1; }   # not $branch: never assigned, and not a manifest field
+# resolve-guard: an empty FROM or TO reaches the ancestry guard below and is reported there as a
+# rewritten history, which sends the reader after a force-push that never happened.
+FROM=$(python -c "import json;print(json.load(open('$AUTODOC/.manifest.json'))['last_sha'] or '')") && [ -n "$FROM" ] || { echo "FATAL: could not read last_sha from $AUTODOC/.manifest.json - the manifest is missing, unreadable, or has no last_sha. This is a manifest problem, not a rewritten history: repair the manifest or re-run /autodoc-init." >&2; exit 1; }
+TO=$(git -C "$SRC" rev-parse --verify --quiet "origin/$source_branch^{commit}") && [ -n "$TO" ] || { echo "FATAL: origin/$source_branch does not resolve to a commit in $SRC after the fetch - check source_branch in .manifest.json. This is a missing ref, not a rewritten history." >&2; exit 1; }
+# end resolve-guard
 # ancestry-guard: BEFORE the reset and the diffs. `git diff FROM TO` is a tree diff and
 # succeeds across unrelated histories, so a rewritten history silently reports phantom changes
 # on every run from this base. Refuse, name both shas, and leave the re-base to the operator.
 git -C "$SRC" cat-file -e "$FROM^{commit}" 2>/dev/null || { echo "FATAL: last_sha $FROM (manifest) is not a commit in $SRC - the source history was rewritten and the old object is gone, or .manifest.json is corrupt, or the clone is shallow and never fetched it (check \`git -C \"\$SRC\" rev-parse --is-shallow-repository\`; \`git -C \"\$SRC\" fetch --unshallow\` then rerun). TO=$TO. Re-base last_sha by hand to a commit on the new history whose tree matches what the corpus was rendered from, or re-run /autodoc-init." >&2; exit 1; }
 git -C "$SRC" merge-base --is-ancestor "$FROM" "$TO" || { echo "FATAL: last_sha FROM=$FROM is not an ancestor of TO=$TO (origin/$source_branch) - the source history was rewritten (or a shallow clone lost the path between them: if \`git -C \"\$SRC\" rev-parse --is-shallow-repository\` says true, \`git -C \"\$SRC\" fetch --unshallow\` and rerun before re-basing anything). Diffing across unrelated history reports phantom changes, so this run refuses. Remedy (operator decision, not automatic): set last_sha in .manifest.json to a commit that IS on the new history and whose tree matches what the corpus was rendered from (inspect \`git -C \"\$SRC\" merge-base $FROM $TO\` and the new history's root, \`git -C \"\$SRC\" rev-list --max-parents=0 $TO\`), or re-run /autodoc-init." >&2; exit 1; }
 # end ancestry-guard
-git -C "$SRC" reset --hard "$TO"
+git -C "$SRC" reset --hard "$TO" || { echo "FATAL: git reset --hard $TO failed in $SRC - the working tree is not at TO, so every step below would document the wrong tree." >&2; exit 1; }
 # $TO in particular MUST go on the carrier from the block that computes it. A stale carrier holds
 # a TO from a previous run, and every step below — the graph build, the records land, the
 # manifest write — stamps that value into the corpus.
@@ -472,12 +477,22 @@ env_put REPO_STEM "$REPO_STEM"
 env_put RENDER_TARGET "$RENDER_TARGET"
 env_put STAMP "$STAMP"
 # install deps once (same guard as init Step 2.5)
-( cd "$SUITE_ROOT/skills/autodoc-init/references/inventory" && test -d node_modules || npm install )
-node "$SUITE_ROOT/skills/autodoc-init/references/inventory/extract-inventory.js" "$SRC" "$INV" "$source_repo" "$TO"
-node "$SUITE_ROOT/skills/autodoc-init/references/inventory/emit-graph.js" "$SRC" "$GRAPH_JSONL" "$REPO_STEM" "$TO" "$source_repo"
+( cd "$SUITE_ROOT/skills/autodoc-init/references/inventory" && { test -d node_modules || npm install; } ) || exit 1
+# Every command below ends in `|| exit 1`: this block has no `set -e`, and a failed step that
+# falls through regroups the diff against the PREVIOUS run's graph while Step 4.5 stamps TO
+# over a range the graph never indexed. The previous run's inventory and graph lines are
+# removed first, because emit-graph writes only on success and `cli build` would otherwise
+# re-ingest the stale file. Nothing reads either one before this block regenerates it.
+rm -f "$INV" "$GRAPH_JSONL" || exit 1
+node "$SUITE_ROOT/skills/autodoc-init/references/inventory/extract-inventory.js" "$SRC" "$INV" "$source_repo" "$TO" || exit 1
+node "$SUITE_ROOT/skills/autodoc-init/references/inventory/emit-graph.js" "$SRC" "$GRAPH_JSONL" "$REPO_STEM" "$TO" "$source_repo" || exit 1
 python -m autodoc_graph.cli build --db "$GRAPH_DB" --corpus "$REPO_STEM" --jsonl "$GRAPH_JSONL" \
-  --repo-ref "$source_repo" --project "$project" --branch "$source_branch"
-python -m autodoc_graph.cli communities --db "$GRAPH_DB" --corpus "$REPO_STEM" --emit "$COMM" "${COMM_PINS[@]}"
+  --repo-ref "$source_repo" --project "$project" --branch "$source_branch" || exit 1
+# Braced rather than a trailing `|| exit 1`, so the call line still ends in the quoted
+# pins expansion; the guard is the same.
+{
+  python -m autodoc_graph.cli communities --db "$GRAPH_DB" --corpus "$REPO_STEM" --emit "$COMM" "${COMM_PINS[@]}"
+} || exit 1
 ```
 
 **Now build `changedCommunities`, because its input exists as of the line above.** This is Step 3's
@@ -715,10 +730,19 @@ Workflow({
                        backlog-drawn entries carry the parked finding text ... ],
     backlogFile:     "<Review Backlog*.md filename if backlog intake fed auditPages, else omit>",
     ucAttachments:   [ ... from step 3.8: [{flowPage, source_paths, ucs:["UC-0147", ...]}] — optional,
-                       flow pages that gained UC links from Use-Case: trailers; omit if empty ... ]
+                       flow pages that gained UC links from Use-Case: trailers; omit if empty ... ],
+    checkRecordsCmd: "python -m autodoc_graph.cli check-records --db \"$GRAPH_DB\" --corpus \"$REPO_STEM\""
   }
 })
 ```
+
+`checkRecordsCmd` is the write-time citation check. Each refresh agent, and the audit
+agent, appends `--records <its own file>` and re-runs it until it exits 0, so a `documents`
+citation with a wrong kind, an absent symbol, or a kind the extractor never indexes (there are no
+`constant` symbols, so no constant can be cited) is fixed when the agent writes it. Without it,
+`graph records` in Step 4.5 is the first place a bad citation surfaces, after every agent has been
+paid for. It checks against the store's symbol tier, rebuilt at `TO` in Step 3.5, and fails loudly
+when that store is missing.
 
 Each `changedCommunities[]` entry carries the changed-file inventory slice from Step 3.5 as its
 per-community coverage checklist. With `--checklist-dir` (the invocation above) that arrives as
@@ -768,6 +792,10 @@ records list, while those records are the freshest thing on the box.
 rm -f /tmp/autodoc-update-run.json /tmp/autodoc-records-files.json /tmp/autodoc-update-coverage.json
 # PASTE the workflow's returned `recordsFiles` array between the FILES markers, verbatim. The
 # empty array below is a PLACE, not a default — it fails the check beneath it, which is the point.
+# ONE SANCTIONED ADDITION, AND ONLY ON A RE-RUN OF THIS BLOCK: a repair record you wrote as a NEW
+# file under $RUN_DIR/records (see "Repairing a record") is appended to the pasted array by its
+# literal full path: this heredoc is quoted and does not expand $RUN_DIR. Nothing else is ever
+# added, and the array is never globbed from the directory.
 cat > /tmp/autodoc-records-files.json <<'FILES'
 []
 FILES
@@ -893,6 +921,13 @@ Every phase above writes **records**, not pages. Nothing the run produced is vis
 tree until this step lands them in the store and re-renders. Same three commands the init path
 uses, in the same order.
 
+Between landing and rendering, `reports-stale` counts the community reports whose code has moved
+since they were written. This runbook does not re-summarize them, so the count is a reported
+outcome, never a failure: the JSON is kept at `$RUN_DIR/reports-stale.json`, the block prints
+`N stale community reports`, and `$STALE_REPORTS` goes on the carrier for the log entry (Step 5)
+and the run report (Step 6). The step fails only when the command errors or its output is not the
+`{"stale": [...], "count": N}` object.
+
 **`$SUITE_ROOT` does NOT redirect the Python.** It points the `node` scripts and this file at a
 checkout, but `python -m autodoc_graph.cli` resolves through the installed package, wherever that
 was installed from. On a normal run those are the same tree and the distinction is invisible. On a
@@ -904,7 +939,7 @@ this step — deliberately, and say in the write-up that it was a branch run, be
 still owes a repeat from the deployed path after the merge.
 
 ```bash
-. "$(cat /tmp/autodoc-env.current)" || exit 1   # SUITE_ROOT, RENDER_TARGET, STAMP, GRAPH_DB, REPO_STEM, RUN_DIR, TO, COMM
+. "$(cat /tmp/autodoc-env.current)" || exit 1   # SUITE_ROOT, RENDER_TARGET, STAMP, GRAPH_DB, REPO_STEM, RUN_DIR, TO, COMM, env_put
 # Step 4.4's output, re-checked here because `cli records --manifest` opens this path with a bare
 # open() and no existence check. Skipping Step 4.4 otherwise surfaces as a traceback on the first
 # command after the fan-out; this says which step to go back to.
@@ -942,7 +977,33 @@ still owes a repeat from the deployed path after the merge.
 python -c "import autodoc_graph, os; print('autodoc_graph:', os.path.dirname(autodoc_graph.__file__))" || exit 1
 node "$SUITE_ROOT/skills/autodoc-init/references/inventory/assert-no-agent-writes.js" "$RENDER_TARGET" --stamp "$STAMP" --clear-prior-render || exit 1
 python -m autodoc_graph.cli records --db "$GRAPH_DB" --corpus "$REPO_STEM"   --records "$RUN_DIR/records" --manifest /tmp/autodoc-update-run.json   --assignment /tmp/autodoc-changed-communities.json   --sha "$TO" --date "$(date +%F)" || exit 1
-python -m autodoc_graph.cli reports-stale --db "$GRAPH_DB" --corpus "$REPO_STEM" --artifact "$COMM" || exit 1
+# REPORTS-STALE IS A COUNT, NOT A GATE. It exits 1 on an error (a missing store, an unknown
+# community) and 0 whatever it counts, so its exit status can never say "too many stale reports".
+# This runbook does not re-summarize community reports, so a nonzero count is an expected outcome
+# and is reported, not failed on: Step 5 writes it into the log entry and Step 6 into the run
+# report. `|| exit 1` stops a crash at once; the shape check below then fails on output that is
+# not the {"stale": [...], "count": N} object, which would otherwise report a count nobody computed.
+python -m autodoc_graph.cli reports-stale --db "$GRAPH_DB" --corpus "$REPO_STEM" --artifact "$COMM" > "$RUN_DIR/reports-stale.json" || exit 1
+# reports-stale-count:
+STALE_REPORTS=$(python - "$RUN_DIR/reports-stale.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError) as e:
+    sys.exit("FATAL: reports-stale wrote no JSON to %s (%s) - read its error above" % (path, e))
+if not isinstance(data, dict):
+    sys.exit("FATAL: %s is not a JSON object: %r" % (path, data))
+stale, count = data.get("stale"), data.get("count")
+if not isinstance(stale, list) or type(count) is not int or count != len(stale):
+    sys.exit("FATAL: %s is not the {\"stale\": [...], \"count\": N} shape: %r" % (path, data))
+print(count)
+PY
+) || exit 1
+echo "$STALE_REPORTS stale community reports (ids in $RUN_DIR/reports-stale.json)"
+env_put STALE_REPORTS "$STALE_REPORTS"
+# end reports-stale-count
 python -m autodoc_graph.cli render --db "$GRAPH_DB" --corpus "$REPO_STEM" --out "$RENDER_TARGET" || exit 1
 # IMMEDIATELY after a render that exited 0, and nowhere else. The stamp is a claim about output
 # that exists: written before the render it would account for files nothing had produced yet, and
@@ -980,7 +1041,8 @@ budgets — and why it is LOSS and not the symmetric difference — is below.
 # THE UPDATE PATH BUDGETS LOSS, NOT THE SYMMETRIC DIFFERENCE. On a refresh, a page that vanished
 # is silent damage and a page that appeared is the job, so 0 lost is the right literal and the
 # created count is left uncapped - the gate reports it on the PASS line so growth is still visible.
-# `pageSetLostBudget` is opt-in; /autodoc-init keeps the symmetric check, which is correct there.
+# `pageSetLostBudget` is opt-in; /autodoc-init uses it on a first build (empty baseline) and keeps
+# the symmetric check for a re-init over a populated tree.
 printf '{ "pageSetLostBudget": 0 }\n' > /tmp/golden-gate-update.json
 # `|| exit 1` and not a paragraph: the next runnable block is the copy-back, so without the stop
 # a reader following the blocks in order copies over a failed render and then deletes the only
@@ -992,7 +1054,9 @@ node "$SUITE_ROOT/skills/autodoc-init/references/inventory/golden-gate.js" \
 `--manifest` is the `recordsFiles` list from the workflow return, written to
 `/tmp/autodoc-update-run.json` as `{"files": [...]}` **by Step 4.4's block, not by hand**. Pass it:
 it is what makes a stale `*.json` from an earlier attempt an error instead of an extra page nobody
-asked for.
+asked for. The only exception to "the workflow's list, verbatim" is a repair record written as a
+new file this run (Repairing a record, below): its path is appended to the paste and Step 4.4's
+block is re-run, so the manifest is still written by that block and never edited by hand.
 
 `--assignment` is Step 3's `/tmp/autodoc-changed-communities.json`. With it, a page two units both
 emitted is resolved instead of refusing the batch: the unit the page was
@@ -1157,10 +1221,10 @@ reported as a failure, and reported only after the entire Step 4 fan-out has bee
 **So the update path declares `pageSetLostBudget: 0` instead.** On a refresh the danger is a page
 LOST, not pages gained: a vanished page is silent damage nobody will notice, a new page is the job.
 The created count is not capped, but the gate prints it on the PASS line too — a gate that hides
-growth is how an unexpected 400-page render slips by. `/autodoc-init` passes no such key and keeps
-the symmetric check unchanged, which is right for a fresh render that must reproduce the tree
-exactly. If pages genuinely should disappear on a refresh — a deleted subsystem — raise the number
-deliberately and say why, the same as any other declared tolerance.
+growth is how an unexpected 400-page render slips by. `/autodoc-init` declares the same key on a
+first build, whose baseline holds no content pages, and keeps the symmetric check for a re-init
+over a populated tree, which must reproduce that tree exactly. If pages genuinely should
+disappear on a refresh — a deleted subsystem — raise the number deliberately and say why, the same as any other declared tolerance.
 
 **A FAIL is a stop, not a note.** Do not copy back over a red gate: `$RENDER_TARGET` is still the
 only copy of the render, and the live tree is still intact, which is the whole reason the gate
@@ -1213,6 +1277,20 @@ Read the rest as a **fork**, not as a diff:
   different page. Fix the product and re-render. An example of the shape: a page body that
   merely *mentions* `[[` — documenting the syntax, as an autodoc corpus routinely does — can make
   a renderer swallow lines and strip the brackets off a real wikilink several lines later.
+- **The page has no record this run, and the link it lost lives only in the live tree.** This
+  is the migration case. A live tree that already carries earlier graph-check `--fix` repairs (a
+  reciprocal `contract_with`, an added alias, a rewritten link) fails `link-recall` on those
+  pages, and it is not a one-off: the gate stops before copy-back, so the live tree keeps the
+  repair, and every run fails on it until the store carries it. The diff above cannot show it.
+  The repair exists only in `$AUTODOC`, and a page no agent touched this run has no record in
+  `$RUN_DIR/records`, so the record-vs-render diff prints nothing for it, which reads as clean
+  when it is not. Diff `$AUTODOC/<page>` against `$RENDER_TARGET/<page>` instead. A link that is
+  in the live tree and in no record is a former graph-check repair, not an agent defect. Carry it
+  into the store through a repair record (Repairing a record, below), verified against `$SRC`,
+  in the part of the page where the live tree holds it: a `contract_with` or alias repair goes in
+  the record's `frontmatter`, not its body. Because the page had no record, that repair is a new
+  record file, so it must be added to the manifest by re-running Step 4.4's block before you
+  re-enter Step 4.5.
 
 ### Repairing a record
 
@@ -1230,6 +1308,46 @@ be perfect, and the gate exists to catch the difference. Two constraints on what
   Verify the relationship still holds in `$SRC`, then write the link against the **new** text.
 - **Say so in the run's own record of what happened**, so the next reader can tell an operator
   repair from agent output.
+
+**A page with no record this run needs a new record file, and a new record file needs the
+manifest.** The migration fork above is that case: no agent touched the page, so there is no
+record to edit. Write one complete page record inside `{"pages": [...]}`, as a new record file at
+`$RUN_DIR/records/repair-<page-slug>.json`. It carries every field an agent's page record
+carries:
+
+- `file`, `type`, `title` and `source_paths`, as the frontmatter of `$RENDER_TARGET/<page>`
+  states them.
+- `summary`, which the rendered page does not carry: the renderer writes it only on the page's
+  line in its folder's `$RENDER_TARGET/<folder>/_index.md`, as `- [[<Title>]] — <summary>`. Take
+  the text after the dash.
+- `frontmatter`, as an object: the frontmatter of `$RENDER_TARGET/<page>` (what the store renders
+  now), minus every key the renderer stamps on its own: `type`, `title`, `created`, `updated`,
+  `project`, `source_repo`, `source_paths`, `diagram` and `diagram_source_sha`. Also drop
+  `related` and `depends_on`, which are rendered from edge rows.
+- `body`: the body of `$RENDER_TARGET/<page>` below its frontmatter. On a flow or data-model page,
+  cut the rendered `## Diagram` section; the store keeps the diagram and the renderer puts it back.
+
+Then carry each repaired link into the part of the record where it lives in `$AUTODOC/<page>`.
+graph-check and the golden gate read it there, so a link in the wrong part still fails:
+
+- **A frontmatter field** goes in `frontmatter`. These are what graph-check `--fix`
+  usually wrote: a reciprocal `contract_with`, or an entry added to `aliases`. The same link put
+  in the body leaves the `contract_with` asymmetric, and `--fail-on-fixable` fails Step 4.5 again.
+- **A body wikilink** goes in `body`.
+- **`related` or `depends_on`** cannot go in `frontmatter`: the renderer discards both there and
+  renders them from edge rows. Add an `edges` entry instead:
+  `{"rel": "related", "dst_type": "<type>", "dst_title": "<Title>"}` (or `"rel": "depends_on"`).
+  The target must be a page the store holds or this run's records write.
+
+Do not stop at the file: `graph records --manifest` refuses any `*.json` in that directory the
+manifest does not list ("contains file(s) NOT in the run manifest"), so Step 4.5 fails on the
+file you just wrote. Re-run Step 4.4's block exactly as before, pasting the same `recordsFiles`
+array with the new file appended. Append its literal path, in the same style as the entries
+already there: the FILES heredoc is quoted, so `$RUN_DIR` is not expanded and Step 4.4 reports
+it as not on disk. That block is the only writer of the manifest, so this is the one addition it
+ever takes. It re-checks that the path exists and sits under `$RUN_DIR/records/`, and it
+rebuilds the coverage report from the same list. An edit to an EXISTING record file needs none
+of this: its name is already listed.
 
 Then re-enter Step 4.5 from the top. `cli records` upserts by entity id, so re-ingesting a
 repaired record is idempotent — and the assert at the top of the step now clears its own prior
@@ -1287,7 +1405,10 @@ rc=$?
   prepend; the header's date and sha range are computed, never typed.
 
 ```bash
-. "$(cat /tmp/autodoc-env.current)" || exit 1   # AUTODOC, FROM, TO
+. "$(cat /tmp/autodoc-env.current)" || exit 1   # AUTODOC, FROM, TO, STALE_REPORTS
+# Step 4.5 put the stale-report count on the carrier. Empty means that block did not run to the
+# end, and an entry saying nothing about stale reports would read as "none".
+[ -n "$STALE_REPORTS" ] || { echo "FATAL: STALE_REPORTS is not on the run carrier - re-run Step 4.5"; exit 1; }
 # FILL IN every REPLACE below from the workflow return before running this block. The literal
 # `REPLACE` tokens are a PLACE, not a default: the guard beneath the heredoc refuses to prepend a
 # half-written entry, which is what a markdown template with no command could not do.
@@ -1295,6 +1416,7 @@ rc=$?
 cat > /tmp/autodoc-update-log-entry.md <<ENTRY
 ## [$(date +%F)] autodoc-update | $(printf '%s' "$FROM" | cut -c1-8)..$(printf '%s' "$TO" | cut -c1-8)
 - Communities: REPLACE | Updated: REPLACE | Created: REPLACE | Deprecated: REPLACE | Audited: REPLACE (REPLACE fixed)
+- Reports: $STALE_REPORTS stale community reports (not re-summarized by this run; graph-query global mode flags the ones it can see from stored timestamps, but not membership-only churn, so trust this count over the absence of a flag)
 - New: REPLACE with wikilinks to created pages, or the word none
 - Impact: REPLACE with one plain-English sentence, who notices and what changed for them. No codenames, no PR numbers.
 - Note: REPLACE with one line on the most significant change
@@ -1337,7 +1459,7 @@ hard-fails on
 ```bash
 . "$(cat /tmp/autodoc-env.current)" || exit 1   # AUTODOC, TO
 # The seed exists to satisfy run-complete.js's hot-cache contract exactly, so it is written
-# against the four things that file checks (run-complete.js:68-73): the run's short sha appears
+# against the four things that file checks (run-complete.js check (d), hot.md): the run's short sha appears
 # in the text; the whole file is <=400 words; there is a line that is literally `## Latest`
 # (its regex is /^## Latest\s*$/m, so no trailing text and no decoration); and the Latest
 # section — everything up to the next `## ` heading — is <=120 words.
@@ -1376,7 +1498,8 @@ let it stand unedited for long — the Orientation section is the part a reader 
 
 Before finishing, run the run-completion gate — non-zero means this update is NOT done
 (short sha = first 8 chars of the full sha — run-complete.js matches exactly that prefix;
-full 40-char shas also pass):
+full 40-char shas also pass). It also fails on a manifest `source_path` that is missing, points
+outside `$AUTODOC`, or names a directory with no `.git` clone: the next update fetches from it.
 
 ```bash
 . "$(cat /tmp/autodoc-env.current)" || exit 1   # SUITE_ROOT, AUTODOC
@@ -1433,8 +1556,9 @@ node "$SUITE_ROOT/skills/autodoc-init/references/inventory/run-complete.js" "$AU
   esac
   ```
 - Confirm `last_sha` advanced to `TO`.
-- Report: range documented, communities touched, pages updated/created/deprecated, and any community agent that
-  returned null (re-run those).
+- Report: range documented, communities touched, pages updated/created/deprecated, any community agent that
+  returned null (re-run those), and the `N stale community reports` line Step 4.5 printed
+  (`$STALE_REPORTS` on the carrier, ids in `$RUN_DIR/reports-stale.json`).
 
 ### Step 6.1 — Graph-reviewer gate (runs in Step 4.5, on the render target)
 
@@ -1457,7 +1581,8 @@ what needs changing and stops.
   would repair, writes no page, prints one `graph-check: fixable (not applied): <page>: <kind>:
   <detail>` line per finding on stderr, lists them under `fixable` in the report, and exits 1. The
   classes it detects:
-  - broken wikilink with **exactly one** case-insensitive candidate;
+  - broken wikilink with **exactly one** near-match candidate (edit distance 1 on the normalized
+    stem, title or alias);
   - **missing universal frontmatter** that has a safe default (`status`, `updated`);
   - **one-way `contract_with` pair** (the page named is the side missing the reciprocal);
   - **route-family alias gap** (`routes:` entry with no matching alias);
@@ -1467,16 +1592,25 @@ what needs changing and stops.
   Each is repaired in the record that renders the named page (or its counterpart), then the run
   re-renders from Step 4.5. Never hand-patch or `--fix` the rendered tree or `$AUTODOC`: the next
   render undoes it.
-- **Blocker gate — the run FAILS (exit 1) on blocker-class residuals:** unexplained symbol-coverage
-  gaps, non-existent `source_paths` (a page citing a file that isn't in the repo), **unresolved
+- **Blocker gate — the run FAILS (exit 1) on any blocker-class finding:** unexplained symbol-coverage
+  gaps, non-existent `source_paths` (a page citing a file that isn't in the repo), **an endpoint
+  page's unresolved `request_model`/`response_model` link**, **unresolved
   frontmatter relational links** (machine-consumed fields per the taxonomy — never advisory), and
   **non-existent diagram `%% source:` paths**. On a red, treat the update as incomplete: read
   `/tmp/autodoc-graph.json`, report the blockers, and re-run the affected communities — do NOT
   mark the update complete with blockers outstanding.
-- **Warnings are reported, not fatal:** broken body-prose wikilinks with no candidate (advisory
-  gap-markers per the taxonomy), orphans (pages with no inbound links), self-links in relational
-  frontmatter, format-invalid structured fields, endpoint↔service `exposes_endpoints` asymmetry,
-  and duplicate/over-budget/out-of-fence diagram issues. Surface them, but they do not fail the run.
+- **Warnings are reported, not fatal:** broken body-prose wikilinks with candidates recorded
+  (`brokenLinkCandidate`; graph-check records no candidates, so this gate never emits it), orphans
+  (`orphan`, pages with no inbound links), self-links in relational frontmatter (`selfLink`),
+  format-invalid structured fields (`fieldFormat`), endpoint↔service `exposes_endpoints` asymmetry
+  (`exposesAsymmetry`), one alias shared by two or more pages (`aliasCollision`), and
+  out-of-fence/duplicate/over-budget diagram issues (`diagramCommentOutsideFence`,
+  `diagramDuplicate`, `diagramOverBudget`). Surface them, but they do not fail the run.
+  Five more warning kinds are the fixable classes above: `brokenLink`, `missingFrontmatter`,
+  `contractAsymmetry`, `aliasParity` and `titleAliasMissing`. An instance `--fail-on-fixable` can
+  repair fails the run as a fixable finding; one it cannot (a broken body-prose link with no single
+  near-match, an advisory gap-marker per the taxonomy, or a missing field with no safe default)
+  stays a warning.
 
 Read `/tmp/autodoc-graph.json` with `python -c` (no jq) for the counts to include in the report —
 and **pass the path in as `sys.argv[1]`**, never as a literal in the `-c` program. MSYS rewrites a
@@ -1487,8 +1621,8 @@ box, so the same mistake in a *writing* script succeeds silently into the wrong 
 ### Step 6.2 — Diagram Staleness (flag-don't-regenerate)
 
 After the refresh, flag any flow/data-model page whose embedded diagram derives from source that
-changed this update. A page's `diagram_source_sha` records the commit its diagram was drawn from; when
-that predates a change to the source the diagram depicts, the diagram is stale. This step is
+changed this update, and any flow/data-model page that has no diagram at all. A page's
+`diagram_source_sha` records the commit its diagram was drawn from; when that predates a change to the source the diagram depicts, the diagram is stale. This step is
 **FLAG-ONLY** — it reports which diagrams are stale plus a regeneration cost budget, and never rewrites
 a diagram. Regeneration is a separate, explicit, budgeted action, never triggered here. Like the
 coverage pre-pass and graph gate, it runs as a plain Node process in the **skill main-loop** (the
@@ -1501,10 +1635,16 @@ node "$SUITE_ROOT/skills/autodoc-init/references/inventory/diagram-staleness.js"
 ```
 
 `$AUTODOC` is the autodoc dir (the refreshed pages), and `$AUTODOC/.manifest.json` supplies
-the source-SHA bookkeeping. The detector prints a staleness report (stale diagrams + regeneration cost
-budget) and exits 0 — it is advisory, not a gate. Surface that report to the user and include it in the
-update log's summary. Do NOT regenerate any diagram automatically; a stale flag is an invitation for an
-explicit, budgeted regeneration pass, not a trigger for one.
+the source-SHA bookkeeping. The detector prints a staleness report and exits 0 — it is advisory, not
+a gate. It flags two classes, both priced into the regeneration cost budget:
+
+- `STALE <path>` — a diagrammed page whose sources changed after its `diagram_source_sha`.
+- `MISSING <path>` — a `type: flow` or `type: data-model` page whose `diagram` field is not `true`:
+  a page this run created without a diagram, or one carrying a `diagram omitted` callout.
+
+Surface that report to the user and include both the STALE and the MISSING lines in the update
+log's summary. Do NOT generate or regenerate any diagram during this run; either flag is an
+invitation for an explicit, budgeted single-page regeneration pass, not a trigger for one.
 
 ### Step 6.5 — Coverage gate (changed symbols only)
 
@@ -1610,6 +1750,29 @@ If the gate fails, report the uncovered changed-file symbols and re-run the affe
 mark the update complete with unexplained coverage gaps in the changed set.
 
 ---
+
+## Store maintenance: move body-stored diagrams into `_diagram` (between runs, once per store)
+
+Older stores keep some validated diagrams as a `## Diagram` section in the page **body**. The
+`_diagram` carry-forward cannot see those, so a re-emitted record has to carry the section itself.
+`graph migrate-diagrams` moves each one into `_diagram`/`_diagram_sha`, where the diagram
+phase stores them. It is not a step of the run above; run it between runs, never mid-run: first with `--dry-run`, then, once the report
+reads right, without it.
+
+```bash
+. "$(cat /tmp/autodoc-env.current)" || exit 1   # SUITE_ROOT, GRAPH_DB, REPO_STEM
+python -m autodoc_graph.cli migrate-diagrams --db "$GRAPH_DB" --corpus "$REPO_STEM" \
+  --validator "$SUITE_ROOT/scripts/validate_mermaid.py" --dry-run
+```
+
+The command validates every diagram before moving it, and moves only flow and data-model pages, the
+kinds the renderer draws `_diagram` on. Any other page (`overview.md`, for example) is reported as
+`left` and keeps its section in the body. A section that fails validation, holds anything besides
+one mermaid fence, or appears twice is `REFUSED`, is left exactly as stored, and makes the command
+exit 1. Re-running the command does nothing. The rendered page keeps its single Diagram section,
+but its `updated:` date moves, because the store changed.
+A moved page whose stored frontmatter had no `diagram_source_sha` gains `diagram: true` and an
+empty `diagram_source_sha`, so Step 6.2 reports it STALE until the diagram phase redraws it.
 
 ## What Not to Do
 

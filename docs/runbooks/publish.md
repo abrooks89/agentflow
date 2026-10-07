@@ -65,8 +65,8 @@ evidence about this week's commit. Step (0) below runs them in order.
    `ci.yml` ships in the cut, so the pattern written there holds only generic shapes that name
    nobody: machine-specific paths such as absolute home directories. The install-specific
    alternatives (product names, hostnames, private address ranges) come from the working
-   repo's Actions variable `SANITIZE_EXTRA_PATTERN`, which mirrors the local extra pattern
-   file of precondition 3 and is appended to the same scan. Check that the variable is set on
+   repo's `SANITIZE_EXTRA_PATTERN` repository secret, which mirrors the local extra pattern
+   file of precondition 3 and is appended to the same scan. Check that the secret is set on
    the working repo (**HUMAN ONLY** to change: a settings change); a run without it logs
    `no extra pattern configured` and scans the generic shapes alone. Do not cut on a red or skipped
    sanitize gate, or on a run that only covered an older commit. On a private repo a push to
@@ -88,6 +88,17 @@ evidence about this week's commit. Step (0) below runs them in order.
    The sanitize gate catches the known shapes; it does not catch a literal nobody has taught
    it about yet, so read the diff.
 
+   The bare personal name is not in the sanitize pattern and, by decision (precondition 4),
+   never joins it. The cut's `person-name` REPORT line looks for it instead: it reads
+   `person.name` from the environment config (or `--person-name <name>`), matches it ignoring
+   case as a whole word over every text file in the cut, and prints each hit as `path:line`,
+   never the name. Only the `Copyright (c)` line of `LICENSE` is exempt,
+   because the license names its holder on purpose; the name on any other line of `LICENSE` is
+   a hit. A path holding the name prints as its position, as a path holding a term does,
+   but matched as a whole word, as the report matches it, where a term masks a path by plain
+   substring. The line never changes the exit code, and when the environment config will not
+   load it reads `not measured: <why>`.
+
    A term that must never ship cannot be taught to the sanitize pattern, because `ci.yml`
    ships in the cut and would publish it. Put such terms (a former employer's name, a personal
    address) in the **local-only** list
@@ -95,18 +106,34 @@ evidence about this week's commit. Step (0) below runs them in order.
    and never ships. One term per line. Blank lines are skipped, and so is a line whose first
    non-blank character is `#` (a whole-line comment); a `#` anywhere else is part of the term.
 
-   A term matches ignoring case, as a whole word where only a letter or digit continues a
-   word: an underscore or punctuation is a boundary, so `term` is found in `TERM_API_KEY`,
+   A term matches ignoring case, as a whole word where only a letter or digit continues a word:
+   an underscore or punctuation is a boundary, so `term` is found in `TERM_API_KEY`,
    `term_client` and `jane@term.example`, but not in `terms` or `term2`. A term that starts or
    ends with punctuation (`@term.example`) matches wherever that text appears. The cut's
    `sensitive-terms` check reports a hit as its file, line and list line number, never the
    term, so a run log cannot republish it. Every check prints paths the same way: a path that
    holds a term anywhere, even inside a longer word, prints as `<cut path #K>` (or
-   `<dropped path #K>`), its position in the cut's file listing, never the path itself.
+   `<dropped path #K>`), its position in the cut's file listing, never the path itself. The
+   cut's own refusals (a submodule entry, a file the tree did not take) run before any check
+   and mask the same way, as `<source path #K>`; if the list cannot be read, they withhold
+   every path they name. A git step that fails while the cut is written prints git's own
+   message, which can name the path it failed on, only when no source path holds a term and the
+   terms list and extra pattern file were both read; otherwise it prints just the git
+   subcommand and its exit code, and you run that step by hand to see why.
+
+   The masking covers paths inside the source tree, never the paths you hand the run. The
+   ledger, the source checkout, the terms list, the extra pattern file, an explicit
+   `--ci-yml` and the cut directory (`--out` when building, `--tree` when checking) all print
+   whole: the first line of output names the ledger and the source, check lines name the terms
+   list, the extra pattern file and `--ci-yml`, and refusals and failures name the source and
+   the cut directory. Keep every one of them out of any directory whose name holds a term, or
+   the run log carries the term in a path nothing masks.
 
    Without the list the check prints `not configured: <where it looked>` and passes: it is an
-   extra guard, not a requirement. `--project` finds the list through the environment config's
-   data root. If the project or environment config will not load, the check is
+   extra guard, not a requirement. That holds only where the check knew where to look: on the
+   explicit route (`--ledger`/`--source`/`--host-ref`, no `--project`) with no
+   `--sensitive-terms`, the check is `cannot measure`. `--project` finds the list through the
+   environment config's data root. If the project or environment config will not load, the check is
    `cannot measure`; pass `--sensitive-terms <path>` to name the list directly. Naming a path
    that does not exist prints `not configured: <path> does not exist`, never a silent pass, so
    read that line to confirm the list you meant was the one read. Never write a real sensitive
@@ -121,9 +148,10 @@ evidence about this week's commit. Step (0) below runs them in order.
    whitespace stripped, blank lines and whole-line `#` comments skipped, the lines OR-ed. The
    cut's `sanitize-terms` check and the pillar residue check (precondition 4) union it with
    `ci.yml`'s pattern. Mirror the same alternatives, joined with `|`, into the working repo's
-   Actions variable `SANITIZE_EXTRA_PATTERN` so the PR-time gate applies them too (precondition
+   `SANITIZE_EXTRA_PATTERN` repository secret so the PR-time gate applies them too (precondition
    1). Without the file the check line says `extra pattern not configured: <where it looked>`
-   and passes on the generic shapes; a file that cannot be read, or a line that does not
+   and passes on the generic shapes (on the explicit route with no `--sanitize-extra-pattern`
+   it is `cannot measure` instead); a file that cannot be read, or a line that does not
    compile, is `cannot measure`. `--project` finds it through the data root, and
    `--sanitize-extra-pattern <path>` names it directly. No output ever prints the pattern or a
    matched term, and a path the extra pattern matches is masked like a path holding a term.
@@ -131,9 +159,12 @@ evidence about this week's commit. Step (0) below runs them in order.
    Enter `SANITIZE_EXTRA_PATTERN` as one line with no surrounding whitespace: the CI step
    appends it as written, without the per-line stripping the file gets, so a trailing space
    narrows the last alternative and a newline breaks every scan (which fails closed). The gate
-   never echoes the variable, but GitHub lists a step's env values at the top of its log and does not mask
-   repository variables, so the working repo's run logs carry it. Set it there only, never on
-   a public copy.
+   never echoes the secret. GitHub lists a step's env at the top of its log and masks a
+   repository secret's value there as `***`, and in any other line that prints it whole; the
+   mask matches the whole value only, so one alternative printed on its own would not be
+   masked. A secret cannot be read back once saved, so the local file stays the copy you edit:
+   re-enter the whole joined line after every change to it. Set it on the working repo only,
+   never on a public copy.
 4. **The `wiki/` pillar is clean by its own check, not by the sanitize gate.** The gate greps
    the *checkout*, and the pillar is not in it: pages live under the data root, which is
    outside the repository and is not a git repository at all. Extending CI to walk it is not
@@ -158,11 +189,13 @@ evidence about this week's commit. Step (0) below runs them in order.
    (`<data_root>/projects/<project>/wiki/residue-baseline.json`) records the pages that were
    already dirty when the ratchet shipped (71 of 507 on 2026-09-22), and the check passes with
    them present, on purpose: a gate that was red on day one is a gate somebody turns off. The
-   decision on those pages is made (registry Q-10079, answered 2026-09-23): **the pages stay,
-   the ratchet stays the control, and the bare personal name does not join the sanitize
-   pattern.** Pillar pages are not edited to clear this; they are create-only by standing
-   decision. Read the printed per-class counts before publishing anything derived from the
-   pillar.
+   decision on those pages is made (answered 2026-09-23): **the pages stay, the ratchet stays
+   the control, and the bare personal name does not join the sanitize pattern.** Pillar pages
+   are not edited to clear this; they are create-only by standing decision. A violation names
+   each hit as `<path>:<line> <class>`, never the matched text, and the remedy is to supersede
+   the page with a clean one that names people by role and move the dirty page into
+   `pages/archived/`; an archived page leaves the ratchet. Read the printed per-class counts
+   before publishing anything derived from the pillar.
 5. **Every CI suite passes on `<rev>` itself**, not on the install at `suite_root`, which can
    lag the commit being cut. `.github/workflows/ci.yml` is the list: the `_shared`, install
    and graph pytest suites, the inventory and orchestrator `node --test` suites and the
@@ -211,7 +244,14 @@ agentflow project, and `<rev>` is the working-repo commit you intend to share.
 
 Key rotation gates the cut unless the ledger records a waiver. Until every row of
 `<data_root>/projects/<project>/status/key-rotation-ledger.md` carries a `rotated_on` date,
-the cut's `ledger-dated` check fails. The one way past it without rotating is a `## Waiver`
+the cut's `ledger-dated` check fails. Every visible table with a `rotated_on` column is
+counted, not only the first, so an undated row in a later table (an addendum section) fails the
+same; with more than one table the line reads `<d> of <n> rows dated across <k> rotated_on
+tables`, and each table needs its own separator row and at least one row or the check is
+`cannot measure`. The header cell matches in any case (`Rotated_On` counts). A `rotated_on`
+table directly under another table with no blank line between them, inside a blockquote, or
+with two `rotated_on` columns is `cannot measure`. The one way past it
+without rotating is a `## Waiver`
 section in that ledger, recording the human's decision not to rotate, one bullet per field:
 
 ```markdown
@@ -224,19 +264,24 @@ section in that ledger, recording the human's decision not to rotate, one bullet
 - evidence: <what was checked to support that>
 ```
 
-A complete waiver passes the check as `waived by <name> on <date>: <n> of <m> rows undated`.
-A field missing, empty or given twice, a `waived_on` that is not an ISO date, or a `scope`
-other than `publish` makes it `cannot measure` (exit `2`), naming the field. The waiver reader
-skips lines inside a fenced code block (```` ``` ```` or `~~~`), so a filled-in waiver example
-pasted in a fence waives nothing, and a fence left unclosed hides every waiver line after it.
-This applies to the `## Waiver` section only: the `rotated_on` table is still read wherever it
-is, so keep example tables out of the ledger. A heading that is
-nearly but not exactly `## Waiver` (`## waiver`, `## Waiver (publish)`) waives nothing either;
-the `FAIL` line names its line number. A waiver never
-fills `rotated_on`: those cells stay blank until a rotation actually happens. There is still
-no flag. The ledger lives in the data root and never ships, and only the human's word puts a
-waiver there. Rotating, and deciding to waive it, are human tasks and are not in this
-runbook; do one of them first.
+A complete waiver passes the check as `waived by <name> on <date>: <n> of <m> rows undated`. A
+field missing, empty or given twice, a `waived_on` that is not an ISO date, or a `scope` other
+than `publish` makes it `cannot measure` (exit `2`), naming the field. The ledger is read as it
+renders: lines inside a fenced code block (```` ``` ```` or `~~~`) or an HTML comment are
+skipped, so a filled-in waiver example pasted in either waives nothing. A comment block starts
+only on a line that begins with `<!--` and runs to the line holding `-->`; elsewhere `<!--`
+hides text only when `-->` closes it on the same line, and inside an inline code span it is
+code. So a stray `<!--` in a table cell is plain text and hides no rows. A fence or comment
+block left unclosed is `cannot measure`, naming the line it opened on: the gate will not guess
+what it was meant to hide. One known gap: a comment block indented four or more spaces (inside a
+nested list item, say) is read as literal text, though it renders hidden. The same goes for the `rotated_on` table: an example table in a
+fence or a comment is never read as the ledger, and a ledger whose only such table is hidden
+has no table (`cannot measure`). A heading that is nearly but not exactly `## Waiver`
+(`## waiver`, `## Waiver (publish)`) waives nothing either; the `FAIL` line names its line
+number. A waiver never fills `rotated_on`: those cells stay blank until a rotation actually
+happens. There is still no flag. The ledger lives in the data root and never ships, and only
+the human's word puts a waiver there. Rotating, and deciding to waive it, are human tasks and
+are not in this runbook; do one of them first.
 
 Run preconditions 1, 3, 4, 5 and 7 on `<rev>`. Then build a dry-run cut into an empty local
 directory. This writes only to that directory; it adds no remote and pushes nothing:
@@ -246,16 +291,26 @@ python -m agentflow.publish cut --rev <rev> --out <dry dir> --author-email <nore
 ```
 
 `--project` is required (or all three of `--ledger`, `--source` and `--host-ref`): `cut` and
-`check` refuse to fall back to the session's default project. The first line of output names
-the project, ledger path, source checkout and owner the run resolved; check that they are the
-ones you meant before reading anything below it.
+`check` refuse to fall back to the session's default project. The explicit route has no data
+root to find the local-only files of precondition 3 in, so it also needs
+`--sensitive-terms <path>` and `--sanitize-extra-pattern <path>`; without them `sensitive-terms`
+and `sanitize-terms` print `cannot measure` naming the flag, and the run exits `2`. The first
+line of output names the project, ledger path, source checkout and owner the run resolved;
+check that they are the ones you meant before reading anything below it.
 
 **Proof:** it exits `0`, and every check line reads `PASS` or `REPORT`. If it exits `1`, a
 hard check failed: fix master (or, for `ledger-dated`, finish rotation or record a waiver)
-and start again; nothing has been renamed yet. If it exits `2`, the gate could not measure;
-that is never a pass. An environment config error (say, a notifier env var that is not set)
-blocks only the ledger path, since the owner and source come from the project file alone, and
-the check line names the config error to fix rather than asking for a flag. **Record the
+and start again in a fresh empty directory (delete the dry-run directory, or pass a new
+`--out`: the cut never overwrites); nothing has been renamed yet. If it exits `2`, the gate
+could not measure; that is never a pass. A `REFUSED` line on stderr exits `2` too: the cut
+refused its inputs, the line says why, and nothing was checked. An environment config error
+(say, a notifier env var that is not set) leaves the owner and source alone, since they come
+from the project file, but blanks every path under the data root and the personal name:
+`ledger-dated`, `sanitize-terms` and `sensitive-terms` each print `cannot measure` naming the
+config error, and `person-name` prints `not measured`. Fix the config error the line names,
+or pass the check's own path instead (`--ledger <path>`, `--sanitize-extra-pattern <path>`,
+`--sensitive-terms <path>`, `--person-name <name>`). Either way the cut has already been
+built, so re-run into a fresh empty directory, as for exit `1`. **Record the
 printed source sha and tree id.** Steps (5), (9) and (10) compare against them.
 
 **What each check line means.** A hard check prints `PASS` or `FAIL`; `FAIL <name> cannot
@@ -264,13 +319,13 @@ the matched text.
 
 | Line | What it checks | On `FAIL` |
 |---|---|---|
-| `cut-shape` | The cut directory is still what the cut built: one parentless commit by `agentflow` with a noreply address, `refs/heads/master` only, no hook file (git's inert `*.sample` files are allowed), and a repo config (local and worktree scope, includes followed) holding only allow-listed keys: `core.repositoryformatversion`, `core.filemode`, `core.bare`, `core.logallrefupdates`, `core.symlinks`, `core.ignorecase`, `core.precomposeunicode`, `core.autocrlf`, `core.safecrlf`, `extensions.objectformat` and `extensions.refstorage`. Any other key fails it, named with its scope; a remote, URL rewrite, include or `core.hooksPath` gets a message of its own. | Delete the directory and build the cut again; never repair it by hand. |
-| `ledger-dated` | Every row of the key-rotation ledger has a real `rotated_on` date, or the ledger records a complete `## Waiver` (step (0)). A malformed waiver is `cannot measure`. | Finish key rotation, or record a waiver. No flag skips it. |
+| `cut-shape` | The cut directory is still what the cut built: one parentless commit by `agentflow` with a noreply address, `refs/heads/master` only, no hook file (git's inert `*.sample` files are allowed), and a repo config (local and worktree scope, includes followed) holding only allow-listed keys: `core.repositoryformatversion`, `core.filemode`, `core.bare`, `core.logallrefupdates`, `core.symlinks`, `core.ignorecase`, `core.precomposeunicode`, `core.autocrlf`, `core.safecrlf`, `extensions.objectformat` and `extensions.refstorage`, each pinned to a value `git init` or the cut writes (`core.bare`, `core.logallrefupdates`, `core.autocrlf` and `core.safecrlf` only `false`; booleans read case-insensitively, as git reads them). Any other key fails it, named with its scope; a remote, URL rewrite, include or `core.hooksPath` gets a message of its own; an allow-listed key at another value fails it, named with its value and the values allowed. An `objects/info/alternates` file, even an empty one, fails it too: the cut never writes one, and it lends the cut another repository's objects. | Delete the directory and build the cut again; never repair it by hand. |
+| `ledger-dated` | Every row of every visible `rotated_on` table in the key-rotation ledger (not only the first table; header matched in any case) has a real `rotated_on` date, or the ledger records a complete `## Waiver` (step (0)). A malformed waiver, a blockquoted table, a table with no blank line above it under another, or a second `rotated_on` column is `cannot measure`. | Finish key rotation, or record a waiver. No flag skips it. |
 | `session-urls` | No file and not the cut's commit message carries an assistant session URL or a session trailer. | Remove it in the working repo, land that, cut again. |
-| `sanitize-terms` | No text file matches the cut's `ci.yml` sanitize pattern unioned with the local extra pattern file (precondition 3), including `skills/_vendored/`, which the CI job skips. The line names the sources it applied: `ci.yml pattern + extra pattern from <path>`, or `ci.yml pattern; extra pattern not configured: <where it looked>`. An extra file that cannot be read, a line that does not compile, or a data root that cannot be resolved is `cannot measure` (pass `--sanitize-extra-pattern <path>`). | Replace the literal in the working repo. |
-| `sensitive-terms` | No file, file path or the cut's commit message holds a term from the local-only list (precondition 3), ignoring case, with `_` and punctuation as word boundaries. A hit prints `path:line (list line N)`. A path holding a term prints as `<cut path #K>` here and in every other check's lines. No list prints `not configured: <where it looked>` and passes; a list that cannot be read, or a data root that cannot be resolved, is `cannot measure` (pass `--sensitive-terms <path>`). | Replace the term in the working repo, land that, cut again. Look it up by its list line number. |
+| `sanitize-terms` | No text file matches the cut's `ci.yml` sanitize pattern unioned with the local extra pattern file (precondition 3), including `skills/_vendored/`, which the CI job skips. The line names the sources it applied: `ci.yml pattern + extra pattern from <path>`, or `ci.yml pattern; extra pattern not configured: <where it looked>`. An extra file that cannot be read, a line that does not compile, a data root that cannot be resolved, or the explicit route without `--sanitize-extra-pattern` or `--project`, is `cannot measure` (pass `--sanitize-extra-pattern <path>`). | Replace the literal in the working repo. |
+| `sensitive-terms` | No file, file path or the cut's commit message holds a term from the local-only list (precondition 3), ignoring case, with `_` and punctuation as word boundaries. A hit prints `path:line (list line N)`. A path holding a term prints as `<cut path #K>` here and in every other check's lines. No list prints `not configured: <where it looked>` and passes; a list that cannot be read, a data root that cannot be resolved, or the explicit route without `--sensitive-terms` or `--project`, is `cannot measure` (pass `--sensitive-terms <path>`). | Replace the term in the working repo, land that, cut again. Look it up by its list line number. |
 | `key-shapes` | No file matches any credential shape `publish.py` lists in `KEY_SHAPES`. | Remove the file or value, and rotate the key: it is in the working history too. |
-| `excluded-paths` | No path in the cut, and none the cut dropped from the source rev, matches `.env`, `.env.*`, `*.pem` or `.worktrees/`, in any segment and any case. The cut leaves such a path out of its tree and still fails, **by design**: a conventional `.env.example` fails too. | Remove or rename the path on the source branch (`env.example` passes), land that, cut again. |
+| `excluded-paths` | No path in the cut, and none the cut dropped from the source rev, matches `.env`, `.env.*`, `*.pem` or `.worktrees/`, in any segment and any case. The cut leaves such a path out of its tree and still fails, **by design**: a conventional `.env.example` fails too. Only `cut` measures the dropped half, since only it knows what it dropped; `check` measures the paths in the cut and labels the dropped half `dropped paths not measured: only cut knows them`, so a `check` PASS never vouches for a source rev that `cut` failed. | Remove or rename the path on the source branch (`env.example` passes), land that, cut again. |
 | `tracker-links` | No line links an issue or pull request under the working repo's owner; those links reach the private tracker, or the share itself after the rename. | Replace the link with a plain `gh#N` reference. |
 | `runbook-present` | `docs/runbooks/publish.md` is in the cut. | Restore it in the working repo. |
 
@@ -281,6 +336,7 @@ The `REPORT` lines never change the exit code. Read each before step (1):
 | `sha-citations` | Each `path:line` that names a commit sha resolving in the source checkout, each sha listed once per line. The share does not carry those commits, so to a share reader each is a dead reference. | Nothing is required. Rewrite, in the working repo, any a share reader needs to follow. |
 | `tracker-refs` | The count of plain `gh#N` references. They name issues in the working repo's tracker, which a share reader cannot open. | Nothing is required; they are labels, not links. |
 | `install-evidence` | How many files besides `docs/INSTALL.md` differ from the tree the Linux install was last verified on. | Follow *Linux install evidence* below. |
+| `person-name` | Each `path:line` of a text file that carries the bare personal name (precondition 3), never the name. The `Copyright (c)` line of `LICENSE` is exempt. `not measured: <why>` when the name does not resolve. | Nothing is required; read each hit before you publish. |
 
 **Linux install evidence.** The share should carry an install that was verified on the tree
 being shared. `docs/INSTALL.md`'s Last-verified line cites the **tree id** `<T1>` the Linux
@@ -299,8 +355,10 @@ git -C <working checkout> diff -U0 <T1> <tree> -- docs/INSTALL.md
 The first must list only `docs/INSTALL.md` (the REPORT line reads `0 file(s)`), and every
 hunk of the second must fall inside the Last-verified block. If anything else differs, re-run
 the Linux drill on the dry-run tree, as that rule says, before step (1). If the REPORT line
-says `not measured`, the comparison did not run: fetch `<T1>` into the working checkout, or
-re-run the drill.
+says `not measured`, the comparison did not run, and the line says why. If `--source` does not
+exist, is not a directory, is not a git repository, or sits inside one without being its top
+level, point `--source` at the working checkout's top level and check again. If
+it is a valid checkout that lacks `<T1>`, fetch `<T1>` into it, or re-run the drill.
 
 ### (1) Quiesce
 
@@ -310,6 +368,8 @@ A loop that pushes a branch between the rename and the repoint can publish it.
 **Proof:** the fleet board shows every loop idle.
 
 ### (2) Rename, then repoint EVERY clone on every machine
+
+First publish only: skip if `publish_repo` is already set.
 
 A repo name is unique per owner: you cannot create `<owner>/<name>` while `<owner>/<name>` is
 the private working repo, so the working repo is renamed first.
@@ -354,6 +414,8 @@ python -m agentflow.doctor --project <project>
 
 ### (3) Create the new repo
 
+First publish only: skip if `publish_repo` is already set.
+
 Its visibility is the owner's decision. The suite's first share is private, plus a
 collaborator invite at step (10).
 
@@ -369,6 +431,8 @@ gh repo view <owner>/<name> --json visibility
 ```
 
 ### (4) Set `publish_repo` to the new repo
+
+First publish only: skip if `publish_repo` is already set.
 
 Set `publish_repo` in `~/.agentflow/config/projects/<project>.md` to `<owner>/<name>`.
 Precondition 6 is checked here.
@@ -403,7 +467,8 @@ git -C <cut dir> rev-parse 'HEAD^{tree}'
 Its `cut-shape` check refuses anything that is not the cut `build_cut` made: exactly one
 parentless commit, authored and committed by `agentflow` with a noreply address, on `master`
 alone, with no hook file (git's inert `*.sample` files aside), and with only the allow-listed
-keys in step (0)'s table in its own config, worktree config and anything they include. A
+keys in step (0)'s table, at their pinned values, in its own config, worktree config and
+anything they include, and with no `objects/info/alternates` file. A
 second commit would be pushed with the first. The config is an allow-list because the keys
 that can redirect step (7)'s push by URL or run code during it (a URL rewrite, an include, a
 hook path, a credential helper, a proxy, an ssh command, an fsmonitor) are too many to list

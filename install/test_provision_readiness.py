@@ -55,7 +55,7 @@ def _run(tmp_path, projects):
         autodoc_reason="forced by --no-autodoc",
     )
     by_name = {p.name: p for p in projects}
-    fake = SimpleNamespace(load_project=lambda stem: by_name[stem])
+    fake = SimpleNamespace(load_project=lambda stem, **_k: by_name[stem])
     with mock.patch.dict(sys.modules, {"agentflow.config": fake}):
         return provision._verification_readiness(opts)
 

@@ -6,6 +6,7 @@ renders cited context for humans."""
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -95,6 +96,22 @@ def test_empty_corpus_fails_loudly(tmp_path, capsys):
     code, _, err = _run(str(path), "anything", capsys=capsys)
     assert code == 1
     assert "empty" in err
+
+
+def test_a_wrong_corpus_is_refused_and_writes_nothing(db, capsys):
+    """gh#778: a mistyped --corpus inserted a corpus row on a read and then reported
+    the corpus empty, sending the reader to rebuild an intact store."""
+    argv = ["--db", db, "--corpus", "corpx", "anything"]
+    code = main(argv, embedder=FakeEmbedder(unit_vec(0)), scorer=StubScorer())
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "no corpus 'corpx'" in err and "'corp'" in err
+    assert "empty" not in err
+    con = sqlite3.connect(db)
+    try:
+        assert [r[0] for r in con.execute("SELECT id FROM corpus")] == ["corp"]
+    finally:
+        con.close()
 
 
 def test_nonexistent_db_is_loud_and_creates_nothing(tmp_path, capsys):

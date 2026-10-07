@@ -140,7 +140,7 @@ def test_one_project_raising_does_not_hide_the_rest(tmp_path, monkeypatch):
         (home / "projects" / f"{name}.md").write_text("x", encoding="utf-8")
     checked = []
 
-    def diagnose(name=None):
+    def diagnose(name=None, config_home=None):
         checked.append(name)
         if name == "b":
             raise RuntimeError("boom in b")

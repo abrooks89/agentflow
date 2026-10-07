@@ -1,5 +1,5 @@
 ---
-description: Thin wrapper that forwards $ARGUMENTS into the jr-dev-2 skill (the TERTIARY parallel builder). Exists so the self-paced ScheduleWakeup continuation string (`/jr-dev-2 $ARGUMENTS`) stays a valid slash command — delegated bare skill invocation is unreliable, so each wake re-enters through this command. jr-dev-2 takes no work target; the only argument it accepts is the optional `--project <name>` selector, because its work comes solely from the registry `## Queue` rows lead-dev publishes to the `jr-dev-2` lane.
+description: Thin wrapper that forwards $ARGUMENTS into the jr-dev-2 skill (the TERTIARY parallel builder). Exists so the self-paced ScheduleWakeup continuation string (`/jr-dev-2 --project <name>`, composed from the resolved values) stays a valid slash command — delegated bare skill invocation is unreliable, so each wake re-enters through this command. jr-dev-2 takes no work target; the only argument it accepts is the optional `--project <name>` selector, because its work comes solely from the registry `## Queue` rows lead-dev publishes to the `jr-dev-2` lane.
 ---
 
 Invoke the `jr-dev-2` skill (the tertiary parallel builder), forwarding this wake's arguments verbatim.
@@ -14,7 +14,8 @@ never selects its own work — it claims only from the registry `## Queue` rows 
 to its lane (`lane: jr-dev-2`), and those rows must be read from the project the selector names.
 
 Run: `Skill(jr-dev-2, args="$ARGUMENTS")` — carry `$ARGUMENTS` through unchanged so the loop's
-self-paced wake continuation (`ScheduleWakeup(prompt="/jr-dev-2 $ARGUMENTS")`) re-enters the same
+self-paced wake continuation (`ScheduleWakeup(prompt="/jr-dev-2 --project <name>")`, written as literal text from
+the project name the skill resolved — never the `$ARGUMENTS` token, which does not expand on a self-wake) re-enters the same
 builder with the project selector intact. A continuation that drops `--project <name>` silently
 reverts to the session's injected default on the very next wake — the builder starts claiming
 lane rows out of a different project's registry. Then follow the skill's procedure to completion,

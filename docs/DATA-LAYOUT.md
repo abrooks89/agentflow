@@ -92,7 +92,9 @@ Three things about that rule are load-bearing, and each of them was learned the 
 - **The frontmatter is the source and the directory is the view.** Editing `current_state` to make
   a file's location correct inverts the rule and gives you two states with no rule for which wins.
   The steward, which runs this pass (`skills/steward/SKILL.md`, domain A2), is explicitly forbidden
-  from doing it.
+  from doing it. The rule runs both ways: moving an `approved-for-autonomous` spec into
+  `archived/` does not withdraw its approval (it stays dispatchable, and this pass moves it back
+  to the bucket root); only editing `current_state` does (`gh#233`).
 - **Unplaceable is a third outcome, not an error and not a default.** A file whose `current_state`
   cannot be read is left exactly where it is and named in the report — 169 files across that same
   project's design tree are in that condition as of this writing, nearly all of them under
@@ -104,12 +106,15 @@ Three things about that rule are load-bearing, and each of them was learned the 
   survey, a *finished* prerequisite read as unsatisfied, and 440 records across two projects sat
   stranded behind dependencies that were already met (`gh#122`).
 
-The `wiki/` pillar uses the same two names for the same idea, with a different mover: `pages/` is
+The `wiki/` pillar uses the same names under a different rule, with a different mover: `pages/` is
 creation-only, a page is retired by **moving** it into `pages/done/` or `pages/archived/`, and
 `agentflow.wiki` skips those names at any depth so a retired page keeps its history and leaves the
 projection. A retirement is routine rather than exceptional, which is why the projection refresh
 sweeps its own `hot-<lane>.md` files in the same pass — a lane that loses its last live page would
-otherwise keep a stale hot file that asserts its own freshness.
+otherwise keep a stale hot file that asserts its own freshness. The same move is how a page
+that fails the residue ratchet (`python -m agentflow.wiki residue`) is cleared: supersede it with
+a clean page, archive the dirty one, and it leaves the ratchet because the check skips these
+partitions too.
 
 ## What never leaves this tree
 
@@ -195,7 +200,8 @@ timestamped, so the number need not be reused across a run.
 **"Converted" is not "the whole tree".** `dev-manager` and `steward` point at the module and a
 test holds them to it; `skills/autodoc-update/SKILL.md` claims its manifest backup from the
 module too (gh#184). The one hand-written backup name left is `skills/autodoc-init/SKILL.md`'s
-`${AUTODOC}.pre-store.bak`, a directory the reaper does not reach by design. Read this section
+`${AUTODOC}.pre-store.bak` (or a UTC-stamped sibling of it, on a re-init that finds that name taken),
+a directory the reaper does not reach by design. Read this section
 as the rule, not as a finished sweep.
 
 Two properties of the format are worth preserving. The timestamp is fixed-width and UTC, so a
@@ -266,19 +272,28 @@ steward already runs the same shape (`agentflow.reconcile`) against the same tre
 >
 > **The exit code is the machine-readable answer.** `0` = bounded (nothing pending, nothing
 > refused); `1` = not bounded (removals pending, or a refusal standing); `2` = bad invocation,
-> including a `--project` whose directory does not exist. A typo must not read as a clean tree.
+> including a `--project` whose directory does not exist and a `--keep` below 1. A typo must
+> not read as a clean tree.
 
 ## Discovery
 
 The disk epic-survey (`agentflow.epic_survey.survey_epics`, which replaced an earlier HTTP
 work-discovery service) globs this layout by default:
 
-- Pass 1 (`design/specs/`): `projects/*/design/specs/*.md`  → `speccing` (unless `current_state` overrides)
-- Pass 2 (`design/plans/`): `projects/*/design/plans/*.md`  → `planning`, promoted over any spec record
-- Pass 3 (`status/`): `projects/*/status`  → `running` / `done` (status.md always wins)
+- Pass 1 (`design/specs/`): `projects/*/design/specs/*.md`, `projects/*/design/specs/done/*.md`,
+  `projects/*/design/specs/archived/*.md`  → `speccing` (unless `current_state` overrides)
+- Pass 2 (`design/plans/`): `projects/*/design/plans/*.md`, `projects/*/design/plans/done/*.md`,
+  `projects/*/design/plans/archived/*.md`  → `planning`, promoted over any spec record
+- Pass 3 (`status/`): `projects/*/status`  → `done` / an ended status (`abandoned`, `failed`,
+  `done_on_hold`) / `running` / `unrecognised-board-status` (status.md always wins). A `status:`
+  outside the board vocabulary is never guessed at, and a slug keyed by more than one board reads
+  `duplicate-status-boards`; both are refused, neither done nor selectable, until the board is
+  fixed or one remains
 
 Glob patterns come from config (`SurveyPatterns`), so the layout is a config default, not a
-hardcode. The defaults describe exactly the subtree above.
+hardcode. The defaults describe exactly the subtree above. The spec and plan globs are not
+written out by hand: `epic_survey._bucket_globs` derives them as the bucket root plus one glob per
+entry of `epic_survey.TERMINAL_PARTITIONS`, so the lists above are that tuple's current output.
 
 ## Scaffolding
 

@@ -73,6 +73,9 @@ def _cut_identity_global(tmp_path_factory, monkeypatch):
     # A system config can name an init.templateDir whose template writes keys into every
     # fixture repo; the allow-list tests would then fail for reasons of the machine.
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    # Every check run reads person.name from the environment config, so no test may reach the
+    # operator's real one: an empty home makes it "not measured" unless a test writes its own.
+    monkeypatch.setenv("AGENTFLOW_CONFIG", str(tmp_path_factory.mktemp("no-config")))
 
 
 def _repo(
@@ -91,6 +94,9 @@ def _repo(
         _git(repo, "config", "user.name", ident[0])
         _git(repo, "config", "user.email", ident[1])
     _git(repo, "config", "core.autocrlf", "false")
+    # git init writes true; cut-shape pins it to the false build_cut writes, and a fixture
+    # checked directly as a cut must carry build_cut's values.
+    _git(repo, "config", "core.logAllRefUpdates", "false")
     for rel, data in files.items():
         p = repo / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -145,9 +151,26 @@ def _waiver(heading: str = "## Waiver", **fields: str | None) -> str:
     return NL.join(["", heading, "", *bullets, ""])
 
 
-def _check(
+def _absent_lists(anchor: Path, extra: tuple[str, ...] = ()) -> list[str]:
+    """``--sensitive-terms`` and ``--sanitize-extra-pattern`` at paths that do not exist, for
+    whichever of the two ``extra`` does not already name, and none when ``extra`` names a
+    project (which derives them). The explicit route without either flag is cannot measure; a
+    named path that does not exist is the explicit "not configured" these fixtures mean."""
+    out: list[str] = []
+    if "--project" in extra:
+        return out
+    absent = anchor / "absent-local-lists"
+    if "--sensitive-terms" not in extra:
+        out += ["--sensitive-terms", str(absent / "sensitive-terms.txt")]
+    if "--sanitize-extra-pattern" not in extra:
+        out += ["--sanitize-extra-pattern", str(absent / "sanitize-extra-pattern.txt")]
+    return out
+
+
+def _bare_check(
     repo: Path, ledger: Path, *extra: str, host_ref: str = HOST_REF, source: Path | None = None
 ) -> list[str]:
+    """The explicit route exactly as given: no list flag is added."""
     return [
         "check",
         "--tree",
@@ -159,6 +182,15 @@ def _check(
         "--source",
         str(source or repo),
         *extra,
+    ]
+
+
+def _check(
+    repo: Path, ledger: Path, *extra: str, host_ref: str = HOST_REF, source: Path | None = None
+) -> list[str]:
+    return [
+        *_bare_check(repo, ledger, *extra, host_ref=host_ref, source=source),
+        *_absent_lists(ledger.parent, extra),
     ]
 
 
@@ -447,19 +479,21 @@ def test_ledger_fence_is_closed_only_by_its_own_kind(tmp_path, capsys, opener, i
     assert _line(out, "ledger-dated") == "FAIL ledger-dated 1 of 2 rows dated"
 
 
-def test_ledger_waiver_after_an_unclosed_fence_is_not_read(tmp_path, capsys):
-    """A fence never closed runs to the end of the file, so a pasted example that lost its
-    closing line fails closed rather than counting as the human's word. A closing run with
-    text after it is not a close either."""
+def test_ledger_with_an_unclosed_fence_is_unmeasurable(tmp_path, capsys):
+    """gh#798: a fence never closed hides the rest of the file, and whether that was meant or
+    a pasted example lost its closing line cannot be told, so the ledger is not measured:
+    exit 2 naming the line the fence opened on, never a count of what is left. A closing run
+    with text after it is not a close either."""
     repo = _repo(tmp_path, _base_files())
     for i, closer in enumerate(("", "``` trailing text")):
         ledger = _ledger(
             tmp_path, ["", ""], name=f"l{i}.md", tail=_fenced(_waiver(), "```", closer=closer)
         )
+        opened = ledger.read_text(encoding="utf-8").splitlines().index("```") + 1
         code = publish.main(_check(repo, ledger))
         out, _ = capsys.readouterr()
-        assert code == 1, (closer, out)
-        assert _line(out, "ledger-dated") == "FAIL ledger-dated 0 of 2 rows dated", closer
+        assert code == 2, (closer, out)
+        assert f"the fence opened on line {opened} never closes" in out, (closer, out)
 
 
 def test_ledger_near_miss_waiver_heading_is_named_by_line(tmp_path, capsys):
@@ -484,6 +518,361 @@ def test_ledger_near_miss_waiver_heading_is_named_by_line(tmp_path, capsys):
         "heading but are not exactly '## Waiver', so they waive nothing"
     )
     assert "(publish)" not in out and "(draft)" not in out
+
+
+@pytest.mark.parametrize("opener", ["<!--", "   <!-- filled in:"])
+def test_ledger_waiver_inside_an_html_comment_is_not_a_waiver(tmp_path, capsys, opener):
+    """gh#798: a waiver commented out with ``<!-- ... -->`` is hidden text, not the human's
+    recorded word, whether the opener is alone on its line or followed by text (indented up
+    to three spaces). Undated rows keep the FAIL and exit 1."""
+    tail = NL.join(["", opener, _waiver(), "-->", ""])
+    repo = _repo(tmp_path, _base_files())
+    ledger = _ledger(tmp_path, ["2026-09-01", ""], tail=tail)
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 1, out
+    assert _line(out, "ledger-dated") == "FAIL ledger-dated 1 of 2 rows dated"
+
+
+def test_ledger_waiver_after_a_closed_html_comment_is_honoured(tmp_path, capsys):
+    """The comment hides only its own span: a real waiver after it still passes, and a
+    comment's ``-->`` inside a fence neither opens nor closes anything."""
+    repo = _repo(tmp_path, _base_files())
+    tail = (
+        NL.join(["", "<!-- an example:", _waiver(waived_by="Example Person"), "-->"])
+        + _fenced("-->", "```")
+        + _waiver()
+    )
+    ledger = _ledger(tmp_path, ["2026-09-01", ""], tail=tail)
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "ledger-dated") == (
+        "PASS ledger-dated waived by Owner on 2026-09-30: 1 of 2 rows undated"
+    )
+
+
+def _raw_ledger(tmp_path: Path, name: str, *lines: str) -> Path:
+    path = tmp_path / name
+    path.write_text(NL.join(["# Key rotation ledger", "", *lines, ""]), encoding="utf-8")
+    return path
+
+
+def test_ledger_stray_comment_opener_in_a_cell_hides_no_rows(tmp_path, capsys):
+    """gh#798: a ``<!--`` in a table cell with no ``-->`` on its line is literal text, as GFM
+    renders it. Read as a comment running to the end of the file, it hid every row after it
+    and turned this FAIL 0 of 2 into a PASS 1 of 1; its cell is not a date either."""
+    repo = _repo(tmp_path, _base_files())
+    ledger = _raw_ledger(
+        tmp_path,
+        "stray.md",
+        "| # | name | rotated_on |",
+        "|---|---|---|",
+        "| 1 | `A` | 2026-01-01 <!-- todo |",
+        "| 2 | `B` | |",
+    )
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 1, out
+    assert _line(out, "ledger-dated") == "FAIL ledger-dated 0 of 2 rows dated"
+
+
+@pytest.mark.parametrize("empty", ["<!-->", "<!--->"])
+def test_an_empty_comment_block_hides_only_its_own_line(tmp_path, capsys, empty):
+    """GFM reads ``<!-->`` and ``<!--->`` as whole comments. Searching for their close past
+    the opener hid everything up to the next ``-->``, here the undated table, and let the
+    dated one below stand in for it: a false PASS."""
+    repo = _repo(tmp_path, _base_files())
+    ledger = _raw_ledger(
+        tmp_path,
+        "empty-comment.md",
+        empty,
+        "| # | name | rotated_on |",
+        "|---|---|---|",
+        "| 1 | `A` | |",
+        "",
+        "<!-- c -->",
+        "",
+        "| # | name | rotated_on |",
+        "|---|---|---|",
+        "| 1 | `A` | 2026-01-01 |",
+    )
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 1, out
+    # Both tables are visible, so both count; a hidden undated table would read PASS 1 of 1.
+    assert _line(out, "ledger-dated") == (
+        "FAIL ledger-dated 1 of 2 rows dated across 2 rotated_on tables"
+    )
+
+
+def test_a_pipe_inside_a_comment_ends_the_cell_as_it_renders(tmp_path, capsys):
+    """GFM splits a row on ``|`` before reading inline comments, so this rotated_on cell
+    renders as the literal ``<!-- x`` and is undated. Stripping the comment before splitting
+    read the date behind it: a false PASS."""
+    repo = _repo(tmp_path, _base_files())
+    ledger = _raw_ledger(
+        tmp_path,
+        "pipe-comment.md",
+        "| # | name | rotated_on |",
+        "|---|---|---|",
+        "| 1 | `A` | <!-- x | --> 2026-01-01 |",
+    )
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 1, out
+    assert _line(out, "ledger-dated") == "FAIL ledger-dated 0 of 1 rows dated"
+
+
+@pytest.mark.parametrize("opener", ["<!--", "   <!-- an example waiver:"])
+def test_ledger_with_an_unclosed_comment_block_is_unmeasurable(tmp_path, capsys, opener):
+    """gh#798: a comment block never closed hides the rest of the file, and what it hides
+    cannot be told from a lost ``-->``, so the ledger is not measured: exit 2 naming the
+    line it opened on, never the FAIL or PASS of the rows left visible."""
+    repo = _repo(tmp_path, _base_files())
+    ledger = _ledger(tmp_path, ["2026-09-01", ""], tail=NL.join(["", opener, _waiver()]))
+    opened = ledger.read_text(encoding="utf-8").splitlines().index(opener) + 1
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 2, out
+    assert f"the HTML comment opened on line {opened} never closes" in out, out
+
+
+def test_ledger_comment_opener_inside_inline_code_hides_nothing(tmp_path, capsys):
+    """gh#798: ``<!--`` inside an inline code span is code, in prose above the table and in
+    a cell alike, so neither hides the table nor the row after it."""
+    repo = _repo(tmp_path, _base_files())
+    ledger = _raw_ledger(
+        tmp_path,
+        "code-span.md",
+        "Write `<!--` to start a note.",
+        "",
+        "| # | name | rotated_on |",
+        "|---|---|---|",
+        "| 1 | `<!--` | 2026-01-01 |",
+        "| 2 | `B` | |",
+    )
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 1, out
+    assert _line(out, "ledger-dated") == "FAIL ledger-dated 1 of 2 rows dated"
+
+
+def _example_table(dates: list[str]) -> str:
+    rows = [f"| {i} | `EXAMPLE_{i}` | {d} |" for i, d in enumerate(dates, 1)]
+    return NL.join(["| # | name | rotated_on |", "|---|---|---|", *rows])
+
+
+def test_ledger_fenced_example_table_is_not_the_ledger(tmp_path, capsys):
+    """gh#798: an all-dated example table pasted in a fence ABOVE the real table is
+    documentation; the real table's undated row still fails. A ledger whose only rotated_on
+    table is fenced (or commented out) has no ledger table at all: cannot measure, exit 2."""
+    repo = _repo(tmp_path, _base_files())
+    real = _ledger(tmp_path, ["2026-09-01", ""]).read_text(encoding="utf-8")
+    ledger = tmp_path / "fenced-first.md"
+    ledger.write_text(
+        _fenced(_example_table(["2026-01-01", "2026-01-02", "2026-01-03"]), "```") + real,
+        encoding="utf-8",
+    )
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 1, out
+    assert _line(out, "ledger-dated") == "FAIL ledger-dated 1 of 2 rows dated"
+
+    for i, hidden in enumerate(
+        (
+            _fenced(_example_table(["2026-01-01"]), "~~~"),
+            NL.join(["<!--", _example_table(["2026-01-01"]), "-->"]),
+        )
+    ):
+        only = tmp_path / f"only-hidden-{i}.md"
+        only.write_text("# Key rotation ledger" + NL + hidden + NL, encoding="utf-8")
+        code = publish.main(_check(repo, only))
+        out, _ = capsys.readouterr()
+        assert code == 2, out
+        assert "has no table with a rotated_on column" in out, out
+
+
+def _two_tables(second: str, *, first_dates: tuple[str, ...] = ("2026-01-01",)) -> list[str]:
+    """A ledger body with a rotated_on table, a paragraph, then ``second`` (a later table)."""
+    first = [f"| {chr(97 + i)} | {d} |" for i, d in enumerate(first_dates)]
+    return [
+        "| key | rotated_on |",
+        "|---|---|",
+        *first,
+        "",
+        "## Addendum",
+        "",
+        "Rows added after the first pass.",
+        "",
+        second,
+    ]
+
+
+def test_ledger_counts_every_rotated_on_table_not_only_the_first(tmp_path, capsys):
+    """An undated row in a second rotated_on table (an addendum later in the ledger) fails the
+    same as one in the first; reading only the first table passed it."""
+    repo = _repo(tmp_path, _base_files())
+    second = NL.join(["| key | rotated_on |", "|---|---|", "| b |  |"])
+    ledger = _raw_ledger(tmp_path, "two-undated.md", *_two_tables(second))
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 1, out
+    assert _line(out, "ledger-dated") == (
+        "FAIL ledger-dated 1 of 2 rows dated across 2 rotated_on tables"
+    )
+
+    # control: both tables fully dated -> PASS, and the column index is per table
+    second = NL.join(["| rotated_on | key | note |", "|---|---|---|", "| 2026-02-02 | b | x |"])
+    ledger = _raw_ledger(tmp_path, "two-dated.md", *_two_tables(second))
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "ledger-dated") == (
+        "PASS ledger-dated 2 of 2 rows dated across 2 rotated_on tables"
+    )
+
+
+@pytest.mark.parametrize(
+    ("second", "want"),
+    [
+        (NL.join(["| key | rotated_on |", "| b | 2026-02-02 |"]), "has no separator row"),
+        (NL.join(["| key | rotated_on |", "|---|---|", "", "no rows"]), "has no rows"),
+        (
+            NL.join(["| key | note | rotated_on |", "|---|---|---|", "| b | 2026-02-02 |"]),
+            "a row of rotated_on table 2 has 2 cells, the header has 3",
+        ),
+    ],
+)
+def test_ledger_malformed_second_table_is_unmeasurable(tmp_path, capsys, second, want):
+    repo = _repo(tmp_path, _base_files())
+    ledger = _raw_ledger(tmp_path, "bad-second.md", *_two_tables(second))
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 2, out
+    assert "FAIL ledger-dated cannot measure" in out, out
+    assert want in out, out
+
+
+def test_ledger_hidden_second_table_is_still_ignored(tmp_path, capsys):
+    repo = _repo(tmp_path, _base_files())
+    undated = NL.join(["| key | rotated_on |", "|---|---|", "| b |  |"])
+    for i, hidden in enumerate((_fenced(undated, "```"), NL.join(["<!--", undated, "-->"]))):
+        ledger = _raw_ledger(tmp_path, f"hidden-second-{i}.md", *_two_tables(hidden))
+        code = publish.main(_check(repo, ledger))
+        out, _ = capsys.readouterr()
+        assert code == 0, out
+        assert _line(out, "ledger-dated") == "PASS ledger-dated 1 of 1 rows dated"
+
+
+def test_ledger_waiver_covers_undated_rows_across_every_table(tmp_path, capsys):
+    repo = _repo(tmp_path, _base_files())
+    second = NL.join(["| key | rotated_on |", "|---|---|", "| b |  |", "| c |  |"])
+    ledger = _raw_ledger(
+        tmp_path, "two-waived.md", *_two_tables(second, first_dates=("", "2026-01-01")), _waiver()
+    )
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "ledger-dated") == (
+        "PASS ledger-dated waived by Owner on 2026-09-30: "
+        "3 of 4 rows undated across 2 rotated_on tables"
+    )
+
+
+def test_ledger_blockquoted_table_is_unmeasurable_naming_its_line(tmp_path, capsys):
+    """A rotated_on table inside a blockquote renders as a table but was skipped, so its
+    undated row was never judged: a false PASS. It is refused, naming the line."""
+    repo = _repo(tmp_path, _base_files())
+    quoted = NL.join(["> | key | rotated_on |", "> |---|---|", "> | b |  |"])
+    ledger = _raw_ledger(tmp_path, "quoted.md", *_two_tables(quoted))
+    n = ledger.read_text(encoding="utf-8").splitlines().index("> | key | rotated_on |") + 1
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 2, out
+    assert _line(out, "ledger-dated").startswith("FAIL ledger-dated cannot measure"), out
+    assert f"line {n} holds a rotated_on table inside a blockquote" in out, out
+
+    # a quoted table inside a fence is documentation, as any fenced table is
+    ledger = _raw_ledger(tmp_path, "quoted-fenced.md", *_two_tables(_fenced(quoted, "```")))
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "ledger-dated") == "PASS ledger-dated 1 of 1 rows dated"
+
+
+def test_ledger_rotated_on_header_is_matched_without_regard_to_case(tmp_path, capsys):
+    """A ``Rotated_On`` header was not seen, so its table's rows were never judged."""
+    repo = _repo(tmp_path, _base_files())
+    for i, (date, code_want, want) in enumerate(
+        (
+            ("", 1, "FAIL ledger-dated 1 of 2 rows dated across 2 rotated_on tables"),
+            ("2026-02-02", 0, "PASS ledger-dated 2 of 2 rows dated across 2 rotated_on tables"),
+        )
+    ):
+        second = NL.join(["| key | Rotated_On |", "|---|---|", f"| b | {date} |"])
+        ledger = _raw_ledger(tmp_path, f"case-{i}.md", *_two_tables(second))
+        code = publish.main(_check(repo, ledger))
+        out, _ = capsys.readouterr()
+        assert code == code_want, out
+        assert _line(out, "ledger-dated") == want
+
+
+def test_ledger_table_with_two_rotated_on_columns_is_unmeasurable(tmp_path, capsys):
+    """Only the first of two rotated_on columns was read, so an undated second column passed."""
+    repo = _repo(tmp_path, _base_files())
+    second = NL.join(
+        ["| key | rotated_on | rotated_on |", "|---|---|---|", "| b | 2026-02-02 |  |"]
+    )
+    ledger = _raw_ledger(tmp_path, "two-cols.md", *_two_tables(second))
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 2, out
+    assert "FAIL ledger-dated cannot measure" in out, out
+    assert "rotated_on table 2 has 2 rotated_on columns; keep one" in out, out
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        # a second table with no blank line above it: GFM renders one table
+        ["| key | note | rotated_on |", "|---|---|---|", "| b | x | 2026-02-02 |"],
+        # a body row reading "rotated_on" over a placeholder row must not reset the columns
+        ["| rotated_on | b |", "| | |", "| 2026-01-02 | c |"],
+    ],
+)
+def test_ledger_header_directly_under_a_table_is_unmeasurable(tmp_path, capsys, rows):
+    """With no blank line between them GFM renders both as one table; reading the second
+    header as a new table could turn an undated row into a dated one, so it is refused."""
+    repo = _repo(tmp_path, _base_files())
+    ledger = _raw_ledger(
+        tmp_path, "adjacent.md", "| key | rotated_on |", "|---|---|", "| a | 2026-01-01 |", *rows
+    )
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 2, out
+    assert "line 6 starts a rotated_on table directly under the rotated_on table" in out, out
+    assert "add a blank line between the tables" in out, out
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        ">\t| key | rotated_on |",
+        "- > | key | rotated_on |",
+        "> | <!-- a | rotated_on | b --> |",
+    ],
+)
+def test_ledger_blockquote_forms_are_refused_not_skipped(tmp_path, capsys, header):
+    """A tab after the quote marker, a quote inside a list item, and cells split from the raw
+    row (as a table row is) all still name the blockquote."""
+    repo = _repo(tmp_path, _base_files())
+    quoted = NL.join([header, "> |---|---|---|", "> | b |  |  |"])
+    ledger = _raw_ledger(tmp_path, "quoted-form.md", *_two_tables(quoted))
+    code = publish.main(_check(repo, ledger))
+    out, _ = capsys.readouterr()
+    assert code == 2, out
+    assert "inside a blockquote" in out, out
 
 
 def test_ledger_missing_or_rowless_exits_2_never_0(tmp_path, capsys, monkeypatch):
@@ -625,9 +1014,10 @@ def test_sanitize_terms_unions_the_extra_pattern_and_names_its_sources(tmp_path,
     code = publish.main(_check(repo, ledger))
     out, _ = capsys.readouterr()
     assert code == 0, out
+    absent = ledger.parent / "absent-local-lists" / "sanitize-extra-pattern.txt"
     assert _line(out, "sanitize-terms") == (
         f"PASS sanitize-terms 0 matches over {len(files)} text files (ci.yml pattern; extra "
-        "pattern not configured: no --sanitize-extra-pattern and no --project)"
+        f"pattern not configured: {absent} does not exist)"
     )
 
     extra = _extra_file(tmp_path)
@@ -821,6 +1211,7 @@ def test_no_check_prints_a_path_that_holds_a_term(tmp_path, capsys):
         source=repo,
         dropped=[f"{TERM_WORD}_old/.env"],
         sensitive_terms=terms,
+        sanitize_extra=tmp_path / "absent-local-lists" / "sanitize-extra-pattern.txt",
     )
     text = NL.join(lines)
     assert code == 1, text
@@ -869,13 +1260,35 @@ def test_sensitive_terms_absent_list_is_not_configured_and_passes(tmp_path, caps
     assert _line(out, "sensitive-terms") == (
         f"PASS sensitive-terms not configured: {missing} does not exist"
     )
-    # explicit routing flags with no project: there is no data root to look in
-    code = publish.main(_check(repo, ledger))
+    # explicit routing flags with no project and no list flag: there is no data root to look
+    # in, so the guard cannot run, and that is cannot measure, never a pass
+    code = publish.main(_bare_check(repo, ledger))
     out, _ = capsys.readouterr()
-    assert code == 0, out
-    assert _line(out, "sensitive-terms") == (
-        "PASS sensitive-terms not configured: no --sensitive-terms and no --project"
+    assert code == 2, out
+    assert _line(out, "sensitive-terms") == NO_TERMS_FLAG_LINE
+
+
+def test_a_direct_run_check_with_no_list_paths_cannot_measure(tmp_path):
+    """A direct caller of run_check that passes neither the terms list nor the extra pattern,
+    and no ``why``, never scanned for either: both lines are cannot measure and the run exits
+    2, never the pass a check that looked and found nothing would print."""
+    terms, early = publish._load_sensitive_terms(None)
+    assert terms == []
+    assert early is not None and early.status == publish.UNMEASURABLE
+    assert early.detail.startswith("no terms list path was given"), early.detail
+
+    repo = _repo(tmp_path, _base_files())
+    code, lines = publish.run_check(
+        repo, ledger=_ledger(tmp_path, ["2026-09-01"]), host_ref=HOST_REF, source=repo
     )
+    text = NL.join(lines)
+    assert code == 2, text
+    assert _line(text, "sensitive-terms").startswith(
+        "FAIL sensitive-terms cannot measure - no terms list path was given"
+    ), text
+    assert _line(text, "sanitize-terms").startswith(
+        "FAIL sanitize-terms cannot measure - no extra pattern path was given"
+    ), text
 
 
 def test_sensitive_terms_skip_blank_lines_and_whole_line_comments(tmp_path, capsys):
@@ -935,6 +1348,116 @@ def test_sensitive_terms_list_defaults_to_the_projects_data_root(tmp_path, capsy
     )
     assert "  notes.md:1 (list line 1)" in out.splitlines()
     _assert_no_term(out + err, TERM_WORD)
+
+
+NO_TERMS_FLAG_LINE = (
+    "FAIL sensitive-terms cannot measure - no terms list path: no --project and no "
+    "--sensitive-terms; pass --sensitive-terms <path> (or --project <name>)"
+)
+NO_EXTRA_FLAG_LINE = (
+    "FAIL sanitize-terms cannot measure - no extra pattern path: no --project and no "
+    "--sanitize-extra-pattern; pass --sanitize-extra-pattern <path> (or --project <name>)"
+)
+
+
+def _project_lists(tmp_path: Path, src: Path, monkeypatch) -> tuple[Path, Path]:
+    """A ``demo`` project whose data root holds a terms list naming TERM_WORD and an extra
+    pattern matching EXTRA_HOST: the lists ``--project`` finds."""
+    from agentflow.sanitize_extra import EXTRA_PATTERN_RELPATH
+
+    _scratch_home(tmp_path, src, monkeypatch, notify="kind: none")
+    project_dir = tmp_path / "data" / "projects" / "demo"
+    terms = project_dir / publish.SENSITIVE_TERMS_RELPATH
+    terms.parent.mkdir(parents=True)
+    terms.write_text(f"{TERM_WORD}\n", encoding="utf-8")
+    extra = project_dir / EXTRA_PATTERN_RELPATH
+    extra.write_text(EXTRA_FILE_TEXT, encoding="utf-8")
+    return terms, extra
+
+
+def test_explicit_route_without_the_list_flags_cannot_measure(tmp_path, capsys, monkeypatch):
+    """The explicit-flag route has no data root, so it never finds the lists ``--project``
+    finds. A cut holding a listed term and an extra-pattern match must not pass there: both
+    guards are cannot measure, naming the flag to pass, and the run exits 2."""
+    files = {**_base_files(), "notes.md": f"hi {TERM_WORD} on {EXTRA_HOST}\n".encode()}
+    src = _repo(tmp_path, files)
+    _project_lists(tmp_path, src, monkeypatch)
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+
+    # control: the same cut through --project fails both guards
+    code = publish.main(_bare_check(src, ledger, "--project", "demo"))
+    out, err = capsys.readouterr()
+    assert code == 1, out
+    assert _line(out, "sensitive-terms").startswith("FAIL sensitive-terms 1 location(s) ")
+    assert _line(out, "sanitize-terms").startswith("FAIL sanitize-terms 1 line(s) ")
+
+    code = publish.main(_bare_check(src, ledger))
+    out, err = capsys.readouterr()
+    assert code == 2, out
+    assert _line(out, "sensitive-terms") == NO_TERMS_FLAG_LINE
+    assert _line(out, "sanitize-terms") == NO_EXTRA_FLAG_LINE
+    _assert_no_term(out + err, TERM_WORD, EXTRA_HOST)
+
+
+def test_explicit_route_with_one_list_flag_still_needs_the_other(tmp_path, capsys):
+    """Each flag closes only its own guard: with ``--sensitive-terms`` naming the term, that
+    line fails on the hit, and the missing extra pattern is still cannot measure."""
+    src = _repo(tmp_path, {**_base_files(), "notes.md": f"hi {TERM_WORD}\n".encode()})
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    terms = _terms(tmp_path, f"{TERM_WORD}\n")
+    code = publish.main(_bare_check(src, ledger, "--sensitive-terms", str(terms)))
+    out, err = capsys.readouterr()
+    assert code == 2, out
+    assert _line(out, "sensitive-terms") == (
+        f"FAIL sensitive-terms 1 location(s) match a term on the local list {terms}"
+    )
+    assert "  notes.md:1 (list line 1)" in out.splitlines()
+    assert _line(out, "sanitize-terms") == NO_EXTRA_FLAG_LINE
+    _assert_no_term(out + err, TERM_WORD)
+
+
+def test_explicit_route_with_both_list_flags_and_a_clean_cut_passes(tmp_path, capsys):
+    files = _base_files()
+    src = _repo(tmp_path, files)
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    terms = _terms(tmp_path, f"{TERM_WORD}\n")
+    extra = _extra_file(tmp_path)
+    code = publish.main(
+        _bare_check(
+            src, ledger, "--sensitive-terms", str(terms), "--sanitize-extra-pattern", str(extra)
+        )
+    )
+    out, _ = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "sensitive-terms") == (
+        f"PASS sensitive-terms 0 matches for 1 term(s) from {terms} over {len(files)} files"
+    )
+    assert _line(out, "sanitize-terms") == (
+        f"PASS sanitize-terms 0 matches over {len(files)} text files "
+        f"(ci.yml pattern + extra pattern from {extra})"
+    )
+
+
+def test_a_project_without_the_lists_is_still_not_configured(tmp_path, capsys, monkeypatch):
+    """A named project whose ``publish/`` folder holds neither file switches the guards off,
+    not on: both lines say ``not configured`` with the path looked at, and pass."""
+    from agentflow.sanitize_extra import EXTRA_PATTERN_RELPATH
+
+    files = _base_files()
+    src = _repo(tmp_path, files)
+    _scratch_home(tmp_path, src, monkeypatch, notify="kind: none")
+    project_dir = tmp_path / "data" / "projects" / "demo"
+    code = publish.main(_bare_check(src, _ledger(tmp_path, ["2026-09-01"]), "--project", "demo"))
+    out, _ = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "sensitive-terms") == (
+        "PASS sensitive-terms not configured: "
+        f"{project_dir / publish.SENSITIVE_TERMS_RELPATH} does not exist"
+    )
+    assert _line(out, "sanitize-terms") == (
+        f"PASS sanitize-terms 0 matches over {len(files)} text files (ci.yml pattern; extra "
+        f"pattern not configured: {project_dir / EXTRA_PATTERN_RELPATH} does not exist)"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1149,8 +1672,8 @@ def test_cut_shape_refuses_every_key_outside_the_allow_list(tmp_path, capsys, ke
 
 
 def test_cut_shape_passes_plain_git_init_and_build_cut_config(tmp_path, capsys):
-    """Controls: neither what `git init` writes on this platform nor what build_cut adds is
-    refused, so the allow-list is not failing genuine cuts."""
+    """Controls: neither the keys `git init` writes on this platform nor what build_cut adds
+    are refused, so the allow-list is not failing genuine cuts."""
     ledger = _ledger(tmp_path, ["2026-09-01"])
 
     def local_keys(repo: Path) -> set[str]:
@@ -1182,6 +1705,115 @@ def test_cut_shape_fails_core_hookspath(tmp_path, capsys):
     assert code == 1, out
     assert _line(out, "cut-shape") == "FAIL cut-shape 1 problem(s); rebuild the cut"
     assert "core.hooksPath is set, want unset" in out
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("core.repositoryformatversion", "00"),  # git reads 0; git init writes "0"
+        ("core.filemode", "yes"),
+        ("core.bare", "true"),
+        ("core.logallrefupdates", "always"),
+        ("core.logallrefupdates", "true"),  # what git init writes; build_cut overrides it
+        ("core.symlinks", "1"),
+        ("core.ignorecase", "on"),
+        ("core.precomposeunicode", "yes"),
+        ("core.autocrlf", "input"),
+        ("core.safecrlf", "warn"),
+    ],
+)
+def test_cut_shape_fails_an_allowed_key_at_a_value_build_cut_never_writes(tmp_path, key, value):
+    # A permitted name can carry a value that changes the repo under the push, so the value
+    # is pinned too. Read through check_cut_shape alone: a bare repo, say, stops other checks.
+    repo = _repo(tmp_path, _base_files())
+    _git(repo, "config", key, value)
+    assert _git(repo, "config", "--get", key) == value  # control: git holds it
+    result = publish.check_cut_shape(repo)
+    # The verdict first, so code that judges names only fails here on its PASS rather than on
+    # a missing value table.
+    assert (result.status, result.detail) == (publish.FAIL, "1 problem(s); rebuild the cut")
+    allowed = " or ".join(sorted(publish.ALLOWED_CONFIG_VALUES[key]))
+    assert result.extra == (
+        "1 allow-listed config key(s) at a value git init and build_cut never write: "
+        f"local {key} = {value!r}, want {allowed}",
+    )
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [("extensions.objectformat", "fixture-format"), ("extensions.refstorage", "fixture-backend")],
+)
+def test_cut_shape_never_passes_an_extension_value_git_rejects(tmp_path, key, value):
+    # git itself refuses to open a repo with an unknown format, which is "cannot measure"
+    repo = _repo(tmp_path, _base_files())
+    cfg = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-dir")) / "config"
+    section, _, var = key.partition(".")
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8") + f"[{section}]\n\t{var} = {value}\n", encoding="utf-8"
+    )
+    result = publish.check_cut_shape(repo)
+    assert result.status in (publish.FAIL, publish.UNMEASURABLE), result
+
+
+def test_cut_shape_reads_boolean_values_case_insensitively(tmp_path, capsys):
+    # git reads FALSE as false, so a re-cased boolean is the same value, not a refusal
+    repo = _repo(tmp_path, _base_files())
+    _git(repo, "config", "core.bare", "FALSE")
+    _git(repo, "config", "core.autocrlf", "False")
+    code, out = _shape_problems(repo, _ledger(tmp_path, ["2026-09-01"]), capsys)
+    assert code == 0, out
+    assert _line(out, "cut-shape").startswith("PASS cut-shape")
+
+
+def test_cut_shape_fails_an_allowed_key_with_no_value(tmp_path):
+    # `[core] bare` with no `=` reads as true; git init never writes a key that way
+    repo = _repo(tmp_path, _base_files())
+    cfg = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-dir")) / "config"
+    cfg.write_text(cfg.read_text(encoding="utf-8") + "[core]\n\tbare\n", encoding="utf-8")
+    result = publish.check_cut_shape(repo)
+    assert result.status == publish.FAIL, result
+    assert any("local core.bare = (no value), want false" in x for x in result.extra), result
+
+
+@pytest.mark.parametrize("content", ["", "fixture-objects-dir\n"])
+def test_cut_shape_fails_objects_info_alternates(tmp_path, capsys, content):
+    # A cut borrowing another repo's object store passed every other check.
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    src = _repo(tmp_path, _base_files(), ident=SOURCE_IDENT)
+    out_dir = tmp_path / "cut"
+    assert publish.main(_cut(src, out_dir, ledger)) == 0
+    capsys.readouterr()
+    common = Path(_git(out_dir, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    alternates = common / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    alternates.write_text(content, encoding="utf-8")
+    code, out = _shape_problems(out_dir, ledger, capsys)
+    assert code == 1, out
+    assert _line(out, "cut-shape") == "FAIL cut-shape 1 problem(s); rebuild the cut"
+    assert (
+        "objects/info/alternates is present, want none: build_cut never writes one, and it "
+        "borrows another repo's objects; delete the cut and build it again"
+    ) in out
+
+
+def test_cut_shape_fails_a_dangling_alternates_symlink(tmp_path, capsys):
+    # A link whose target is gone is still a file at that path; exists() would miss it.
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    src = _repo(tmp_path, _base_files(), ident=SOURCE_IDENT)
+    out_dir = tmp_path / "cut"
+    assert publish.main(_cut(src, out_dir, ledger)) == 0
+    capsys.readouterr()
+    common = Path(_git(out_dir, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    alternates = common / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        alternates.symlink_to(tmp_path / "no-such-target")
+    except OSError:
+        pytest.skip("symlinks are not available here")
+    assert not alternates.exists() and os.path.lexists(alternates)  # control: dangling
+    code, out = _shape_problems(out_dir, ledger, capsys)
+    assert code == 1, out
+    assert "objects/info/alternates is present, want none" in out
 
 
 def test_cut_shape_fails_a_hook_file_and_allows_git_sample_hooks(tmp_path, capsys):
@@ -1369,6 +2001,36 @@ def test_install_evidence_says_what_it_could_not_measure(tmp_path, capsys):
     assert f"verified tree {absent} is not in the source checkout" in _line(out, "install-evidence")
 
 
+def test_install_evidence_names_a_bad_source_apart_from_a_missing_tree(tmp_path, capsys):
+    """A --source that does not exist or is not a repository is named as such; only a real
+    checkout lacking the verified tree is told to fetch it."""
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    absent = "0123456789abcdef" * 2 + "01234567"
+    repo = _repo(tmp_path, {**_base_files(), "docs/INSTALL.md": _install_doc(absent)}, name="cut")
+    missing = tmp_path / "no-such-checkout"
+    plain = tmp_path / "plain-dir"
+    plain.mkdir()
+    a_file = tmp_path / "a-file"
+    a_file.write_text("x", encoding="utf-8")
+    nested = repo / "nested-dir"
+    nested.mkdir()
+    want = {
+        missing: f"not measured: source checkout {missing} does not exist",
+        a_file: f"not measured: source {a_file} is not a directory",
+        plain: f"not measured: {plain} is not a git repository",
+        nested: f"not measured: {nested} is inside a git repository but is not its top level",
+        repo: f"not measured: verified tree {absent} is not in the source checkout; "
+        "fetch it or re-run the Linux drill",
+    }
+    for source, message in want.items():
+        code = publish.main(_check(repo, ledger, source=source))
+        out, _ = capsys.readouterr()
+        assert code == 0, out
+        line = _line(out, "install-evidence")
+        assert line == f"REPORT install-evidence {message}", line
+        assert ("fetch it" in line) == (source == repo), line
+
+
 def test_install_evidence_parses_the_real_last_verified_line():
     # The line's wording is the parser's contract; a reworded INSTALL.md must fail here, not
     # turn the report into a silent "cites no tree id".
@@ -1377,9 +2039,414 @@ def test_install_evidence_parses_the_real_last_verified_line():
 
 
 # --------------------------------------------------------------------------- #
+# person-name (report only)
+# --------------------------------------------------------------------------- #
+#: An invented name. The real one comes from config and is never written into a tracked file.
+OPERATOR = "Pat Example-Operator"
+COPYRIGHT_LICENSE = f"MIT License\n\nCopyright (c) 2026 {OPERATOR}\n\nPermission is granted.\n"
+
+
+def _person_home(tmp_path: Path, monkeypatch, name: str = OPERATOR) -> Path:
+    """A scratch AGENTFLOW_CONFIG home holding only an environment file naming ``name``."""
+    d = str(tmp_path).replace(chr(92), "/")
+    (tmp_path / "data").mkdir(exist_ok=True)
+    home = tmp_path / "person-config"
+    _write_config(
+        home,
+        "environment.md",
+        f"""
+        schema_version: 1
+        person:
+          name: {name}
+        data_root: {d}/data
+        git_host:
+          kind: local
+        notify:
+          kind: none
+        lock_dir: {d}
+        shell: posix
+        suite_root: {d}
+        worktree_root: {d}
+    """,
+    )
+    monkeypatch.setenv("AGENTFLOW_CONFIG", str(home))
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    return home
+
+
+def _assert_no_person(*texts: str) -> None:
+    for text in texts:
+        assert OPERATOR.casefold() not in text.casefold(), "the personal name reached the output"
+
+
+def _person_hits(out: str) -> list[str]:
+    """The indented hit lines under the person-name head line."""
+    lines = out.splitlines()
+    i = lines.index(_line(out, "person-name"))
+    hits = []
+    for ln in lines[i + 1 :]:
+        if not ln.startswith("  "):
+            break
+        hits.append(ln.strip())
+    return hits
+
+
+def test_person_name_in_docs_reports_one_path_line_and_exit_0(tmp_path, capsys, monkeypatch):
+    """All three routing flags explicit and no --project: the name still comes from config."""
+    _person_home(tmp_path, monkeypatch)
+    files = {
+        **_base_files(),
+        "LICENSE": COPYRIGHT_LICENSE.encode(),
+        # lower case on purpose: the match ignores case, as the residue check's does
+        "docs/notes.md": f"# Notes\n\nwritten by {OPERATOR.lower()}\n".encode(),
+    }
+    repo = _repo(tmp_path, files)
+    code = publish.main(_check(repo, _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "person-name") == "REPORT person-name 1 line(s)"
+    assert _person_hits(out) == ["docs/notes.md:3"]
+    _assert_no_person(out, err)
+
+
+def test_person_name_license_copyright_line_alone_is_zero(tmp_path, capsys, monkeypatch):
+    _person_home(tmp_path, monkeypatch)
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    repo = _repo(tmp_path, {**_base_files(), "LICENSE": COPYRIGHT_LICENSE.encode()})
+    code = publish.main(_check(repo, ledger))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "person-name") == "REPORT person-name 0 line(s)"
+    assert _person_hits(out) == []
+    _assert_no_person(out, err)
+
+    # exactly one line is exempt: the name on any other LICENSE line is a hit
+    second = COPYRIGHT_LICENSE + f"Maintained by {OPERATOR}.\n"
+    repo = _repo(tmp_path, {**_base_files(), "LICENSE": second.encode()}, name="second")
+    code = publish.main(_check(repo, ledger))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "person-name") == "REPORT person-name 1 line(s)"
+    assert _person_hits(out) == ["LICENSE:6"]
+    _assert_no_person(out, err)
+
+
+def test_person_name_unloadable_config_is_not_measured(tmp_path, capsys):
+    """The autouse fixture points AGENTFLOW_CONFIG at an empty directory."""
+    repo = _repo(tmp_path, {**_base_files(), "docs/notes.md": f"by {OPERATOR}\n".encode()})
+    code = publish.main(_check(repo, _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    line = _line(out, "person-name")
+    assert line.startswith(
+        "REPORT person-name not measured: person.name not resolved: the environment config "
+        "did not load"
+    ), line
+    assert "--person-name" in line, line
+    assert _person_hits(out) == []
+    _assert_no_person(out, err)
+
+
+def test_person_name_failure_does_not_blank_the_routing_fields(tmp_path):
+    repo = _repo(tmp_path, _base_files())
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    r = publish._resolve(publish.build_parser().parse_args(_check(repo, ledger)))
+    assert r.person_name is None
+    assert set(r.why) == {"person"}
+    assert "the environment config did not load" in r.why["person"]
+    assert (r.ledger, r.host_ref, r.source) == (ledger, HOST_REF, repo)
+
+
+def test_person_name_is_read_with_every_routing_flag_explicit(tmp_path, monkeypatch):
+    _person_home(tmp_path, monkeypatch)
+    repo = _repo(tmp_path, _base_files())
+    args = _check(repo, _ledger(tmp_path, ["2026-09-01"]))
+    r = publish._resolve(publish.build_parser().parse_args(args))
+    assert r.person_name == OPERATOR
+    assert "person" not in r.why
+
+
+def test_person_name_never_printed_even_in_a_path(tmp_path, capsys, monkeypatch):
+    _person_home(tmp_path, monkeypatch)
+    history = _repo(tmp_path, {"a.txt": b"a\n"}, name="history")
+    sha = _git(history, "rev-parse", "HEAD")
+    files = {
+        **_base_files(),
+        "LICENSE": COPYRIGHT_LICENSE.encode(),
+        f"docs/{OPERATOR}.md": f"{OPERATOR} cites {sha}\n".encode(),
+    }
+    repo = _repo(tmp_path, files)
+    code = publish.main(_check(repo, _ledger(tmp_path, ["2026-09-01"]), source=history))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "person-name") == "REPORT person-name 1 line(s)"
+    [hit] = _person_hits(out)
+    assert re.fullmatch(r"<cut path #\d+>:1", hit), hit
+    assert re.search(rf"<cut path #\d+>:1 {sha}", out), out  # other checks mask it too
+    _assert_no_person(out, err)
+
+
+def test_person_name_override_flag_wins_without_config(tmp_path, capsys):
+    repo = _repo(tmp_path, {**_base_files(), "docs/notes.md": f"by {OPERATOR}\n".encode()})
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    code = publish.main(_check(repo, ledger, "--person-name", OPERATOR))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "person-name") == "REPORT person-name 1 line(s)"
+    assert _person_hits(out) == ["docs/notes.md:1"]
+    _assert_no_person(out, err)
+
+
+#: Each part of the invented name, checked case-sensitively so "path" does not trip "Pat".
+OPERATOR_PARTS = (OPERATOR, "Pat", "Example", "Operator")
+
+
+def _assert_no_person_part(*texts: str) -> None:
+    _assert_no_person(*texts)
+    for text in texts:
+        for part in OPERATOR_PARTS:
+            assert part not in text, "a part of the personal name reached the output"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [f"{OPERATOR}: oops", f'"{OPERATOR}'],
+    ids=["second-colon", "unclosed-quote"],
+)
+def test_person_name_yaml_error_on_its_line_never_prints_it(
+    tmp_path, capsys, monkeypatch, bad_value
+):
+    """PyYAML's message quotes the offending source line; the why must not carry it."""
+    _person_home(tmp_path, monkeypatch, name=bad_value)
+    repo = _repo(tmp_path, {**_base_files(), "docs/notes.md": f"by {OPERATOR}\n".encode()})
+    code = publish.main(_check(repo, _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    line = _line(out, "person-name")
+    assert line.startswith(
+        "REPORT person-name not measured: person.name not resolved: the environment config "
+        "did not load: "
+    ), line
+    assert "invalid YAML (" in line and "of its yaml block" in line, line
+    assert _person_hits(out) == []
+    _assert_no_person_part(out, err)
+
+
+def _edit_environment(home: Path, old: str, new: str) -> None:
+    env = home / "environment.md"
+    text = env.read_text(encoding="utf-8")
+    assert old in text
+    env.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("person:\n", f"person:\n  {OPERATOR}: 1\n"),
+        ("schema_version: 1\n", f"schema_version: 1\n{OPERATOR}: 1\n"),
+    ],
+    ids=["key-under-person", "top-level-key"],
+)
+def test_person_name_unknown_key_holding_the_name_never_prints_it(
+    tmp_path, capsys, monkeypatch, old, new
+):
+    """config's field path for an unknown key is the key's own text; the why must not echo it."""
+    home = _person_home(tmp_path, monkeypatch)
+    _edit_environment(home, old, new)
+    repo = _repo(tmp_path, {**_base_files(), "docs/notes.md": f"by {OPERATOR}\n".encode()})
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    for argv in (_check(repo, ledger), _cut(repo, tmp_path / "cut", ledger)):
+        code = publish.main(argv)
+        out, err = capsys.readouterr()
+        assert code == 0, out
+        assert _line(out, "person-name").startswith("REPORT person-name not measured: "), out
+        _assert_no_person_part(out, err)
+
+
+def _person_project_home(tmp_path: Path, monkeypatch, src: Path) -> Path:
+    """``_person_home`` plus a ``demo`` project, so a run can route by ``--project`` alone."""
+    home = _person_home(tmp_path, monkeypatch)
+    _write_config(
+        home / "projects",
+        "demo.md",
+        f"""
+        schema_version: 1
+        name: demo
+        canonical_repo:
+          host_ref: {HOST_REF}
+          local_checkout: {str(src).replace(chr(92), "/")}
+        verification:
+          strategy: test-suite
+    """,
+    )
+    return home
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("schema_version: 1\n", f"schema_version: 1\n{OPERATOR}: 1\n"),
+        ("shell: posix\n", f"shell: {OPERATOR}\n"),
+        ("shell: posix\n", "shell: posix\nmtime_cutoff_iso: 2026-13-45\n"),
+        ("schema_version: 1\n", "schema_version: 1\nx: " + "[" * 5000 + "]" * 5000 + "\n"),
+    ],
+    ids=["unknown-key", "bad-choice-value", "bad-date-valueerror", "deep-nesting"],
+)
+def test_project_routed_run_never_prints_the_name_from_a_broken_environment(
+    tmp_path, capsys, monkeypatch, old, new
+):
+    """``--project`` reloads the environment for the data-root paths. That second load must name
+    the kind of failure, not quote the config, and must not crash on what the person lookup
+    survives. This is the route the runbook uses."""
+    src = _repo(tmp_path, {**_base_files(), "docs/notes.md": f"by {OPERATOR}\n".encode()})
+    home = _person_project_home(tmp_path, monkeypatch, src)
+    _edit_environment(home, old, new)
+    for argv in (
+        ["check", "--tree", str(src), "--project", "demo"],
+        ["cut", "--rev", "HEAD", "--out", str(tmp_path / "cut"), "--author-email", NOREPLY,
+         "--project", "demo"],
+    ):
+        code = publish.main(argv)
+        out, err = capsys.readouterr()
+        assert isinstance(code, int)
+        assert "not resolved" in out + err, out + err
+        _assert_no_person_part(out, err)
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("shell: posix\n", "shell: posix\nmtime_cutoff_iso: 2026-13-45\n"),
+        ("schema_version: 1\n", "schema_version: 1\nx: " + "[" * 5000 + "]" * 5000 + "\n"),
+    ],
+    ids=["bad-date-valueerror", "deep-nesting"],
+)
+def test_person_name_unexpected_load_error_blanks_only_this_report(
+    tmp_path, capsys, monkeypatch, old, new
+):
+    """A config the loader cannot parse must not crash check: only this report goes unmeasured."""
+    home = _person_home(tmp_path, monkeypatch)
+    _edit_environment(home, old, new)
+    repo = _repo(tmp_path, {**_base_files(), "docs/notes.md": f"by {OPERATOR}\n".encode()})
+    code = publish.main(_check(repo, _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 0, out + err
+    assert _line(out, "person-name").startswith("REPORT person-name not measured: "), out
+    _assert_no_person_part(out, err)
+
+
+def test_person_name_non_utf8_config_is_not_measured(tmp_path, capsys, monkeypatch):
+    home = _person_home(tmp_path, monkeypatch)
+    env = home / "environment.md"
+    env.write_bytes(env.read_bytes().replace(b"shell: posix", b"shell: posix\n# \xff\xfe"))
+    repo = _repo(tmp_path, {**_base_files(), "docs/notes.md": f"by {OPERATOR}\n".encode()})
+    code = publish.main(_check(repo, _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert "not valid UTF-8" in _line(out, "person-name"), out
+    _assert_no_person_part(out, err)
+
+
+def test_person_name_empty_in_config_is_not_measured(tmp_path, capsys, monkeypatch):
+    _person_home(tmp_path, monkeypatch, name="''")
+    repo = _repo(tmp_path, {**_base_files(), "docs/notes.md": f"by {OPERATOR}\n".encode()})
+    code = publish.main(_check(repo, _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "person-name").startswith(
+        "REPORT person-name not measured: person.name not resolved: the name is empty or blank"
+    ), out
+    assert _person_hits(out) == []
+
+
+def test_person_name_direct_call_without_a_name_is_not_measured(tmp_path):
+    repo = _repo(tmp_path, _base_files())
+    _, lines = publish.run_check(
+        repo, ledger=_ledger(tmp_path, ["2026-09-01"]), host_ref=HOST_REF, source=repo
+    )
+    assert _line(NL.join(lines), "person-name") == (
+        "REPORT person-name not measured: person.name not resolved: no name was given to the check"
+    )
+
+
+def test_person_name_only_the_first_license_copyright_line_is_exempt(tmp_path, capsys, monkeypatch):
+    _person_home(tmp_path, monkeypatch)
+    two = COPYRIGHT_LICENSE + f"Copyright (c) 2027 {OPERATOR}\n"
+    repo = _repo(tmp_path, {**_base_files(), "LICENSE": two.encode()})
+    code = publish.main(_check(repo, _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert _person_hits(out) == ["LICENSE:6"]
+    _assert_no_person(out, err)
+
+
+def test_person_name_copyright_without_c_is_not_exempt(tmp_path, capsys, monkeypatch):
+    _person_home(tmp_path, monkeypatch)
+    lic = f"MIT License\n\nCopyright 2026 {OPERATOR}\n"
+    repo = _repo(tmp_path, {**_base_files(), "LICENSE": lic.encode()})
+    code = publish.main(_check(repo, _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert _person_hits(out) == ["LICENSE:3"]
+    _assert_no_person(out, err)
+
+
+def test_person_name_in_a_binary_file_is_not_reported(tmp_path, capsys, monkeypatch):
+    _person_home(tmp_path, monkeypatch)
+    files = {
+        **_base_files(),
+        "assets/blob.bin": b"\x00\x01" + OPERATOR.encode() + b"\n",
+        "docs/notes.md": f"by {OPERATOR}\n".encode(),
+    }
+    repo = _repo(tmp_path, files)
+    code = publish.main(_check(repo, _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert _person_hits(out) == ["docs/notes.md:1"]
+    _assert_no_person(out, err)
+
+
+def test_runbook_documents_the_person_name_report():
+    text = " ".join((REPO_ROOT / "docs" / "runbooks" / "publish.md").read_text("utf-8").split())
+    start = text.index("3. **No personal literals.**")
+    precondition_3 = text[start : text.index("4. **The `wiki/` pillar", start)]
+    assert "`person-name`" in precondition_3
+    assert "every text file in the cut" in precondition_3
+    assert "the `Copyright (c)` line of `LICENSE` is exempt" in precondition_3
+    row = re.search(r"\| `person-name` \|[^|]*\|([^|]*)\|", text)
+    assert row, "the REPORT table has no person-name row"
+    assert "Nothing is required" in row.group(1) and "read each hit" in row.group(1)
+
+
+def test_runbook_names_every_line_an_environment_error_blocks():
+    """The dry-run proof must name all four lines an environment config error reaches, the
+    per-check flags, and a fresh directory for the re-run (the cut never overwrites)."""
+    text = " ".join((REPO_ROOT / "docs" / "runbooks" / "publish.md").read_text("utf-8").split())
+    start = text.index("**Proof:** it exits `0`")
+    proof = text[start : text.index("**Record the printed source sha and tree id.**", start)]
+    assert "blocks only the ledger path" not in proof
+    for line in ("`ledger-dated`", "`sanitize-terms`", "`sensitive-terms`", "`person-name`"):
+        assert line in proof, line
+    for flag in ("--ledger", "--sanitize-extra-pattern", "--sensitive-terms", "--person-name"):
+        assert f"`{flag}" in proof, flag
+    assert "fresh empty directory" in proof
+    assert "`REFUSED`" in proof
+
+
+# --------------------------------------------------------------------------- #
 # cut
 # --------------------------------------------------------------------------- #
 def _cut(source: Path, out: Path, ledger: Path, *extra: str, email: str = NOREPLY) -> list[str]:
+    return [
+        *_bare_cut(source, out, ledger, *extra, email=email),
+        *_absent_lists(ledger.parent, extra),
+    ]
+
+
+def _bare_cut(
+    source: Path, out: Path, ledger: Path, *extra: str, email: str = NOREPLY
+) -> list[str]:
+    """The explicit ``cut`` route exactly as given: no list flag is added."""
     return [
         "cut",
         "--rev",
@@ -1402,6 +2469,31 @@ def _printed(out: str, key: str) -> str:
     hits = [ln.split(" ", 1)[1] for ln in out.splitlines() if ln.startswith(key + " ")]
     assert len(hits) == 1, out
     return hits[0]
+
+
+def test_cut_on_the_explicit_route_without_the_list_flags_cannot_measure(tmp_path, capsys):
+    """``cut`` resolves its inputs as ``check`` does, so the explicit route without the two
+    list flags builds the cut and then reports both guards cannot measure, exit 2."""
+    src = _repo(tmp_path, {**_base_files(), "notes.md": f"hi {TERM_WORD}\n".encode()})
+    code = publish.main(_bare_cut(src, tmp_path / "cut", _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 2, out + err
+    assert _printed(out, "commit")
+    assert _line(out, "sensitive-terms") == NO_TERMS_FLAG_LINE
+    assert _line(out, "sanitize-terms") == NO_EXTRA_FLAG_LINE
+
+
+def test_cut_reports_the_person_name_without_printing_it(tmp_path, capsys, monkeypatch):
+    """The cut is the path the runbook uses: it must hand the name to the check."""
+    _person_home(tmp_path, monkeypatch)
+    files = {**_base_files(), "docs/notes.md": f"# Notes\n\nby {OPERATOR}\n".encode()}
+    src = _repo(tmp_path, files)
+    code = publish.main(_cut(src, tmp_path / "cut", _ledger(tmp_path, ["2026-09-01"])))
+    out, err = capsys.readouterr()
+    assert code == 0, out
+    assert _line(out, "person-name") == "REPORT person-name 1 line(s)"
+    assert _person_hits(out) == ["docs/notes.md:3"]
+    _assert_no_person(out, err)
 
 
 def test_cut_keeps_skills_vendored_and_its_license(tmp_path, capsys):
@@ -1543,6 +2635,97 @@ def test_cut_fails_loudly_when_the_written_tree_is_short_of_the_kept_files(
     assert f"the cut's tree holds {n - 1} files, {n} were kept; not written: " in err, err
 
 
+def test_cut_build_errors_never_print_a_path_that_holds_a_term(tmp_path, capsys, monkeypatch):
+    """gh#798: the cut's own refusals run BEFORE any check, so they mask paths themselves: a
+    submodule path and a "not written" path holding a term print as their position in the
+    source tree, and the term reaches neither stdout nor stderr. A path without one still
+    prints whole, so the operator can find it."""
+    low = TERM_WORD.lower()
+    terms = _terms(tmp_path, f"{TERM_WORD}{NL}")
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+
+    sub = _repo(tmp_path, _base_files(), name="sub-src")
+    head = _git(sub, "rev-parse", "HEAD")
+    for gitlink in (f"vendor/{low}_sub", "vendor/plain_sub"):
+        _git(sub, "update-index", "--add", "--cacheinfo", f"160000,{head},{gitlink}")
+    _git(sub, "commit", "-q", "-m", "gitlinks")
+    code = publish.main(_cut(sub, tmp_path / "cut-sub", ledger, "--sensitive-terms", str(terms)))
+    out, err = capsys.readouterr()
+    assert code == 2, err
+    assert "submodule entr(ies)" in err, err
+    assert re.search(r"<source path #\d+>", err), err
+    assert "vendor/plain_sub" in err, err
+    _assert_no_term(out + err, TERM_WORD)
+
+    # A list that exists but cannot be read leaves every path suspect, so none prints whole.
+    unreadable = tmp_path / "terms-dir"
+    unreadable.mkdir()
+    code = publish.main(
+        _cut(sub, tmp_path / "cut-sub2", ledger, "--sensitive-terms", str(unreadable))
+    )
+    out, err = capsys.readouterr()
+    assert code == 2, err
+    assert len(re.findall(r"<source path #\d+>", err)) == 2, err
+    _assert_no_term(out + err, TERM_WORD)
+
+    # The last kept entry in tree order is the one the injected drop loses.
+    src = _repo(tmp_path, {**_base_files(), f"zz/{low}_notes.md": b"x\n"})
+    real_run = publish._run
+
+    def dropping_run(argv, **kw):
+        if "--index-info" in argv:
+            records = [r for r in kw["stdin"].split(b"\0") if r]
+            kw["stdin"] = b"".join(r + b"\0" for r in records[:-1])
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(publish, "_run", dropping_run)
+    code = publish.main(_cut(src, tmp_path / "cut", ledger, "--sensitive-terms", str(terms)))
+    out, err = capsys.readouterr()
+    assert code == 2, err
+    assert re.search(r"not written: <source path #\d+>", err), err
+    _assert_no_term(out + err, TERM_WORD)
+
+
+def test_cut_git_failure_never_prints_git_stderr_naming_a_held_path(
+    tmp_path, capsys, monkeypatch
+):
+    """gh#798: git names the path it failed on, and the cut runs before any check can mask
+    it. When any source path holds a term, or the terms list cannot be read, a failed git
+    step prints its subcommand and exit code only. With nothing held, git's message prints
+    whole, so the operator still sees why."""
+    low = TERM_WORD.lower()
+    terms = _terms(tmp_path, f"{TERM_WORD}{NL}")
+    unreadable = tmp_path / "terms-dir"
+    unreadable.mkdir()
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    src = _repo(tmp_path, {**_base_files(), f"{low}dir/notes.md": b"x\n"})
+    real_run = subprocess.run
+
+    def failing_checkout(argv, **kw):
+        if "checkout-index" in argv:
+            err = f"fatal: cannot create directory at '{low}dir/notes.md': Filename too long"
+            return subprocess.CompletedProcess(argv, 128, b"", err.encode())
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(publish.subprocess, "run", failing_checkout)
+    for i, terms_arg in enumerate((terms, unreadable)):
+        code = publish.main(
+            _cut(src, tmp_path / f"cut{i}", ledger, "--sensitive-terms", str(terms_arg))
+        )
+        out, err = capsys.readouterr()
+        assert code == 2, err
+        assert "checkout-index ... exited 128; git's message is withheld" in err, err
+        _assert_no_term(out + err, TERM_WORD)
+
+    plain = _repo(tmp_path, _base_files(), name="plain-src")
+    code = publish.main(
+        _cut(plain, tmp_path / "cut-plain", ledger, "--sensitive-terms", str(terms))
+    )
+    _, err = capsys.readouterr()
+    assert code == 2, err
+    assert "exited 128: fatal: cannot create directory at" in err, err
+
+
 @pytest.mark.skipif(
     os.name != "nt", reason="only Git for Windows skips a name NTFS cannot hold, with exit 0"
 )
@@ -1591,9 +2774,42 @@ def test_check_counts_excluded_paths_actually_present_in_the_tree(tmp_path, caps
     out, _ = capsys.readouterr()
     assert code == 1, out
     n = len(CASE_AND_DIR_VARIANTS)
-    assert _line(out, "excluded-paths").startswith(f"FAIL excluded-paths {n} in the cut, 0"), out
+    assert _line(out, "excluded-paths") == (
+        f"FAIL excluded-paths {n} in the cut; dropped paths not measured: only cut knows them; "
+        "remove them from the source branch"
+    ), out
     listed = [ln.strip() for ln in out.splitlines() if ln.strip().startswith("in cut: ")]
     assert sorted(listed) == sorted(f"in cut: {p}" for p in CASE_AND_DIR_VARIANTS)
+
+
+def test_check_labels_the_dropped_half_unmeasured_on_a_cut_that_cut_failed(tmp_path, capsys):
+    """Only cut knows which paths it dropped, so check on the cut it built passes the in-cut
+    half and says the dropped half was not measured, never a bare PASS."""
+    src = _repo(tmp_path, {**_base_files(), ".env.example": b"KEY=1"})
+    out_dir = tmp_path / "cut"
+    ledger = _ledger(tmp_path, ["2026-09-01"])
+    assert publish.main(_cut(src, out_dir, ledger)) == 1
+    out, _ = capsys.readouterr()
+    assert _line(out, "excluded-paths").startswith("FAIL excluded-paths 0 in the cut, 1 dropped")
+    assert "dropped by cut: .env.example" in out
+    publish.main(_check(out_dir, ledger, source=src))
+    out, _ = capsys.readouterr()
+    assert _line(out, "excluded-paths") == (
+        "PASS excluded-paths 0 paths match "
+        + " ".join(publish.EXCLUDED_PATTERNS)
+        + " (any segment, any case); dropped paths not measured: only cut knows them"
+    ), out
+    assert "dropped by cut:" not in out
+
+
+def test_check_excluded_paths_tells_unknown_dropped_from_none_dropped(tmp_path):
+    repo = _repo(tmp_path, _base_files())
+    files = publish._load_cut(repo)
+    measured = publish.check_excluded_paths(files, ())
+    unknown = publish.check_excluded_paths(files, None)
+    assert measured.status == unknown.status == publish.PASS
+    assert "not measured" not in NL.join(measured.lines())
+    assert "dropped paths not measured: only cut knows them" in NL.join(unknown.lines())
 
 
 def test_cut_is_one_parentless_commit_with_no_remote_and_no_source_object(
@@ -1701,6 +2917,8 @@ def test_cut_refuses_a_non_empty_out_dir(tmp_path, capsys):
     assert "REFUSED" in err
     assert keep.read_bytes() == b"do not touch\n"
     assert sorted(p.name for p in out_dir.iterdir()) == ["keep.txt"]
+    # A re-run into the failed dry run's directory lands here: the refusal names the remedy.
+    assert "delete it or choose a new empty --out" in err, err
 
     a_file = tmp_path / "a-file"
     a_file.write_bytes(b"x")
@@ -1837,8 +3055,12 @@ def test_an_unrelated_environment_error_blocks_only_the_data_root_paths(
     assert r.host_ref == HOST_REF
     assert r.source == src
     assert r.ledger is None and r.sensitive_terms is None and r.sanitize_extra is None
-    assert set(r.why) == {"ledger", "sensitive_terms", "sanitize_extra"}
-    assert "notify.url_env" in r.why["ledger"] and unset in r.why["ledger"]
+    # person.name comes from the same environment file; its report is never a hard check
+    assert set(r.why) == {"ledger", "sensitive_terms", "sanitize_extra", "person"}
+    # The field is named; its value is not (a value can carry person.name), and the why points
+    # at config show for the full reason.
+    assert "notify.url_env" in r.why["ledger"] and "config show" in r.why["ledger"]
+    assert unset not in r.why["ledger"]
     assert r.why["sensitive_terms"] == r.why["ledger"] == r.why["sanitize_extra"]
 
     code = publish.main(["check", "--tree", str(src), "--project", "demo"])
@@ -1848,7 +3070,8 @@ def test_an_unrelated_environment_error_blocks_only_the_data_root_paths(
     assert ledger_line.startswith(
         "FAIL ledger-dated cannot measure - no ledger path: the environment config did not load"
     )
-    assert unset in ledger_line and "pass --ledger" not in ledger_line
+    assert "notify.url_env" in ledger_line and unset not in ledger_line
+    assert "pass --ledger" not in ledger_line
     assert _line(out, "sensitive-terms").startswith(
         "FAIL sensitive-terms cannot measure - no terms list path: the environment config"
     )
@@ -2031,6 +3254,7 @@ def test_the_gate_passes_over_a_cut_of_its_own_checkout(tmp_path, capsys):
             str(ledger),
             "--host-ref",
             host_ref,
+            *_absent_lists(tmp_path),
         ]
     )
     out, err = capsys.readouterr()
@@ -2075,6 +3299,7 @@ def test_the_gate_passes_over_a_cut_of_its_own_checkout(tmp_path, capsys):
             host_ref,
             "--source",
             str(root),
+            *_absent_lists(tmp_path),
         ]
     )
     out, _ = capsys.readouterr()
@@ -2083,3 +3308,20 @@ def test_the_gate_passes_over_a_cut_of_its_own_checkout(tmp_path, capsys):
     assert "planted.md:1" in out
     # and the second commit, by a non-cut identity, is what cut-shape exists to catch (gh#654)
     assert _line(out, "cut-shape").startswith("FAIL cut-shape")
+
+
+def test_a_path_shaped_project_name_gets_its_own_line_not_the_unknown_field_one(
+    tmp_path, capsys, monkeypatch
+):
+    # The resolver refuses a path-shaped name with field path `<project>` before reading any
+    # file. That is a bad name, not an unknown field, and the line should say so (gh#918).
+    src = _repo(tmp_path, _base_files())
+    _scratch_home(tmp_path, src, monkeypatch, notify="kind: none")
+    code = publish.main(["check", "--tree", str(src), "--project", "sub/ghost"])
+    out, err = capsys.readouterr()
+    assert code == 2, out
+    line = _line(out, "ledger-dated")
+    assert "project 'sub/ghost' did not load" in line, line
+    assert "invalid project name" in line, line
+    assert "unknown or unnamed field" not in line, line
+    assert "invalid project name" in err  # the stderr note names it too

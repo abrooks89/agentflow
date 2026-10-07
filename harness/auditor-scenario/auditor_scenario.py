@@ -102,6 +102,7 @@ from agentflow import registry as registry_cli        # noqa: E402 — shipped C
 from agentflow.config import Audit                    # noqa: E402 — real defaults (window=7)
 from agentflow.epic_survey import survey_epics        # noqa: E402
 from agentflow.registry import AGENTS                 # noqa: E402 — the ONE definition of the fleet
+from agentflow.tracked_paths import tracked_files     # noqa: E402
 
 
 def _assert_own_tree() -> None:
@@ -1458,8 +1459,9 @@ def assert_rename() -> None:
     # (g1) zero surviving developer-1|developer-2|developer-3 skill-name refs.
     pat = re.compile(r"developer-[123]")
     offenders: list[str] = []
+    # Tracked files only (gh#410): a scratch copy under skills/ must not move this verdict.
     for base in ("skills", "commands"):
-        for f in (SUITE_ROOT / base).rglob("*"):
+        for f in tracked_files(SUITE_ROOT, lambda rel, b=base: rel.startswith(b + "/")):
             if not f.is_file() or f.suffix not in (".md", ".py", ".json", ".js"):
                 continue
             if "_vendored" in f.parts or "node_modules" in f.parts:

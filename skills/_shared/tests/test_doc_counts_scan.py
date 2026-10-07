@@ -15,8 +15,8 @@ was invisible: a new, unlisted doc copying the README row stated a stale count
 and the gate passed.
 
 The tests build a THROWAWAY git repo and point `assert_doc_counts.REPO` at it.
-That is not fastidiousness: `scan_candidates()` runs `git ls-files` and returns
-that list whenever it is non-empty, so a probe written into the live checkout is
+That is not fastidiousness: `scan_candidates()` reads the git index and nothing
+else, so a probe written into the live checkout is
 untracked and invisible to SCAN no matter what the pattern says -- a naive test
 would pass before and after and prove nothing. `git add -N` in the live checkout
 would work, but leaves an index entry behind if the test dies mid-run.
@@ -106,7 +106,7 @@ def test_an_unlisted_file_stating_a_stale_count_is_caught(adc, tmp_path, capsys)
 
     The `41` below is deliberately stale — it has to be, or there is nothing for the
     gate to catch — and it survives in a tracked file only because SCAN is scoped to
-    `*.md` (`assert_doc_counts.SCAN_GLOBS`, and the `git ls-files *.md` it prefers),
+    `*.md` (`assert_doc_counts.SCAN_SUFFIX`, filtered over the git index),
     so this `.py` module is never a scan candidate. That dependence is stated here
     rather than left implicit (gh#218): widening SCAN to `*.py` makes this literal a
     finding against the live checkout and self-reds the gate. If you widen it, move

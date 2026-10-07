@@ -4,6 +4,12 @@
 
 **Worktree:** `{worktree}`
 
+This is the tree that has the task's change checked out: the task's per-wave worktree when the
+epic builds each task in its own tree, otherwise the epic worktree. On the per-wave path the
+task's commit stays on its wave branch, in that tree, until merge-back after your approval; the
+epic tree does not contain the change yet. So file reads and test runs go to this tree and no
+other: the epic tree would show you pre-change code.
+
 Every git call you make names it explicitly:
 `git -C {worktree} diff <base>..<head>`, `git -C {worktree} show <sha>`, `git -C {worktree} log`.
 Every **repository** path you read is under `{worktree}`. This does NOT cover the vendored

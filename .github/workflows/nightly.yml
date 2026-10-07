@@ -82,6 +82,10 @@ jobs:
       issues: read
       pull-requests: read
     uses: ./.github/workflows/ci.yml
+    # A called workflow sees none of the caller's secrets unless they are passed. ci.yml's
+    # sanitize gate and `_shared pytest` step read the SANITIZE_EXTRA_PATTERN repository
+    # secret; without this the nightly would scan the generic shapes only.
+    secrets: inherit
 
   report:
     needs: [gate, ci]

@@ -1,5 +1,5 @@
 {
-  "_comment": "Tracked example harness config. Copy to harness/harness.config.json (gitignored, machine-local) and replace the placeholder paths. Keys: specs_dir/plans_dir name YOUR spec + plan directories, used by live recording sessions and not by check.py assertions; status_roots names them too BUT IS ALSO READ BY AN ASSERTION - C3 probes <root>/<slug>/status.md and <root>/<slug>.status.md for the malformed fixture's slug, so a board there turns C3 red; solution_skill/orchestrator_skill/builder_entry name the skills the scenarios drive; parse_plan imports from the installed agentflow package (`pip install -e skills/_shared`); skills_root may be relative, resolved against this file's directory. See harness/README.md.",
+  "_comment": "Tracked example harness config. Copy to harness/harness.config.json (gitignored, machine-local) and replace the placeholder paths. Keys: specs_dir/plans_dir name YOUR spec + plan directories, used by live recording sessions and not by check.py assertions; status_roots names them too BUT IS ALSO READ BY AN ASSERTION - C3 probes <root>/<slug>/status.md and <root>/<slug>.status.md for the malformed fixture's slug, so a board there turns C3 red; solution_skill/orchestrator_skill/builder_entry name the skills the scenarios drive; parse_plan imports from the installed agentflow package (`pip install -e skills/_shared`); skills_root may be relative, resolved against this file's directory; toy_project names the project profile (harness/toy-profile/) every live A/B/D launch line in run-scenario.md passes as --project, equal to that profile's name - no assertion reads it, a test keeps the three in step. See harness/README.md.",
   "specs_dir": "/path/to/your/specs",
   "plans_dir": "/path/to/your/plans",
   "status_roots": [
@@ -10,5 +10,6 @@
   "orchestrator_skill": "orchestrator",
   "builder_entry": "/lead-dev",
   "skills_root": "../skills",
-  "preport_ip_literals": []
+  "preport_ip_literals": [],
+  "toy_project": "harness-toy"
 }

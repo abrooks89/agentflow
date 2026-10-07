@@ -84,7 +84,12 @@ class ContextItem:
     # ALWAYS carries `documents`. The inapplicable field stays None.
     documented_by: list[TierRef] | None = None
     documents: list[TierRef] | None = None
-    community: dict[str, Any] | None = None   # global items: {id, level, label, score}
+    # Hub guard on whichever list above applies: how many refs existed before
+    # MAX_TIER_REFS_PER_ITEM trimmed it, and the named cap when it fired
+    # (None when the list was not trimmed). Unset on unannotated items.
+    tier_refs_total: int | None = None
+    tier_refs_truncation: str | None = None
+    community: dict[str, Any] | None = None   # global items: {id, level, label, score, stale}
 
     @property
     def citation(self) -> str:

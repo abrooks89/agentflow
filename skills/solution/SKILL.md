@@ -60,6 +60,7 @@ orchestrator's parser and the acceptance harness depend on it byte-for-structure
 ## When to use
 
 - Invoked by `orchestrator` during epic bootstrap
+- Invoked by `refine` once the user approves the written spec (refine's terminal step)
 - User explicitly asks for an epic plan or plan-with-frontmatter
 - A plan needs YAML frontmatter for the DAG (phases + cross-phase deps)
 
@@ -112,16 +113,19 @@ Invoke the `../_vendored/writing-plans/SKILL.md` skill with the spec. Wait for i
 
 **Require maximal detail in the produced bodies (Posture dial 1).** The plan is executed by
 implementer subagents that see only the task body + verification block. Direct writing-plans to make
-each `## Task N:` body a self-sufficient contract, and if the returned plan falls short, iterate on
-it before proceeding to Step 2. The wave dispatcher reads a body from its `## Task N` or `### Task N`
-heading down to the next Task heading or a shallower heading, and refuses to dispatch a task whose
-body comes back empty. So keep every section that belongs to a task, `## Files:` included, between
-its heading and the next Task heading, at the Task heading's level or deeper. Each task body must carry:
+each `### Task N:` body a self-sufficient contract, and if the returned plan falls short, iterate on
+it before proceeding to Step 2. `### Task N:` is the canonical task heading. The wave dispatcher
+reads a body from its Task heading down to the next Task heading or a shallower heading, and refuses
+to dispatch a task whose body comes back empty. So every per-task subsection (Files, Acceptance,
+Steps, Test) uses a `####` or deeper heading, or the bold `**Files:**` label the vendored
+writing-plans skill emits: a `##` heading ends a `### Task N:` body, and everything under it never
+reaches the dispatched agent. A legacy plan whose tasks sit under `## Task N:` still parses. Each
+task body must carry:
 
 - **Literal artifacts, pasted in** — the exact function/method signatures, type / dataclass / schema
   definitions, config fragments, and test fixtures (input → expected output, error strings) the task
   must produce or conform to. Paste the real text; do not paraphrase "add a function that…".
-- **A `## Files:` section** listing every file the task may modify (backtick-quoted paths, `(new)`
+- **A `#### Files:` section (or the bold `**Files:**` label)** listing every file the task may modify (backtick-quoted paths, `(new)`
   on new files) plus a "do not touch" note naming regression-guard files/services.
 - **Discrete, testable acceptance criteria** — one bullet per check, no judgment calls — and the
   exact test command(s) that decide the task.
@@ -234,7 +238,7 @@ record domain, status, and the owning task(s). One block per UC:
   and interfaces that realize it. This is solution's contribution; it exists nowhere upstream.>
 - **Domain:** <carried from the refine block, e.g. `auth/login`>
 - **Status:** backlog
-- **Owning tasks:** [3, 5]   <!-- the `## Task N` numbers whose frontmatter carries this UC -->
+- **Owning tasks:** [3, 5]   <!-- the `### Task N` numbers whose frontmatter carries this UC -->
 ```
 
 Rules for the block:
@@ -247,7 +251,7 @@ Rules for the block:
   tasks are done, `in-progress` once some-but-not-all are done. Seed it `backlog` at authoring time —
   a derived read can't rot. `completed`/`deprecated` are **post-ship** states owned by
   autodoc-update reconciling against code; never set them here.
-- **`Owning tasks:`** lists the `## Task N` numbers whose frontmatter will carry this UC (threaded in
+- **`Owning tasks:`** lists the `### Task N` numbers whose frontmatter will carry this UC (threaded in
   Step 3). A UC with no owning task is a red flag — either a task is missing or the UC isn't in this
   epic's scope; surface it rather than shipping an orphan.
 - **Opaque ids only.** `UC-NNNN` digits carry no domain meaning. Re-parenting a domain later edits
@@ -258,11 +262,12 @@ Rules for the block:
 After writing-plans completes:
 
 1. Read the produced plan file
-2. For each `## Task N:` heading, identify:
+2. For each `### Task N:` heading (or legacy `## Task N:`), identify:
    - The task number (N)
    - The phase it belongs to (group tasks into 3-6 phases by major component or sequence)
    - Its dependencies (which earlier tasks must complete first — derive from task body's references and from logical sequencing)
    - Optional complexity (default `medium`; mark `low` for trivial mechanical tasks, `high` for tasks requiring design judgment)
+   - Optional `type`: `standard` (the default; omit it) or `tdd` for a task with crisp acceptance criteria and an existing test framework. No other value exists; the plan parser rejects one.
    - Optional effort-mode knobs (both default absent = single-shot):
      - `best_of_n: N` — emit for tasks that are genuinely hard or design-ambiguous (N=2 or 3). The orchestrator runs N candidate implementations, test-pre-filters them, and a 3-judge panel picks the winner. Reserve for tasks whose spec marks them high-risk or design-heavy; do NOT apply by default.
      - `adversarial: true` — emit for security-critical or correctness-critical tasks. The orchestrator runs an adversarial refuter panel after implementation. Reserve for tasks explicitly marked as security or invariant-critical; do NOT apply by default.
@@ -270,6 +275,7 @@ After writing-plans completes:
 3. Identify the test commands by reading the project's test infrastructure (check `pyproject.toml`, `package.json`, README)
 
 ### Step 2.5: Derive verification block per task
+**Evidence states.** Empty, unavailable, truncated and stale are different answers: `<suite_root>/skills/_shared/EVIDENCE.md`.
 
 For each task in the plan, derive a `verification` block that the in-wave verifier subagent will evaluate against the implementer's diff. This block is the per-task contract — get it right and the verifier catches drift before it ships.
 
@@ -279,10 +285,10 @@ touch (new files marked) with `regression_guard` naming every file/service it mu
 incomplete allowlist blocks a legitimate edit or lets drift through; an incomplete criteria list
 lets a task pass while under-built.
 
-Read each task's body (acceptance criteria list, `## Files:` section, constraints, "do not touch" notes) and populate:
+Read each task's body (acceptance criteria list, `#### Files:` section, constraints, "do not touch" notes) and populate:
 
 - **`acceptance_criteria`** — the discrete checks the verifier evaluates. Lift directly from the task body's listed criteria. One bullet per check. Concrete, testable, no judgment calls.
-- **`file_allowlist`** — files the wave is permitted to modify. Lift from the task body's `## Files:` section. Mark new files explicitly. Tests for the task code count as in-allowlist.
+- **`file_allowlist`** — files the wave is permitted to modify. Lift from the task body's Files section (`#### Files:`, or the legacy `## Files:` / `**Files:**`). Mark new files explicitly. Tests for the task code count as in-allowlist.
 - **`regression_guard`** — files/services the wave MUST NOT touch. Source: spec's "do not touch" constraints + invariants + adjacent systems the task brushes against. Explicit > implicit. Service-config files (systemd units, docker-compose lockfiles), shared libs not in scope, neighbor modules — list them.
 - **`spec_format`** — what format the task body declares. Defaults: detect from the spec doc. Examples: `"sectioned spec (Frontmatter + Story + Contract + Boundary)"`, `"user story (As a / I want / So that)"`, `"acceptance-criteria checklist"`.
 - **`failure_modes`** — task-specific known failure modes from the spec. Examples: security tasks → `"an API key leaked into a log line"`; auth tasks → `"signing key logged in error path"`; migration tasks → `"backfill default applied to existing rows under concurrent writes"`. The plan-level `verification.global_failure_modes` covers cross-cutting modes — don't duplicate them here.
@@ -325,12 +331,17 @@ Inject:
   - **Thread, never mint.** Only ids that already exist in the Step 1.6 doc of record (hence in the
     refine doc) may appear. If a task needs a UC that was never minted, stop — do not fabricate an id.
 - Plan-level `verification` globals at the same top level as `test_commands` — seeded from template defaults.
-- **`worktree:` field (optional).** Plans that will run inside a dedicated git worktree (the default for new epics) should include the path under the
-  configured `worktree_root`, one directory per project:
+- **`worktree:` field (required in a fleet run, optional in a hand run).** Plans that will run inside a dedicated git worktree (the default for new epics) should include the path under the
+  configured `worktree_root`, one directory per project. In a fleet run (a claimed registry row)
+  always write it, with the claim branch name as the directory:
 
   ```yaml
-  worktree: '<worktree_root>/<project>/<epic-slug>'
+  worktree: '<worktree_root>/<project>/<epic-branch>'
   ```
+
+  `<epic-branch>` is defined in `/project` Step 5: the claimed row's `e<NNNN>-<short>`. With no
+  registry row (a hand run) the directory is `<epic-slug>`:
+  `worktree: '<worktree_root>/<project>/<epic-slug>'`.
 
   `worktree_root` comes from `agentflow.config.load_environment()`; do not hard-code a home-relative
   path. **A flat `~/CODE/<repo>-<epic-slug>` form is wrong and must not be emitted** — nothing

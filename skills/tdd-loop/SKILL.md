@@ -68,15 +68,24 @@ digraph tdd_loop {
 ### 1. Read spec, lock file allowlist
 
 - Read the spec/ticket fully. Extract acceptance criteria as a bullet list.
-- Determine the file list — every path you may modify (existing or new). New files marked `(new)`.
-- Write the allowlist to `.tdd-loop/allowlist.txt` in the repo (gitignored). One path per line.
+- Determine the file list — every path you may modify (existing or new), relative to the repo root. New files may be marked with a trailing ` (new)`; the gate strips it.
+- From the repo root, hide the loop's state directory from git through `info/exclude`, never `.gitignore` (editing a tracked ignore file is itself an out-of-allowlist change):
+
+  ```bash
+  exclude="$(git rev-parse --git-path info/exclude)"
+  mkdir -p .tdd-loop "$(dirname "$exclude")"
+  grep -qxF '.tdd-loop/' "$exclude" 2>/dev/null || echo '.tdd-loop/' >> "$exclude"
+  ```
+
+- Write the allowlist to `.tdd-loop/allowlist.txt`. One path per line.
 - Confirm test command for this codebase (e.g. `pytest`, `npm test`, `cargo test`).
 
 ### 2. Write failing tests first (RED)
 
 - Tests express acceptance criteria, one test per criterion minimum.
 - Tests reference the not-yet-existing function/module signatures from the spec.
-- Commit on a branch `tdd/<slug>` with message `red: failing tests for <feature>`.
+- Cut a branch `tdd/<slug>` from `<base-ref>` and commit with message `red: failing tests for <feature>`.
+- `<base-ref>` is the ref `tdd/<slug>` was cut from, and every later step uses the same one: `origin/<base-branch>` when the repo has that remote-tracking ref, else the local `<base-branch>`. `<base-branch>` is `canonical_repo.base_branch` off the resolved block on the configured project, else the branch you were on when you cut `tdd/<slug>`. Never assume `main`.
 
 ### 3. Run tests — must fail for the right reason
 
@@ -86,7 +95,11 @@ digraph tdd_loop {
 ### 4. Implement minimum code
 
 - Smallest change that could plausibly turn tests green. No speculation, no premature abstraction.
-- Run `bash "<suite_root>/skills/tdd-loop/file-gate.sh" .tdd-loop/allowlist.txt` after editing — it will exit non-zero if any out-of-allowlist file changed.
+- After editing, run the file gate from the repo root (see File Gate below) — it exits non-zero if any out-of-allowlist file changed on the branch:
+
+  ```bash
+  bash "<suite_root>/skills/tdd-loop/file-gate.sh" .tdd-loop/allowlist.txt <base-ref>
+  ```
 
 ### 5. Run tests
 
@@ -105,7 +118,7 @@ digraph tdd_loop {
 ### 7. Critic subagent
 
 - REQUIRED: use the prompt at `<suite_root>/skills/tdd-loop/critic-prompt.md`.
-- Hand the critic: the spec, the full diff (`git diff main...HEAD`), the test output, the allowlist.
+- Hand the critic: the spec, the full diff (`git diff <base-ref>...HEAD`, with the `<base-ref>` from Step 2), the test output, the allowlist.
 - Critic returns: APPROVED, or NEEDS WORK with specific issues (drift from spec, missing edge cases, quality problems).
 
 ### 8. Refactor (only if critic flagged issues)
@@ -128,10 +141,12 @@ Report includes:
 Run after every implementation or refactor edit:
 
 ```bash
-bash "<suite_root>/skills/tdd-loop/file-gate.sh" .tdd-loop/allowlist.txt
+bash "<suite_root>/skills/tdd-loop/file-gate.sh" .tdd-loop/allowlist.txt <base-ref>
 ```
 
-The script compares `git diff --name-only HEAD` against the allowlist. Exit 0 if all changed files are in allowlist. Exit non-zero with the offending paths otherwise.
+The script checks the branch's whole change set against the allowlist: the diff from the merge-base of `<base-ref>` and `HEAD` to the working tree and to the index (so committed, staged and unstaged edits all count), plus untracked files that are not ignored. It diffs with `--no-renames`, so a rename counts as both its deleted and its added path. Every path is compared repo-root-relative, so it gives the same verdict from any subdirectory. Anything under `.tdd-loop/` never counts, nor does the allowlist file itself while it is untracked; a committed allowlist is a branch change like any other. Allowlist lines may carry whole-line `#` comments or inline ` # ...` comments. Exit 0 if every changed file is in the allowlist; exit 1 with the offending paths otherwise.
+
+How it learns the base: the second argument, which is the `<base-ref>` from Step 2. Omitted, it falls back to `origin/HEAD`. If that is unset, the ref does not resolve, or it names the current branch or that branch's own remote-tracking copy (`<remote>/tdd/<slug>`), the gate exits 2 and says why, because an empty branch scope would pass every committed edit. The branch's upstream is a valid base: cutting `tdd/<slug>` from `origin/<base-branch>` makes that its upstream. The guard compares ref names, not commits, since at the start of a loop the base and `HEAD` are legitimately the same commit; a raw SHA or another spelling of the branch's own tip is not caught and passes vacuously, so always pass the `<base-ref>` from Step 2.
 
 If the gate fails, the loop STOPS — do not commit, do not proceed. Either:
 - Revert the out-of-scope edit (preferred)
@@ -172,7 +187,7 @@ Green + critic-approved + file-gate-clean is the only "done."
 
 When running on the configured project:
 - Test command: the project's suite (e.g. `pytest` for a Python backend, `npm test` for a frontend) — from `test_commands` / project config
-- Branch convention: `tdd/<slug>` off `<base-branch>`
+- Branch convention: `tdd/<slug>` off `<base-ref>` (Step 2), whose branch is `canonical_repo.base_branch`
 - Push: REQUIRED at end — verify with `git log origin/<branch>`
 - Deploy: only after PR merge — TDD loop produces the PR, doesn't deploy
 - Lint: the repo's linter (e.g. `ruff check`) on touched files before commit

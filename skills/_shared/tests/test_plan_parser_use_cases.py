@@ -314,3 +314,43 @@ def test_the_SURVEY_now_counts_a_document_instead_of_skipping_it(tmp_path):
     records, scan = survey_with_skips(root, "2020-01-01T00:00:00+00:00")
     assert scan.skipped_count == 0, f"still skipped: {scan}"
     assert "programme" in {r.slug for r in records}
+
+
+# --- A byte-order mark before the frontmatter -------------------------------------------
+#
+# A Windows editor or a PowerShell redirect can save a spec or plan with a UTF-8 BOM. Decoded
+# as plain utf-8 the BOM survives as a leading U+FEFF, the anchored frontmatter match misses,
+# and a valid file reads as having no frontmatter at all.
+
+BOM = b"\xef\xbb\xbf"
+
+
+def _bom_file(tmp_path, body: str, name: str) -> Path:
+    f = tmp_path / name
+    text = "---" + NL + body.strip() + NL + "---" + NL + NL + "prose" + NL
+    f.write_bytes(BOM + text.encode("utf-8"))
+    return f
+
+
+def test_a_spec_saved_with_a_BOM_parses(tmp_path):
+    from agentflow.plan_parser import parse_spec_frontmatter
+
+    spec = _bom_file(tmp_path, "slug: bom-spec" + NL + "title: A BOM spec", "bom-spec.md")
+    parsed = parse_spec_frontmatter(spec)
+    assert parsed.slug == "bom-spec"
+    assert parsed.title == "A BOM spec"
+
+
+def test_a_plan_saved_with_a_BOM_parses(tmp_path):
+    plan = parse_plan(_bom_file(tmp_path, ORCHESTRATOR, "bom-plan.md"))
+    assert plan.epic == "a real epic"
+    assert not plan.is_document
+
+
+def test_the_BOM_is_not_left_in_the_first_frontmatter_key(tmp_path):
+    """The match succeeding is not enough: a BOM stripped only for the regex but kept in
+    the YAML would turn the first key into U+FEFF + "slug" and silently lose its value."""
+    from agentflow.plan_parser import parse_spec_frontmatter
+
+    spec = _bom_file(tmp_path, "slug: kept" + NL + "title: t", "other-name.md")
+    assert parse_spec_frontmatter(spec).slug == "kept"

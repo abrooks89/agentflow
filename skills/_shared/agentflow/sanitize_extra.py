@@ -11,8 +11,9 @@ list (``agentflow.publish``, precondition 3 of ``docs/runbooks/publish.md``)::
 FORMAT. One regular-expression alternative per line, valid for both Python ``re`` and
 ``grep -P`` because the same alternatives also run in CI. Surrounding whitespace is stripped;
 a blank line, and a line whose first non-blank character is ``#``, is skipped. The alternatives
-are OR-ed. The same text joined with ``|`` is what the private repository's Actions variable
-``SANITIZE_EXTRA_PATTERN`` holds, so the PR-time gate applies it too.
+are OR-ed. The same text joined with ``|`` is what the private repository's
+``SANITIZE_EXTRA_PATTERN`` repository secret holds, so the PR-time gate applies it too and the
+run logs mask it.
 
 THIS IS THE ONE READER. The cut's ``sanitize-terms`` check (:mod:`agentflow.publish`) and the
 wiki ratchet's ``sanitize`` class (:mod:`agentflow.pillar_residue`) both resolve the file here
@@ -47,16 +48,19 @@ __all__ = [
 #: The file inside ``<data_root>/projects/<project>/``, beside ``publish/sensitive-terms.txt``.
 EXTRA_PATTERN_RELPATH = Path("publish") / "sanitize-extra-pattern.txt"
 
-#: Where neither an explicit path nor a project was given. Both CLIs spell the flag the same.
+#: Where neither an explicit path nor a project was given: cannot measure, never "not
+#: configured" (a pass there is a tree nobody scanned for these terms). Both CLIs spell the flag
+#: the same.
 NO_SOURCE = "no --sanitize-extra-pattern and no --project"
 
 
 class ExtraPatternUnreadable(Exception):
     """The extra pattern exists, or was meant to, but cannot be used.
 
-    Unreadable, not UTF-8, a line that does not compile, or a path the config could not
-    resolve. Callers map it to "cannot measure", never to a pass: a check that silently fell
-    back to the generic shapes would report a clean tree it never scanned for these terms.
+    Unreadable, not UTF-8, a line that does not compile, a path the config could not resolve,
+    or no path at all. Callers map it to "cannot measure", never to a pass: a check that
+    silently fell back to the generic shapes would report a clean tree it never scanned for
+    these terms.
     """
 
 
@@ -65,8 +69,8 @@ class ExtraPattern:
     """The extra pattern, configured or not, and where it came from.
 
     ``pattern`` is the OR-ed alternatives, or None when nothing is configured. ``where`` says
-    why nothing is (the path that does not exist, the file that lists none, or that no source
-    was named), so a "not configured" line always says where it looked.
+    why nothing is (the path that does not exist, or the file that lists none), so a "not
+    configured" line always says where it looked.
     """
 
     pattern: str | None
@@ -113,7 +117,9 @@ def read_extra_pattern(path: Path | None, *, why: str | None = None) -> ExtraPat
 
     * ``path`` None and ``why`` given: the path could not be resolved (a config that did not
       load) - :class:`ExtraPatternUnreadable`, because nothing was looked at.
-    * ``path`` None otherwise: not configured, no source named.
+    * ``path`` None and no ``why``: no source was named at all -
+      :class:`ExtraPatternUnreadable` too. Nothing was looked at, and a caller that forgot the
+      path must not read as one that checked and found nothing configured.
     * a path that does not exist, or a file with no alternatives: not configured, saying so.
     * unreadable, not UTF-8, a line that does not compile, or alternatives that do not compile
       once OR-ed: :class:`ExtraPatternUnreadable`.
@@ -121,7 +127,7 @@ def read_extra_pattern(path: Path | None, *, why: str | None = None) -> ExtraPat
     if path is None:
         if why:
             raise ExtraPatternUnreadable(f"no extra pattern path: {why}")
-        return ExtraPattern(None, None, NO_SOURCE)
+        raise ExtraPatternUnreadable(f"no extra pattern path was given ({NO_SOURCE})")
     if not path.exists():
         return ExtraPattern(None, path, f"{path} does not exist")
     try:
@@ -159,7 +165,7 @@ def union(base: str, extra: ExtraPattern | None) -> str:
     """``base`` OR-ed with the extra pattern when one is configured, else ``base`` unchanged.
 
     Appended after the ``ci.yml`` pattern, in the order the CI step appends the repository
-    variable, so the two build the same expression. ``|`` binds loosest, and every alternative
+    secret, so the two build the same expression. ``|`` binds loosest, and every alternative
     was compiled on its own before it got here, so no grouping is needed to keep them apart.
     """
     if extra is None or not extra.configured:

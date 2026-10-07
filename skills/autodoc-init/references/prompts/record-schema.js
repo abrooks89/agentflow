@@ -24,7 +24,7 @@ export const PAGE_RECORD_SCHEMA = {
           file: { type: 'string' }, kind: { type: 'string' }, name: { type: 'string' },
         },
       },
-      description: 'symbol-granularity citations, copied EXACTLY from the coverage checklist rows this page documents',
+      description: 'symbol-granularity citations, copied EXACTLY from the coverage checklist rows this page documents; `graph check-records` resolves each against the symbol index of the store the moment the records file is written',
     },
     edges: {
       type: 'array',

@@ -230,7 +230,7 @@ Wait until brainstorming has:
 2. Completed its Step 7 spec self-review
 3. The user has reviewed the spec (brainstorming Step 8)
 
-**Critical handoff seam:** brainstorming's Step 9 will normally invoke `../_vendored/writing-plans/SKILL.md` directly. **You are intercepting that transition.** When brainstorming reaches Step 9, take over instead of letting it chain into raw `writing-plans` — proceed to Step 3, which invokes `solution` instead. The plan must end up with DAG frontmatter for the orchestrator to consume it.
+**Critical handoff seam:** refine's terminal step invokes `solution` itself. **You are intercepting that transition.** When refine reaches it, take over instead of letting refine chain into `solution` — proceed to Step 3, which invokes `solution` once, with `REFINE_PATH` and the execution context. Letting both fire plans the epic twice. The plan must end up with DAG frontmatter for the orchestrator to consume it.
 
 Capture the spec path (`REFINE_PATH`). Pass it to `solution` in Step 3.
 
@@ -259,7 +259,7 @@ print("HAVE_PROJECT" if has_project else "NEED_PROJECT")
 PYEOF
    ```
 
-   If `NEED_PROJECT`: ask the user *once* — "Spec has no `project:` field — which project is this for? (one of your installed `~/.agentflow/config/projects/*.md` names, or `personal` / `other`)". **Fleet-context branch:** in a `fleet-context` run there is no user to ask — this is a free-form ask, not an `AskUserQuestion`, so no static gate catches it. Take `FLEET_CONTEXT`'s own project (the dispatching loop is configured for exactly one) as the `default:`, raise an `advisory` registry `## Questions` row recording the assumption (the CLI refuses an advisory row without `--assumption`), and PROCEED on it — writing a `project:` field is reversible, and stalling a dispatch on a missing metadata line is not worth a park. On reply, prepend `project: <value>` to the spec's YAML frontmatter (insert after the opening `---` line, before the closing `---`). If the user skips or says "skip", proceed without adding the field (mirror will route to `_unsorted/`).
+   If `NEED_PROJECT`: ask the user *once* — "Spec has no `project:` field — which project is this for? (one of your installed `~/.agentflow/config/projects/*.md` names)". **Fleet-context branch:** in a `fleet-context` run there is no user to ask — this is a free-form ask, not an `AskUserQuestion`, so no static gate catches it. Take `FLEET_CONTEXT`'s own project (the dispatching loop is configured for exactly one) as the `default:`, raise an `advisory` registry `## Questions` row recording the assumption (the CLI refuses an advisory row without `--assumption`), and PROCEED on it — writing a `project:` field is reversible, and stalling a dispatch on a missing metadata line is not worth a park. If the reply names no installed project, use the current project (`python -c "from agentflow.config import resolve_project_name; print(resolve_project_name(<project-arg>))"`, where `<project-arg>` is the invoking `--project` value quoted, or `None`) and say so. On reply, prepend `project: <value>` to the spec's YAML frontmatter (insert after the opening `---` line, before the closing `---`). If the user skips or says "skip", proceed without adding the field (mirror will route to `_unsorted/`).
 
 2. **Invoke the mirror** (best-effort):
 
@@ -389,16 +389,19 @@ orchestrator's recovery point here rather than carrying their own:
 
 ```
 git -C <canonical_repo.local_checkout> fetch
-git -C <canonical_repo.local_checkout> worktree add <worktree_root>/<project>/<epic-slug> -b <epic-branch> --no-track origin/<base-branch>
+git -C <canonical_repo.local_checkout> worktree add <worktree_root>/<project>/<epic-branch> -b <epic-branch> --no-track origin/<base-branch>
 ```
 
 - `<canonical_repo.local_checkout>` is the shared checkout, as the resolved block prints it.
 - `<worktree_root>` is the resolved block's `worktree_root`; `<project>` is the spec's `project:`.
-- `<epic-slug>` is the epic's slug, the same leaf the plan's `worktree:` field names.
+- `<epic-slug>` is the epic's slug.
 - `<epic-branch>` is the epic's branch: the one name the orchestrator's Step 7 pushes
   (`push -u origin <epic-branch>`) and opens its PR from (`--head <epic-branch>`). In a fleet run
   it is the claimed row's `e<NNNN>-<short>` (the claim contract in `<suite_root>/docs/REGISTRY.md`);
-  with no registry row, it is `<epic-slug>`.
+  with no registry row, it is `<epic-slug>`. The worktree directory is named after it, so in a
+  fleet run the directory is the claim branch name and carries the row's number: a merged tree
+  sits on a detached HEAD, and its directory name is then the only thing that ties it to its row.
+  The plan's `worktree:` field names this same directory.
 - `<base-branch>` is the resolved block's `base-branch` line (`canonical_repo.base_branch`). The
   fetch comes first so `origin/<base-branch>` is current, and the branch starts there rather than
   at whatever HEAD the shared checkout happens to hold. `--no-track` keeps `<epic-branch>` from
@@ -408,7 +411,7 @@ git -C <canonical_repo.local_checkout> worktree add <worktree_root>/<project>/<e
 `worktree add`. When a resumed epic's directory was removed but `<epic-branch>` survives
 (`git -C <canonical_repo.local_checkout> rev-parse --verify <epic-branch>` succeeds), run
 `git -C <canonical_repo.local_checkout> worktree prune` and re-attach the branch without `-b`:
-`git -C <canonical_repo.local_checkout> worktree add <worktree_root>/<project>/<epic-slug> <epic-branch>`.
+`git -C <canonical_repo.local_checkout> worktree add <worktree_root>/<project>/<epic-branch> <epic-branch>`.
 
 **Why explicit, and why there is no worktree-entering tool here.** A fleet-launched run starts in
 the machine's single launch directory, which is not a repository — so the harness's native
@@ -425,7 +428,7 @@ checked out, each leaf takes its own branch (`-b <epic-branch>-<agent> <epic-bra
 `--detach <epic-branch>` in place of `-b <epic-branch>`. Parallel waves sharing one git
 index collide; read-only agents need none. At epic end
 the orchestrator removes each one by path
-(`git -C <canonical_repo.local_checkout> worktree remove <worktree_root>/<project>/<epic-slug>`,
+(`git -C <canonical_repo.local_checkout> worktree remove <worktree_root>/<project>/<epic-branch>`,
 then `worktree prune`) — left behind they accumulate under `<worktree_root>` and the next epic's
 `worktree add` fails on a path that already exists.
 

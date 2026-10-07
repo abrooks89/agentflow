@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import provision  # noqa: E402
 from agentflow import preflight  # noqa: E402
+from agentflow.tracked_paths import tracked_files  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 TEMPLATE_ENV = REPO / "templates" / "environment.md"
@@ -244,8 +245,11 @@ def test_manifest_shared_citation_resolves():
     assert suite_paths, f"the paragraph cites no `<suite_root>/skills/_shared/...` path: {para!r}"
     for rel in suite_paths:
         assert (REPO / rel).is_file(), f"install/manifest.md cites `{rel}`, which does not exist"
-        citers = [p for p in (REPO / "skills").glob("*/SKILL.md")
-                  if f"<suite_root>/{rel}" in p.read_text(encoding="utf-8")]
+        # From the git index (gh#410): an untracked SKILL.md must not satisfy this citation.
+        skill_mds = tracked_files(
+            REPO, lambda r: r.startswith("skills/") and r.count("/") == 2 and r.endswith("/SKILL.md")
+        )
+        citers = [p for p in skill_mds if f"<suite_root>/{rel}" in p.read_text(encoding="utf-8")]
         assert citers, f"install/manifest.md says SKILL.md files cite `<suite_root>/{rel}`; none do"
 
     commands = _CITED_COMMAND.findall(para)

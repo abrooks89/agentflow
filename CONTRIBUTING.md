@@ -16,16 +16,16 @@ Found a security problem? Don't open a public issue. See [`SECURITY.md`](SECURIT
 
 ## Running the suite
 
-These are the main commands CI runs, copied from
+These are the main commands CI runs, taken from
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Each one says where to run it. Start
-every block from the repo root.
+every block from the repo root. Where CI sets a job's `working-directory`, the block names that
+directory in the command instead, so your shell never moves.
 
 **The `_shared` package** (config, registry, plan parser, waves). CI job `shared-tests`:
 
 ```bash
-cd skills/_shared
-python -m pip install -e ".[test]"
-python -m pytest -q
+python -m pip install -e "skills/_shared[test]"
+python -m pytest skills/_shared -q
 ```
 
 **Install and provision**. CI job `install-tests`, run from the repo root:
@@ -35,21 +35,20 @@ python -m pip install -e skills/_shared pytest
 python -m pytest install -q
 ```
 
-**The tree-sitter inventory (Node)**. CI job `inventory-tests`:
+**The tree-sitter inventory (Node)**. CI job `inventory-tests`. `node --test <dir>` reads a
+directory as a single test file on Node 24, so the `cd` sits inside a subshell, which returns
+your shell to the repo root when it exits:
 
 ```bash
-cd skills/autodoc-init/references/inventory
-npm ci
-node --test
+( cd skills/autodoc-init/references/inventory && npm ci && node --test )
 ```
 
 **The autodoc graph package**. CI job `graph-tests`. Its end-to-end tests drive the Node
 inventory, so run the inventory's `npm ci` above first:
 
 ```bash
-cd skills/autodoc-init/references/graph
-python -m pip install -e ".[test]"
-python -m pytest -q
+python -m pip install -e "skills/autodoc-init/references/graph[test]"
+python -m pytest skills/autodoc-init/references/graph -q
 ```
 
 **The acceptance harness**. CI job `harness-self-test`, run from the repo root:
@@ -111,9 +110,9 @@ install-specific alternatives would be published by that same file, so they neve
 they live in a local-only file under the data root
 (`<data_root>/projects/<project>/publish/sanitize-extra-pattern.txt`, see
 [`docs/runbooks/publish.md`](docs/runbooks/publish.md), precondition 3) and, for CI, in the
-working repository's Actions variable `SANITIZE_EXTRA_PATTERN`, which the step appends to the
-same scan. A repository without the variable runs the generic shapes alone and says so in one
-notice line.
+working repository's `SANITIZE_EXTRA_PATTERN` repository secret, which the step appends to the
+same scan and which the run logs mask. A repository without the secret runs the generic shapes
+alone and says so in one notice line.
 
 **What trips it:** a literal that ties the tree to one person's machine. The shipped shapes
 catch:
@@ -197,19 +196,21 @@ finding, and 2 when the scan could not run; 2 is never a pass.
 [`skills/_shared/tests/test_evidence_table.py`](skills/_shared/tests/test_evidence_table.py),
 which runs as part of the `_shared` suite.
 
-**What trips it:** adding or removing tests. Each row of the [`README.md`](README.md#evidence)
-*Evidence* table prints a count beside the command that produces it. The guard re-runs the rows it
-can run where it is running (in CI, the `_shared`, install and harness rows) and fails when a
-count no longer matches. The graph and Node inventory rows are not compared in CI, so update
-those by hand.
+**What trips it:** a count leaving its floor. Each row of the [`README.md`](README.md#evidence)
+*Evidence* table prints a floor, written `**N+**`, beside the command that produces the count. The
+guard re-runs the rows it can run where it is running (in CI, the `_shared`, install and harness
+rows) and fails when a count falls below its floor, or rises past 1.25 times it, which means the
+floor is stale. It also fails a Tests cell that is not written as a floor with at most two
+significant figures. The graph and Node inventory rows are not compared in CI, so check those by
+hand.
 
-**How to fix it:** re-run the command in the row for the layer you changed and put the new number
-in that row.
+**How to fix it:** touch a cell only when the guard fails. Re-run the command in the failing row
+and write the count rounded down to two significant figures, followed by `+` (5359 becomes
+`5300+`, 361 becomes `360+`, 44 stays `44+`). A pull request that adds tests without tripping the
+guard leaves README.md alone.
 
-**A local run may not catch it.** The guard compares counts only on Linux, which in CI is the
-`ubuntu-latest` leg, because test collection can differ between platforms. If you run the suite on
-Windows, a stale count passes on your machine and fails in CI. Update the row whenever your change
-adds or removes tests, whatever your local run says.
+**It runs on every platform.** The comparison is not limited to Linux, so a local run on Windows
+checks the same floors CI does.
 
 ### ruff
 

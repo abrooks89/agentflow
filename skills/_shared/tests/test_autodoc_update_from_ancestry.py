@@ -11,10 +11,12 @@ WHAT IT CAN PROVE
 * The guard lines themselves, extracted from SKILL.md (never a copy), exit nonzero naming both
   shas when FROM is off TO's history or missing from the clone, and exit 0 when FROM is an
   ancestor of TO.
+* The resolve-guard lines (FROM= and TO=) also run, and stop with their own message when the
+  manifest's last_sha or the branch ref cannot be resolved (gh#1008).
 
 WHAT IT CANNOT PROVE
 * That an operator picks a correct re-base point. The guard deliberately does not pick one.
-* The rest of Step 2 (fetch, manifest read, env carrier) - only the guard lines are executed.
+* The rest of Step 2 (fetch, reset, diffs, env carrier) - only the two guarded regions run.
 """
 
 from __future__ import annotations
@@ -188,3 +190,71 @@ def test_guard_refuses_missing_from_object(repos, tmp_path: Path) -> None:
     assert "GUARD-PASSED" not in r.stdout
     assert ghost in r.stderr and a2 in r.stderr, r.stderr
     assert "is not a commit in" in r.stderr, r.stderr
+
+
+# --------------------------------------------------------------------------------------------
+# resolve-guard (gh#1008): a FROM or TO that could not be resolved stops with its own message,
+# before the ancestry guard can misreport it as a rewritten history.
+# --------------------------------------------------------------------------------------------
+RESOLVE_START = "# resolve-guard:"
+RESOLVE_END = "# end resolve-guard"
+
+
+def _resolve_lines() -> str:
+    block = _step2_block()
+    assert RESOLVE_START in block and RESOLVE_END in block, "resolve-guard markers missing"
+    return block[block.index(RESOLVE_START) : block.index(RESOLVE_END)]
+
+
+def _run_resolve(src: Path, autodoc: Path, branch: str = "master"):
+    script = "set -u\n" + _resolve_lines() + 'echo "RESOLVED FROM=$FROM TO=$TO"\n'
+    env = {**os.environ, **_GIT_ENV, "SRC": src.as_posix(), "AUTODOC": autodoc.as_posix(),
+           "source_branch": branch}
+    return subprocess.run([_bash(), "-c", script], env=env, capture_output=True, text=True,
+                          timeout=60)
+
+
+def _manifest(tmp_path: Path, body: str) -> Path:
+    autodoc = tmp_path / "autodoc"
+    autodoc.mkdir(exist_ok=True)
+    (autodoc / ".manifest.json").write_text(body, encoding="utf-8")
+    return autodoc
+
+
+def test_resolve_guard_precedes_the_ancestry_guard() -> None:
+    block = _step2_block()
+    assert block.index(RESOLVE_END) < block.index(GUARD_START)
+    resolve = _resolve_lines()
+    assert resolve.count("exit 1") >= 2, "both FROM= and TO= must fail the block"
+
+
+def test_resolve_guard_passes_on_a_readable_manifest_and_a_real_ref(repos, tmp_path) -> None:
+    _work, clone, a1, a2 = repos
+    r = _run_resolve(clone, _manifest(tmp_path, '{"last_sha": "%s"}' % a1))
+    assert r.returncode == 0, r.stderr
+    assert f"RESOLVED FROM={a1} TO={a2}" in r.stdout
+
+
+@pytest.mark.parametrize("body", ["{}", '{"last_sha": ""}', '{"last_sha": null}', "not json"])
+def test_unreadable_last_sha_is_named_and_not_called_a_rewrite(repos, tmp_path, body) -> None:
+    _work, clone, _a1, _a2 = repos
+    r = _run_resolve(clone, _manifest(tmp_path, body))
+    assert r.returncode != 0 and "RESOLVED" not in r.stdout
+    assert "could not read last_sha" in r.stderr, r.stderr
+    assert "rewritten" not in r.stderr.replace("not a rewritten history", ""), r.stderr
+
+
+def test_missing_manifest_is_named(repos, tmp_path) -> None:
+    _work, clone, _a1, _a2 = repos
+    empty = tmp_path / "no-manifest"
+    empty.mkdir()
+    r = _run_resolve(clone, empty)
+    assert r.returncode != 0 and "could not read last_sha" in r.stderr, r.stderr
+
+
+def test_unresolvable_branch_is_named_and_not_called_a_rewrite(repos, tmp_path) -> None:
+    _work, clone, a1, _a2 = repos
+    r = _run_resolve(clone, _manifest(tmp_path, '{"last_sha": "%s"}' % a1), branch="no-such")
+    assert r.returncode != 0 and "RESOLVED" not in r.stdout
+    assert "origin/no-such does not resolve" in r.stderr, r.stderr
+    assert "rewritten" not in r.stderr.replace("not a rewritten history", ""), r.stderr

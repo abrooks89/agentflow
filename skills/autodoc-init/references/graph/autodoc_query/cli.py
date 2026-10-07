@@ -73,9 +73,12 @@ def _render_pretty(res: QueryResult) -> str:
     if res.reports:
         lines.append(f"kept {len(res.reports)} community report(s):")
         for rep in res.reports:
+            # visible on the line itself: a stale summary reads exactly like a
+            # fresh one, so the marker is the only thing that tells them apart
+            stale = " [STALE: code moved since this report]" if rep.get("stale") else ""
             lines.append(
                 f"  [{rep['score']:.0f}/10] {rep['label']} (community "
-                f"{rep['community_id']}, level {rep['level']}): {rep['summary']}"
+                f"{rep['community_id']}, level {rep['level']}){stale}: {rep['summary']}"
             )
     lines.append(f"{len(res.items)} context item(s):")
     for item in res.items:
@@ -158,7 +161,7 @@ def main(argv: list[str] | None = None,
     adapter = SqliteGraphAdapter(args.db)
     try:
         question, mode, via_prefix = parse_prefix(args.question, args.mode)
-        adapter.open(args.corpus)
+        adapter.open(args.corpus, create=False)
         res = query(
             question, adapter, mode=mode,
             embedder=embedder, ollama_url=args.ollama_url,

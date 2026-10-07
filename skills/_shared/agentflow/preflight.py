@@ -47,7 +47,7 @@ from typing import Iterable, Optional, Sequence
 
 _NL = chr(10)
 
-#: The tool a self-waking loop cannot do without. Five of the six loops self-continue;
+#: The tool a self-waking loop cannot do without. Six of the seven loops self-continue;
 #: dev-manager stopped when E-0220 moved the unattended pump to the steward, so it is the one
 #: seat that needs neither tool.
 SELF_WAKE_TOOL = "ScheduleWakeup"

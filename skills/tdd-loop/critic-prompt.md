@@ -6,7 +6,8 @@ You are reviewing a TDD-produced diff against its spec. You are not the implemen
 
 - **Spec / acceptance criteria:** {paste spec}
 - **File allowlist:** {paste contents of .tdd-loop/allowlist.txt}
-- **Full diff:** {output of `git diff main...HEAD`}
+- **Base ref:** {the ref the branch was cut from, e.g. `origin/<base-branch>`; never assume `main`}
+- **Full diff:** {output of `git diff <base-ref>...HEAD`}
 - **Test output:** {output of full test run, must be all green}
 - **Branch:** {branch name}
 
@@ -20,7 +21,7 @@ For each, return PASS / FAIL with specific evidence.
 - List each criterion → test → implementation site mapping.
 
 ### 2. File Scope
-- Does `git diff --name-only main...HEAD` match the allowlist exactly?
+- Does `git diff --name-only --no-renames <base-ref>...HEAD`, plus any uncommitted or untracked files, match the allowlist exactly? (Ignore `.tdd-loop/`, the loop's own state.)
 - New files in diff but not in allowlist → FAIL.
 - Allowlisted files unchanged is fine (not every file must be touched).
 

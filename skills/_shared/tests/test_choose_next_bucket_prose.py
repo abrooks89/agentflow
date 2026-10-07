@@ -52,6 +52,18 @@ def test_step2_names_the_ended_board_states():
         assert f"`{state}`" in step2, state
 
 
+def test_step2_buckets_unreadable_boards_apart_from_candidates():
+    # A board nobody can read a run out of (an unrecognised `status:`, or more than one board for
+    # the slug) is refused by the survey: neither a candidate nor a dep anyone can wait on.
+    step2 = _step(2)
+    assert "**Unreadable boards**" in step2
+    bullet = step2.split("**Unreadable boards**", 1)[1].split("\n- **", 1)[0]
+    for state in (s.UNRECOGNISED_BOARD_STATUS, s.DUPLICATE_STATUS_BOARDS):
+        assert f"`{state}`" in bullet, state
+        assert not s.is_candidate(s.EpicRecord(slug="x", title="x", lifecycle_state=state))
+    assert "not a candidate" in bullet and "MISSING-DEP" in bullet
+
+
 def test_step3_explains_ended_parents_honestly():
     step3 = _step(3)
     assert "will never land" in step3
@@ -63,7 +75,13 @@ def test_step3_explains_ended_parents_honestly():
 
 @pytest.mark.parametrize(
     ("parent", "bucket"),
-    [("abandoned", "MISSING-DEP"), ("failed", "MISSING-DEP"), ("done_on_hold", "CHAINED")],
+    [
+        ("abandoned", "MISSING-DEP"),
+        ("failed", "MISSING-DEP"),
+        ("done_on_hold", "CHAINED"),
+        (s.UNRECOGNISED_BOARD_STATUS, "MISSING-DEP"),
+        (s.DUPLICATE_STATUS_BOARDS, "MISSING-DEP"),
+    ],
 )
 def test_the_prose_matches_the_computed_bucket(parent, bucket):
     def rec(slug, state, deps=()):
@@ -103,3 +121,58 @@ def _bucket_explanations() -> dict[str, str]:
         elif current is not None:
             blocks[current] += "\n" + ln
     return blocks
+
+
+def test_step2_reads_candidates_through_the_shared_predicate():
+    # The skill and `blocked_status` must agree on what a candidate is; a restated tuple is how
+    # the skill came to skip the drafted and approved stages.
+    step2 = _step(2)
+    assert "is_candidate(r)" in step2
+    assert '("speccing", "planning")' not in step2
+    for state in ("drafted", "approved-for-autonomous"):
+        assert f"`{state}`" in step2, state
+
+
+def test_missing_dep_names_the_file_stem_cause_and_the_check_that_finds_it():
+    blocks = _bucket_explanations()
+    assert "dep spelled as a file stem; maps to `<slug>` (done)" in blocks["MISSING-DEP"]
+    assert "one of five reasons" in blocks["MISSING-DEP"]
+    assert "resolves_after_normalization(dep, known)" in _step(3)
+    assert "_resolves_after_normalization" not in _step(3)
+
+    # ...and the check the prose names really separates the two causes on such a dep.
+    def rec(slug, state, deps=()):
+        return s.EpicRecord(
+            slug=slug, title=slug, lifecycle_state=state, depends_on=list(deps), project="otherproj"
+        )
+
+    recs = [
+        rec("parent", "done"),
+        rec("child", "drafted", ["2026-01-02-parent", "ghost"]),
+    ]
+    assert s.blocked_status(recs[1], recs) == "MISSING-DEP"
+    known = {r.slug for r in recs}
+    assert s.resolves_after_normalization("2026-01-02-parent", known) == "parent"
+    assert s._resolves_after_normalization("ghost", known) is None
+
+
+def test_steps_5_and_7_hand_over_the_surveyed_source_path():
+    step5, step7 = _step(5), _step(7)
+    assert "handoff_path(record, env.data_root)" in step5
+    assert "record.source_path" in step5
+    assert "handoff_path" in step7
+    # The rebuilt-path recipe survives only as the fallback handoff_path runs, never as the
+    # instruction.
+    assert "design/specs/YYYY-MM-DD-<slug>.md" not in step5
+
+
+def test_a_drafted_pick_shows_its_missing_approval_on_the_card_and_at_handoff():
+    # Drafted and speccing epics are candidates now; nothing else on the way to /project tells
+    # the human that no one has approved them for autonomous builds.
+    assert "speccing" in _step(2) and "no approval for autonomous builds" in _step(2)
+    step6 = _step(6)
+    assert "lifecycle state" in step6
+    assert "drafted - not yet approved for autonomous builds" in step6
+    step7 = _step(7).split("If the user picks", 1)[0]
+    assert "is drafted - not yet approved for autonomous builds" in step7
+    assert step7.index("not yet approved") < step7.index("Invoke `/project <path>`")

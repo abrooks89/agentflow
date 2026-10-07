@@ -40,6 +40,7 @@ STDLIB ONLY. No network, no model call, no clock beyond the commit timestamp git
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import dataclass, field
 import datetime as _dt
 import os
@@ -48,9 +49,9 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
-from agentflow.pillar_residue import ResidueUnmeasurable, sanitize_pattern
+from agentflow.pillar_residue import ResidueUnmeasurable, person_pattern, sanitize_pattern
 from agentflow.sanitize_extra import (
     ExtraPattern,
     ExtraPatternUnreadable,
@@ -83,21 +84,28 @@ CUT_BRANCH = "master"
 #: ``ignorecase`` and ``precomposeunicode`` depend on the filesystem), plus the three
 #: :func:`build_cut` sets. The two ``extensions`` keys are repository-format markers a git that
 #: defaults to SHA-256 or reftable writes at init; neither runs anything or names a URL.
-ALLOWED_CONFIG_KEYS = frozenset(
-    {
-        "core.repositoryformatversion",
-        "core.filemode",
-        "core.bare",
-        "core.logallrefupdates",
-        "core.symlinks",
-        "core.ignorecase",
-        "core.precomposeunicode",
-        "core.autocrlf",
-        "core.safecrlf",
-        "extensions.objectformat",
-        "extensions.refstorage",
-    }
-)
+#:
+#: Each key is pinned to the values ``git init`` or :func:`build_cut` can write, because a
+#: permitted name can still carry a value that changes the repo under the push (``core.bare``
+#: true, a ``logAllRefUpdates`` that stamps reflogs with the ambient identity). The
+#: filesystem-dependent booleans take either value; the keys :func:`build_cut` sets, and
+#: ``core.bare`` in a non-bare cut, take only ``false``. ``repositoryformatversion`` is 1
+#: when git init writes an ``extensions`` key.
+_CONFIG_BOOLEANS = frozenset({"true", "false"})
+ALLOWED_CONFIG_VALUES: dict[str, frozenset[str]] = {
+    "core.repositoryformatversion": frozenset({"0", "1"}),
+    "core.filemode": _CONFIG_BOOLEANS,
+    "core.bare": frozenset({"false"}),
+    "core.logallrefupdates": frozenset({"false"}),
+    "core.symlinks": _CONFIG_BOOLEANS,
+    "core.ignorecase": _CONFIG_BOOLEANS,
+    "core.precomposeunicode": _CONFIG_BOOLEANS,
+    "core.autocrlf": frozenset({"false"}),
+    "core.safecrlf": frozenset({"false"}),
+    "extensions.objectformat": frozenset({"sha1", "sha256"}),
+    "extensions.refstorage": frozenset({"files", "reftable"}),
+}
+ALLOWED_CONFIG_KEYS = frozenset(ALLOWED_CONFIG_VALUES)
 
 #: The runbook the gate requires to ship in the cut.
 RUNBOOK_PATH = "docs/runbooks/publish.md"
@@ -121,6 +129,9 @@ _WAIVER_BULLET_RE = re.compile(r"^\s*[-*]\s+([a-z_]+)\s*:(.*)$")
 #: A fenced-code-block delimiter: three or more backticks or tildes, indented at most three
 #: spaces. Group 1 is the run, group 2 what follows it (an info string on an opening fence).
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+#: A line that opens an HTML comment BLOCK: ``<!--`` first, indented at most three spaces.
+#: Anywhere else on a line, ``<!--`` is a comment only if ``-->`` closes it on that line.
+_COMMENT_BLOCK_RE = re.compile(r"^ {0,3}<!--")
 
 #: The local-only term list inside ``<data_root>/projects/<project>/``. It lives in the data
 #: root, never in the repo, so the terms it guards against never ship with the cut.
@@ -201,7 +212,15 @@ class CutRefused(Exception):
 
 
 class GitFailed(Exception):
-    """A git call exited non-zero where success was required."""
+    """A git call exited non-zero where success was required. ``command`` and ``returncode``
+    are set when :func:`_run` raised it, so a caller can re-raise it without git's stderr."""
+
+    def __init__(
+        self, message: str, command: str | None = None, returncode: int | None = None
+    ) -> None:
+        super().__init__(message)
+        self.command = command
+        self.returncode = returncode
 
 
 # --------------------------------------------------------------------------- #
@@ -236,7 +255,10 @@ def _run(
     )
     if check and proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip()
-        raise GitFailed(f"{' '.join(argv[:4])} ... exited {proc.returncode}: {err}")
+        command = " ".join(argv[:4])
+        raise GitFailed(
+            f"{command} ... exited {proc.returncode}: {err}", command, proc.returncode
+        )
     return proc
 
 
@@ -376,11 +398,35 @@ def _hits(
     return found
 
 
+def _path_holder(
+    terms: Sequence[tuple[int, str]],
+    extra: re.Pattern | None = None,
+    person: re.Pattern | None = None,
+) -> Callable[[str], bool]:
+    """Whether a path must never print whole: it holds a term as a case-insensitive substring,
+    or the extra pattern or the personal name matches it. :func:`_path_display` says why."""
+    folded = [term.casefold() for _, term in terms]
+
+    def held(path: str) -> bool:
+        return (
+            any(t in path.casefold() for t in folded)
+            or bool(extra and extra.search(path))
+            or bool(person and person.search(path))
+        )
+
+    return held
+
+
+def _holds_nothing(path: str) -> bool:
+    return False
+
+
 def _path_display(
     files: CutFiles,
     terms: Sequence[tuple[int, str]],
     dropped: Sequence[str] = (),
     extra: re.Pattern | None = None,
+    person: re.Pattern | None = None,
 ) -> Callable[[str], str]:
     """How every check prints a path, so no check's output can carry a sensitive term.
 
@@ -390,12 +436,9 @@ def _path_display(
     not need it costs a lookup, and failing to mask one publishes the term in the run log.
     A path the local extra sanitize pattern (``extra``, compiled ignoring case) matches is
     masked the same way: those alternatives are kept out of ``ci.yml`` for the same reason the
-    terms are kept out of the tree."""
-    folded = [term.casefold() for _, term in terms]
-
-    def held(path: str) -> bool:
-        return any(t in path.casefold() for t in folded) or bool(extra and extra.search(path))
-
+    terms are kept out of the tree. So is a path the personal name (``person``) matches: the
+    ``person-name`` report promises the name never reaches the output."""
+    held = _path_holder(terms, extra, person)
     labels: dict[str, str] = {}
     for kind, paths in (("cut", files.paths), ("dropped", dropped)):
         for i, path in enumerate(paths, 1):
@@ -423,54 +466,115 @@ def _is_iso_date(text: str) -> bool:
     return True
 
 
-def _unfenced(lines: list[str]) -> Iterable[tuple[int, str]]:
-    """``(1-based line number, line)`` for every line outside a fenced code block.
+def _strip_inline_comments(text: str) -> str:
+    """``text`` without the HTML comments that open AND close on it.
+
+    A ``<!--`` with no ``-->`` after it on the same text is literal, as GFM renders it: reading
+    it as a comment that runs on would hide every ledger row after a stray one in a cell and
+    turn a FAIL into a PASS. A ``<!--`` inside an inline code span is code, not a comment."""
+    kept: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "`":
+            run = len(text) - i - len(text[i:].lstrip("`"))
+            close = re.compile(rf"(?<!`)`{{{run}}}(?!`)").search(text, i + run)
+            # An unmatched run is literal backticks, and what follows it is read normally.
+            stop = close.end() if close else i + run
+            kept.append(text[i:stop])
+            i = stop
+        elif text.startswith("<!--", i) and (end := text.find("-->", i + 2)) >= 0:
+            i = end + 3
+        else:
+            kept.append(text[i])
+            i += 1
+    return "".join(kept)
+
+
+def _visible(lines: list[str]) -> tuple[list[str], str | None]:
+    """``lines`` as a reader of the rendered markdown sees them: one entry per line, with every
+    line inside a fenced code block or an HTML comment block, and every comment span, blanked.
+    Also returns what is still open at the end of the file, or None.
 
     A fence opens on three or more backticks or tildes and closes on a run of the SAME
     character at least as long with nothing after it, so a shorter run or the other character
     inside a block is content (that is how a block shows a fence). A backtick opener whose
-    info string holds a backtick is not a fence. A fence never closed runs to the end of the
-    file: a pasted example that lost its closing line must not start counting as real text.
-    The delimiter lines themselves are never yielded."""
+    info string holds a backtick is not a fence. A comment BLOCK opens only on a line that
+    starts with ``<!--`` (up to three spaces in) and runs to the line holding ``-->``; text
+    after that ``-->`` is read. Any other comment is :func:`_strip_inline_comments`'s. A
+    ``<!--`` inside a fence is content, and a fence delimiter inside a comment is comment.
+    The delimiter lines themselves are blanked too. Blanking rather than dropping keeps line
+    numbers and keeps a hidden block from joining the lines around it.
+
+    A fence or comment block never closed is reported, not trusted: the renderer hides the
+    rest of the file, but whether the rest was meant to be hidden or lost its closing line
+    cannot be told, so the caller must not measure past it."""
+    shown: list[str] = []
     fence: tuple[str, int] | None = None
+    opened_at = 0
+    comment = False
     for n, line in enumerate(lines, 1):
         m = _FENCE_RE.match(line)
-        if fence is None:
-            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
-                fence = (m.group(1)[0], len(m.group(1)))
-                continue
-            yield n, line
-        elif (
-            m
-            and m.group(1)[0] == fence[0]
-            and len(m.group(1)) >= fence[1]
-            and not m.group(2).strip()
-        ):
-            fence = None
+        if fence is not None:
+            if (
+                m
+                and m.group(1)[0] == fence[0]
+                and len(m.group(1)) >= fence[1]
+                and not m.group(2).strip()
+            ):
+                fence = None
+            shown.append("")
+        elif comment:
+            end = line.find("-->")
+            if end >= 0:
+                comment = False
+                shown.append(_strip_inline_comments(line[end + 3 :]))
+            else:
+                shown.append("")
+        elif m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            fence, opened_at = (m.group(1)[0], len(m.group(1))), n
+            shown.append("")
+        elif _COMMENT_BLOCK_RE.match(line):
+            start = line.index("<!--")
+            # From start + 2, not + 4: `<!-->` and `<!--->` are whole comments in GFM, and
+            # searching past them would hide everything up to the next `-->`.
+            end = line.find("-->", start + 2)
+            if end >= 0:
+                shown.append(_strip_inline_comments(line[end + 3 :]))
+            else:
+                comment, opened_at = True, n
+                shown.append("")
+        else:
+            shown.append(_strip_inline_comments(line))
+    if fence is not None:
+        return shown, f"the fence opened on line {opened_at} never closes"
+    if comment:
+        return shown, f"the HTML comment opened on line {opened_at} never closes"
+    return shown, None
 
 
-def _near_waiver_headings(lines: list[str]) -> list[int]:
-    """Line numbers of unfenced headings that look like a waiver heading but are not one."""
+def _near_waiver_headings(visible: list[str]) -> list[int]:
+    """Line numbers of visible headings that look like a waiver heading but are not one."""
     return [
         n
-        for n, line in _unfenced(lines)
+        for n, line in enumerate(visible, 1)
         if _NEAR_WAIVER_HEADING_RE.match(line) and not _WAIVER_HEADING_RE.match(line)
     ]
 
 
-def _read_waiver(lines: list[str]) -> dict[str, str] | None:
+def _read_waiver(visible: list[str]) -> dict[str, str] | None:
     """The ledger's ``## Waiver`` fields, or None when it has no such section.
 
     A section runs to the next ``#`` or ``##`` heading; bullets outside one waive nothing.
-    Lines inside a fenced code block (``` or ~~~) are skipped entirely: a filled-in example
-    pasted in a fence is documentation, not the human's recorded word.
+    ``visible`` is :func:`_visible`'s view, so a fenced code block (``` or ~~~) or an HTML
+    comment is skipped entirely: a filled-in example pasted in either is documentation, not
+    the human's recorded word.
     Raises :class:`PublishUnmeasurable` naming the field when a waiver is present but not
     complete and valid: a field missing, empty or given twice (across sections too), a
     ``waived_on`` that is not an ISO date, or a ``scope`` other than :data:`WAIVER_SCOPE`.
     A waiver that cannot be read exactly one way is not read at all."""
     fields: dict[str, str] = {}
     found = inside = False
-    for _, line in _unfenced(lines):
+    for line in visible:
         if _WAIVER_HEADING_RE.match(line):
             found = inside = True
             continue
@@ -498,8 +602,18 @@ def _read_waiver(lines: list[str]) -> dict[str, str] | None:
 def check_ledger(ledger: Path | None, why: str | None = None) -> Result:
     """Every ledger row carries a ``rotated_on`` date, or the ledger records a complete waiver.
 
+    Every visible table whose header has a ``rotated_on`` column (the cell matched without
+    regard to case) is counted, and the counts are summed. Each needs a separator row and at
+    least one row, and each row needs at least its own table's header cell count; a table that
+    fails any of these is unmeasurable. So are a ``rotated_on`` header and separator directly
+    under another table's rows (GFM renders the two as one table), a header with two
+    ``rotated_on`` columns, and a ``rotated_on`` table inside a blockquote: none can be counted
+    one way, and skipping them would leave their rows unjudged.
+
     A waiver passes with its signer and date and the undated count; its reason, its evidence
-    and every table cell stay unprinted. An incomplete or invalid waiver is unmeasurable."""
+    and every table cell stay unprinted. An incomplete or invalid waiver is unmeasurable.
+    Neither the table nor the waiver is read from inside a fenced code block or an HTML
+    comment (:func:`_visible`), and a fence or comment block left open is unmeasurable."""
     name = "ledger-dated"
     if ledger is None:
         return Result(name, UNMEASURABLE, f"no ledger path: {why or 'pass --ledger or --project'}")
@@ -509,49 +623,109 @@ def check_ledger(ledger: Path | None, why: str | None = None) -> Result:
         return Result(name, UNMEASURABLE, f"cannot read {ledger}: {type(exc).__name__}")
     except UnicodeDecodeError:
         return Result(name, UNMEASURABLE, f"{ledger} is not UTF-8")
+    # The table is read from the same view as the waiver: an example table in a fence or a
+    # comment is documentation, and reading it first would let its dates stand in for the
+    # real rows.
+    raw = lines
+    lines, unclosed = _visible(lines)
+    if unclosed:
+        # Fail closed: a stray opener hides every row after it, which could turn a FAIL into
+        # a PASS, so an unclosed block is a reason to stop, never a reason to count less.
+        return Result(name, UNMEASURABLE, f"{ledger}: {unclosed}, so its rows cannot be counted")
 
-    def cells(line: str) -> list[str]:
-        return [c.strip() for c in line.strip().strip("|").split("|")]
+    def cells(i: int) -> list[str]:
+        # GFM splits a row on `|` before it reads inline comments, so a pipe inside a comment
+        # ends the cell and the comment is literal text. Split the raw row first, then strip
+        # each cell; stripping first would read a date the rendered table does not show.
+        line = raw[i] if raw[i].lstrip().startswith("|") else lines[i]
+        return [_strip_inline_comments(c).strip() for c in line.strip().strip("|").split("|")]
 
-    header_at = None
-    for i, line in enumerate(lines):
-        if line.lstrip().startswith("|") and "rotated_on" in cells(line):
-            header_at = i
-            break
-    if header_at is None:
-        return Result(name, UNMEASURABLE, f"{ledger} has no table with a rotated_on column")
-    header = cells(lines[header_at])
-    col = header.index("rotated_on")
-    if header_at + 1 >= len(lines) or not re.match(r"^\s*\|[\s:|-]+\|?\s*$", lines[header_at + 1]):
-        return Result(name, UNMEASURABLE, f"{ledger}: the rotated_on table has no separator row")
-    rows = []
-    for line in lines[header_at + 2 :]:
-        if not line.lstrip().startswith("|"):
-            break
-        row = cells(line)
-        if len(row) < len(header):
+    def rotated(row: list[str]) -> int:
+        return sum(1 for c in row if c.lower() == "rotated_on")
+
+    def separator(i: int) -> bool:
+        return i < len(lines) and bool(re.match(r"^\s*\|[\s:|-]+\|?\s*$", lines[i]))
+
+    # A quoted table renders as a table, but its rows are not read below; refuse it rather
+    # than leave them unjudged. A quote may sit behind a list marker and use tabs, and its cells
+    # are split from the raw line, as cells() splits a table row, before comments are stripped.
+    quote = re.compile(r"^[ 	]*(?:(?:[-*+]|\d+[.)])[ 	]+)?(?:>[ 	]*)+")
+    for n, line in enumerate(lines, 1):
+        m = quote.match(line)
+        if not m:
+            continue
+        body = quote.sub("", raw[n - 1], count=1)
+        split = body.strip().strip("|").split("|")
+        if body.startswith("|") and rotated([_strip_inline_comments(c).strip() for c in split]):
             return Result(
                 name,
                 UNMEASURABLE,
-                f"{ledger}: a row has {len(row)} cells, the header has {len(header)}",
+                f"{ledger}: line {n} holds a rotated_on table inside a blockquote; "
+                "move it out of the quote so it can be counted",
             )
-        rows.append(row)
-    if not rows:
-        return Result(name, UNMEASURABLE, f"{ledger}: the rotated_on table has no rows")
-    dated = sum(1 for row in rows if _is_iso_date(row[col]))
+
+    # Every visible rotated_on table counts, not only the first: an undated row in a later
+    # table (an addendum section) is as unrotated as one in the first.
+    tables = 0
+    total = dated = 0
+    i = 0
+    while i < len(lines):
+        if not (lines[i].lstrip().startswith("|") and rotated(cells(i))):
+            i += 1
+            continue
+        tables += 1
+        header = cells(i)
+        which = "the rotated_on table" if tables == 1 else f"rotated_on table {tables}"
+        if rotated(header) > 1:
+            return Result(
+                name,
+                UNMEASURABLE,
+                f"{ledger}: {which} has {rotated(header)} rotated_on columns; keep one",
+            )
+        col = [c.lower() for c in header].index("rotated_on")
+        if not separator(i + 1):
+            return Result(name, UNMEASURABLE, f"{ledger}: {which} has no separator row")
+        rows = []
+        i += 2
+        while i < len(lines) and lines[i].lstrip().startswith("|"):
+            row = cells(i)
+            if rotated(row) and separator(i + 1):
+                # GFM renders this as ONE table, the second header and separator as body rows,
+                # while a reader would see two; neither reading is safe to count.
+                return Result(
+                    name,
+                    UNMEASURABLE,
+                    f"{ledger}: line {i + 1} starts a rotated_on table directly under {which}; "
+                    "add a blank line between the tables",
+                )
+            if len(row) < len(header):
+                return Result(
+                    name,
+                    UNMEASURABLE,
+                    f"{ledger}: a row of {which} has {len(row)} cells, the header has {len(header)}",
+                )
+            rows.append(row)
+            i += 1
+        if not rows:
+            return Result(name, UNMEASURABLE, f"{ledger}: {which} has no rows")
+        total += len(rows)
+        dated += sum(1 for row in rows if _is_iso_date(row[col]))
+    if not tables:
+        return Result(name, UNMEASURABLE, f"{ledger} has no table with a rotated_on column")
     try:
         waiver = _read_waiver(lines)
     except PublishUnmeasurable as exc:
         return Result(name, UNMEASURABLE, f"{ledger}: {exc}")
+    across = f" across {tables} rotated_on tables" if tables > 1 else ""
     if waiver is not None:
         return Result(
             name,
             PASS,
             f"waived by {waiver['waived_by']} on {waiver['waived_on']}: "
-            f"{len(rows) - dated} of {len(rows)} rows undated",
+            f"{total - dated} of {total} rows undated{across}",
         )
-    status = PASS if dated == len(rows) else FAIL
-    detail = f"{dated} of {len(rows)} rows dated"
+    status = PASS if dated == total else FAIL
+    detail = f"{dated} of {total} rows dated{across}"
     near = _near_waiver_headings(lines) if status == FAIL else []
     if near:
         # Line numbers only: the heading is the ledger's text, and a finding never prints it.
@@ -646,15 +820,20 @@ _LoadedTerms = tuple[list[tuple[int, str]], Result | None]
 def _load_sensitive_terms(terms_path: Path | None, why: str | None = None) -> _LoadedTerms:
     """The local list's terms, or no terms plus the ``sensitive-terms`` result that says why.
 
-    No list is ``not configured`` and passes: this is an extra guard, not a new requirement.
-    The status line names the path it looked for, so "not configured" is never a surprise. A
-    list that exists but cannot be read, or a path the config could not resolve, cannot be
-    measured."""
+    A named list that does not exist, or lists no terms, is ``not configured`` and passes: this
+    is an extra guard, not a new requirement. The status line names the path it looked for, so
+    "not configured" is never a surprise. A list that exists but cannot be read, a path the
+    config could not resolve, or no path at all cannot be measured: nothing was looked at, and
+    a caller that forgot the path must not read as one that checked."""
     name = "sensitive-terms"
     if terms_path is None and why:
         return [], Result(name, UNMEASURABLE, f"no terms list path: {why}")
     if terms_path is None:
-        return [], Result(name, PASS, "not configured: no --sensitive-terms and no --project")
+        return [], Result(
+            name,
+            UNMEASURABLE,
+            "no terms list path was given (no --sensitive-terms and no --project)",
+        )
     if not terms_path.exists():
         return [], Result(name, PASS, f"not configured: {terms_path} does not exist")
     try:
@@ -756,24 +935,31 @@ def check_key_shapes(files: CutFiles, show: Callable[[str], str] = _as_is) -> Re
 
 
 def check_excluded_paths(
-    files: CutFiles, dropped: Sequence[str], show: Callable[[str], str] = _as_is
+    files: CutFiles, dropped: Sequence[str] | None, show: Callable[[str], str] = _as_is
 ) -> Result:
+    """``dropped`` is the paths the cut left out of its tree; None is unknown, which is the
+    case for every caller but ``cut``: the tree alone cannot say what it was cut from. The
+    line then labels that half unmeasured instead of counting it as zero."""
     present = [p for p in files.paths if is_excluded(p)]
     extra = [f"in cut: {show(p)}" for p in present]
-    extra += [f"dropped by cut: {show(p)}" for p in dropped]
+    extra += [f"dropped by cut: {show(p)}" for p in dropped or ()]
+    unmeasured = "dropped paths not measured: only cut knows them"
     if extra:
+        counts = (
+            f"{len(present)} in the cut; {unmeasured}"
+            if dropped is None
+            else f"{len(present)} in the cut, {len(dropped)} dropped from the source rev"
+        )
         return Result(
             "excluded-paths",
             FAIL,
-            f"{len(present)} in the cut, {len(dropped)} dropped from the source rev; "
-            "remove them from the source branch",
+            f"{counts}; remove them from the source branch",
             tuple(extra),
         )
-    return Result(
-        "excluded-paths",
-        PASS,
-        "0 paths match " + " ".join(EXCLUDED_PATTERNS) + " (any segment, any case)",
-    )
+    detail = "0 paths match " + " ".join(EXCLUDED_PATTERNS) + " (any segment, any case)"
+    if dropped is None:
+        detail += f"; {unmeasured}"
+    return Result("excluded-paths", PASS, detail)
 
 
 def check_tracker_links(
@@ -822,10 +1008,12 @@ def _shown_key(key: str) -> str:
 
 def check_cut_shape(tree: Path) -> Result:
     """The repo at ``tree`` is still what ``build_cut`` made: one parentless commit, stamped by
-    the cut identity, on :data:`CUT_BRANCH` alone, no hook file, and a repo config holding
-    only :data:`ALLOWED_CONFIG_KEYS`. The content checks read only HEAD's tree, so without this
-    a cut somebody committed to again, or added a remote to, passes them. Findings name what
-    is wrong, never the identity, remote, URL or include path found."""
+    the cut identity, on :data:`CUT_BRANCH` alone, no hook file, no ``objects/info/alternates``,
+    and a repo config holding only :data:`ALLOWED_CONFIG_KEYS`, each at a value
+    :data:`ALLOWED_CONFIG_VALUES` permits. The content checks read only HEAD's tree, so without
+    this a cut somebody committed to again, or added a remote to, passes them. Findings name
+    what is wrong, never the identity, remote, URL or include path found; an allow-listed key's
+    wrong value is shown, cut short."""
     name = "cut-shape"
     try:
         count = _git(tree, "rev-list", "--all", "--count").stdout.decode().strip()
@@ -836,7 +1024,8 @@ def check_cut_shape(tree: Path) -> Result:
         # `worktree` scope is `config.worktree`, which `extensions.worktreeConfig` switches on:
         # a narrower read (`--local`, or one named key) missed both (gh#728). A git without
         # `--show-scope` (older than 2.26) fails here, which is "cannot measure", never a pass.
-        cfg = _git(tree, "config", "--list", "--show-scope", "--name-only", "--includes")
+        # `-z` because the values are read too, and a value may hold a newline.
+        cfg = _git(tree, "config", "--list", "--show-scope", "--includes", "-z")
         # The common dir, not the git dir: hooks are read from there. core.hooksPath is refused
         # below, so `<common dir>/hooks` is the only place git will look for one.
         common = _git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -844,14 +1033,26 @@ def check_cut_shape(tree: Path) -> Result:
         return Result(name, UNMEASURABLE, f"cannot read the cut: {exc}")
     # System, global and command-line scope belong to the machine running the check, not to
     # the cut; only the repo's own files travel with the directory.
+    # `-z` prints `<scope>NUL<key>LF<value>NUL` per entry, or `<scope>NUL<key>NUL` for a key
+    # written with no `=` (which git reads as boolean true).
     keys: list[tuple[str, str]] = []
-    for line in cfg.stdout.decode("utf-8", "replace").splitlines():
-        scope, tab, key = line.partition("\t")
-        if not tab:
-            return Result(name, UNMEASURABLE, f"cannot parse git config's scope output: {line!r}")
+    values: list[tuple[str, str, str | None]] = []  # (scope, key, value), the same entries
+    tokens = cfg.stdout.decode("utf-8", "replace").split("\0")
+    if tokens[-1] == "":
+        tokens.pop()
+    if len(tokens) % 2:
+        return Result(name, UNMEASURABLE, "cannot parse git config's -z scope output")
+    for scope, entry in zip(tokens[0::2], tokens[1::2]):
+        key, newline, value = entry.partition("\n")
         if scope in ("local", "worktree"):
             keys.append((scope, key))
-    hooks_dir = Path(common.stdout.decode("utf-8", "replace").strip()) / "hooks"
+            values.append((scope, key, value if newline else None))
+    common_dir = Path(common.stdout.decode("utf-8", "replace").strip())
+    hooks_dir = common_dir / "hooks"
+    # build_cut never writes an alternates file, and one lends the cut another repo's object
+    # store, so the cut is no longer only what build_cut put in it. Any entry at the path
+    # counts, an empty file or a dangling link included: lexists, not is_file.
+    alternates = os.path.lexists(common_dir / "objects" / "info" / "alternates")
     try:
         # git runs only `hooks/<hook name>`, so the `*.sample` files its default template
         # ships are inert under any name git looks for. They are allowed: a re-run `git init`
@@ -896,6 +1097,17 @@ def check_cut_shape(tree: Path) -> Result:
             hooks_path.append(scope)
         else:
             other.append(f"{scope} {_shown_key(key)}")
+    # An allow-listed key at a value git init and build_cut never write. Booleans compare the
+    # way git reads them, case-insensitively; git reads the other values case-sensitively.
+    bad_values: list[str] = []
+    for scope, key, value in values:
+        allowed = ALLOWED_CONFIG_VALUES.get(key)
+        if allowed is None:
+            continue
+        seen = value.lower() if value is not None and allowed <= _CONFIG_BOOLEANS else value
+        if seen not in allowed:
+            shown = "(no value)" if value is None else repr(value[:40])
+            bad_values.append(f"{scope} {key} = {shown}, want {' or '.join(sorted(allowed))}")
 
     def where(scopes: Iterable[str]) -> str:
         return f" ({', '.join(sorted(set(scopes)))} config)"
@@ -928,8 +1140,18 @@ def check_cut_shape(tree: Path) -> Result:
         problems.append(
             f"{len(other)} config key(s) outside the allow-list: {', '.join(sorted(other))}"
         )
+    if bad_values:
+        problems.append(
+            f"{len(bad_values)} allow-listed config key(s) at a value git init and build_cut "
+            f"never write: {'; '.join(sorted(bad_values))}"
+        )
     if hooks:
         problems.append(f"{len(hooks)} hook file(s) besides git's inert *.sample files, want none")
+    if alternates:
+        problems.append(
+            "objects/info/alternates is present, want none: build_cut never writes one, and it "
+            "borrows another repo's objects; delete the cut and build it again"
+        )
     extra_refs = [r for r in refs if r != f"refs/heads/{CUT_BRANCH}"]
     if extra_refs:
         problems.append(f"{len(extra_refs)} ref(s) besides refs/heads/{CUT_BRANCH}, want none")
@@ -941,7 +1163,7 @@ def check_cut_shape(tree: Path) -> Result:
         name,
         PASS,
         f"1 parentless commit by {AUTHOR_NAME}, refs/heads/{CUT_BRANCH} only, "
-        "only allow-listed config keys, no hook",
+        "only allow-listed config keys and values, no hook, no alternates",
     )
 
 
@@ -998,6 +1220,30 @@ def report_tracker_refs(files: CutFiles) -> Result:
     return Result("tracker-refs", REPORT, f"{n} plain gh#N references")
 
 
+def _source_problem(source: Path, verified: str) -> str:
+    """Why ``verified`` could not be read from ``source``: the checkout is missing, is not a
+    directory, is not a git repository or not its top level, or is a repository without that
+    tree. Only the last is fixed by a fetch."""
+    if not source.exists():
+        return f"source checkout {source} does not exist"
+    if not source.is_dir():
+        return f"source {source} is not a directory"
+    try:
+        probe = _git(source, "rev-parse", "--show-prefix", check=False)
+    except OSError as exc:
+        return f"cannot run git in {source}: {type(exc).__name__}"
+    if probe.returncode != 0:
+        return f"{source} is not a git repository"
+    if probe.stdout.strip():
+        # git walks up to an enclosing repository, so a plain directory inside some other
+        # checkout reads as a repository; only the checkout's own top level is a source.
+        return f"{source} is inside a git repository but is not its top level"
+    return (
+        f"verified tree {verified} is not in the source checkout; "
+        "fetch it or re-run the Linux drill"
+    )
+
+
 def report_install_evidence(
     files: CutFiles, tree: Path, source: Path | None, why: str | None = None
 ) -> Result:
@@ -1027,14 +1273,14 @@ def report_install_evidence(
         )
     try:
         old = {e.path: (e.mode, e.oid) for e in _ls_tree(source, verified)}
+    except (GitFailed, OSError):
+        # Only a real checkout that lacks the tree earns the fetch remedy; a missing or
+        # non-git --source is fixed by pointing it at the working checkout, not by a fetch.
+        return Result(name, REPORT, f"not measured: {_source_problem(source, verified)}")
+    try:
         new = {e.path: (e.mode, e.oid) for e in _ls_tree(tree, "HEAD")}
-    except GitFailed:
-        return Result(
-            name,
-            REPORT,
-            f"not measured: verified tree {verified} is not in the source checkout; "
-            "fetch it or re-run the Linux drill",
-        )
+    except (GitFailed, OSError) as exc:
+        return Result(name, REPORT, f"not measured: cannot read the cut tree's HEAD: {exc}")
     differ = sorted(p for p in old.keys() | new.keys() if old.get(p) != new.get(p))
     others = [p for p in differ if p != INSTALL_DOC]
     return Result(
@@ -1043,6 +1289,83 @@ def report_install_evidence(
         f"{len(others)} file(s) besides {INSTALL_DOC} differ from verified tree {verified} "
         "(never changes the exit code)",
     )
+
+
+def _person_matcher(name: str | None) -> tuple[re.Pattern | None, str | None]:
+    """The compiled personal-name pattern, or None and why it could not be built. The why
+    never carries the name."""
+    if name is None:
+        return None, None
+    try:
+        return re.compile(person_pattern(name), re.IGNORECASE), None
+    except ResidueUnmeasurable:
+        return None, (
+            "person.name not resolved: the name is empty or blank, and an empty pattern would "
+            "match everywhere (set person.name or pass --person-name)"
+        )
+
+
+# A field path in the schema's own shape: lower-case snake segments joined by dots.
+_SCHEMA_FIELD_PATH = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*")
+
+
+def _environment_failure(exc: BaseException, file: Path) -> str:
+    """Why the environment config did not load, naming the file and the KIND of failure but
+    never echoing the error's message. PyYAML's message quotes the offending source line, and
+    that line can be ``person.name``'s; so can a reason that repeats a bad value."""
+    if isinstance(exc, UnicodeDecodeError):
+        return f"{file}: not valid UTF-8 (at byte {exc.start})"
+    field_path = getattr(exc, "field_path", None)
+    if field_path is None:
+        return f"{file}: {type(exc).__name__}"
+    file = getattr(exc, "file", None) or file
+    if field_path == "<file>":
+        return f"{file}: config file not found"
+    if field_path == "<project>":
+        # A path-shaped name (separator, drive letter, `.`/`..`), refused before any file is
+        # read. The name itself is not repeated: the caller already says which project.
+        return f"{file}: invalid project name (a name is a bare file stem, not a path)"
+    cause = exc.__context__
+    mark = getattr(cause, "problem_mark", None)
+    if mark is not None:
+        at = f" at line {mark.line + 1}, column {mark.column + 1} of its yaml block"
+        return f"{file}: invalid YAML ({type(cause).__name__}{at})"
+    if field_path == "<yaml-block>":
+        return f"{file}: no usable yaml block"
+    # An unknown key's field path is the key's own text, which can be the name; a schema field's
+    # path is the schema's own words. The reason is never printed: it can repeat a bad value.
+    reason = getattr(exc, "reason", "") or ""
+    if not reason.startswith("unknown key") and _SCHEMA_FIELD_PATH.fullmatch(field_path):
+        return f"{file}: field {field_path} is invalid (python -m agentflow.config show says why)"
+    return f"{file}: an unknown or unnamed field (python -m agentflow.config show names it)"
+
+
+def report_person_name(
+    files: CutFiles,
+    person: re.Pattern | None,
+    why: str | None = None,
+    show: Callable[[str], str] = _as_is,
+) -> Result:
+    """Every ``path:line`` of a text file that carries the bare personal name, never the name.
+
+    A REPORT, not a hard check: a recorded decision keeps the name out of the sanitize pattern
+    (``docs/runbooks/publish.md``, precondition 4), and ``LICENSE`` carries it on purpose. That
+    one line, LICENSE's ``Copyright (c)`` line, is the only exemption; the name anywhere else in
+    LICENSE is a hit like any other."""
+    name = "person-name"
+    if person is None:
+        # Through the CLI ``why`` is always set; a direct caller may pass no name and no why.
+        why = why or "person.name not resolved: no name was given to the check"
+        return Result(name, REPORT, f"not measured: {why}")
+    hits = _hits(person, files, include_binary=False, show=show)
+    if "LICENSE" in files.text and "LICENSE" not in files.binary:
+        for n, line in enumerate(files.text["LICENSE"].splitlines(), 1):
+            if line.lstrip().startswith("Copyright (c)"):
+                exempt = f"{show('LICENSE')}:{n}"
+                if exempt in hits:
+                    hits.remove(exempt)
+                break
+    return Result(name, REPORT, f"{len(hits)} line(s)", tuple(hits))
 
 
 def _load_cut(tree: Path) -> CutFiles:
@@ -1093,17 +1416,23 @@ class Resolved:
     host_ref: str | None
     source: Path | None
     notes: list[str]
-    #: Why a field is still None although a project was named: the config error that stopped
-    #: it, keyed ``ledger`` / ``host_ref`` / ``source`` / ``sensitive_terms``. Empty when
-    #: nothing failed to load, so a direct :func:`run_check` caller's "pass --<flag> or
-    #: --project" messages stand.
+    #: Why a field is still None: the config error that stopped it although a project was
+    #: named, keyed ``ledger`` / ``host_ref`` / ``source`` / ``sensitive_terms`` /
+    #: ``sanitize_extra``; or, with no project, that ``sensitive_terms`` / ``sanitize_extra``
+    #: has no flag and no data root to come from. Empty when nothing failed to load, so a
+    #: direct :func:`run_check` caller's "pass --<flag> or --project" messages stand.
     why: dict[str, str] = field(default_factory=dict)
     #: The local-only sensitive-terms list: ``--sensitive-terms``, else derived from the data
-    #: root when a project is named. None with no project and no flag (``not configured``).
+    #: root when a project is named. None with no project and no flag (cannot measure).
     sensitive_terms: Path | None = None
     #: The local-only extra sanitize pattern: ``--sanitize-extra-pattern``, else derived from the
-    #: data root beside the sensitive-terms list. None with no project and no flag.
+    #: data root beside the sensitive-terms list. None with no project and no flag (cannot
+    #: measure).
     sanitize_extra: Path | None = None
+    #: The bare personal name: ``--person-name``, else the environment config's
+    #: ``person.name``. None when neither resolves; :attr:`why` ``person`` then says why.
+    #: Never printed.
+    person_name: str | None = None
 
 
 def _resolved_line(a: argparse.Namespace, r: Resolved) -> str:
@@ -1143,18 +1472,45 @@ def _resolve(a: argparse.Namespace) -> Resolved:
         )
     notes: list[str] = []
     why: dict[str, str] = {}
+    from agentflow import config
+
+    # person.name is read whatever routing the run used, all three routing flags included,
+    # and in a try of its own: the environment failing to load blanks only this report.
+    person_name = a.person_name
+    if not person_name:
+        try:
+            person_name = config.load_environment().person.name
+        # ValueError covers UnicodeDecodeError and PyYAML's bare date errors; RecursionError is
+        # deep nesting. Neither may crash a run that never needed the config for routing.
+        except (config.ConfigError, OSError, ValueError, RecursionError) as exc:
+            # Not config.error_line: its text can quote the config's source (a YAML error
+            # on the person.name line prints the name).
+            why["person"] = (
+                "person.name not resolved: the environment config did not load: "
+                f"{_environment_failure(exc, config.environment_path())} (or pass --person-name)"
+            )
     ledger = Path(a.ledger) if a.ledger else None
     host_ref = a.host_ref
     source = Path(a.source) if a.source else None
     terms = Path(a.sensitive_terms) if a.sensitive_terms else None
     extra = Path(a.sanitize_extra) if a.sanitize_extra else None
     # A run with all three routing flags and no project has no data root to find the terms
-    # list or the extra pattern in; their checks report that as "not configured".
+    # list or the extra pattern in. That is cannot measure, never "not configured": a pass
+    # there is a cut nobody scanned for the private terms, which the operator asked to check.
+    if not a.project:
+        if terms is None:
+            why["sensitive_terms"] = (
+                "no --project and no --sensitive-terms; pass --sensitive-terms <path> "
+                "(or --project <name>)"
+            )
+        if extra is None:
+            why["sanitize_extra"] = (
+                "no --project and no --sanitize-extra-pattern; pass "
+                "--sanitize-extra-pattern <path> (or --project <name>)"
+            )
     if a.project and (
         ledger is None or host_ref is None or source is None or terms is None or extra is None
     ):
-        from agentflow import config
-
         name = a.project
         # The project file alone gives host_ref and the source checkout; the environment is
         # read only for the data-root paths. Loading both under one try let an environment
@@ -1162,8 +1518,13 @@ def _resolve(a: argparse.Namespace) -> Resolved:
         # (gh#657).
         try:
             proj = config.load_project(name)
-        except (config.ConfigError, OSError) as exc:
-            reason = f"project {name!r} did not load: {config.error_line(exc)}"
+        except (config.ConfigError, OSError, ValueError, RecursionError) as exc:
+            # The kind of failure only, never config.error_line's text: it can quote the
+            # file's source, and a check that reports the personal name must not print it.
+            reason = (
+                f"project {name!r} did not load: "
+                f"{_environment_failure(exc, Path('projects') / f'{name}.md')}"
+            )
             notes.append(f"config not resolved ({reason})")
             for key, value in (
                 ("ledger", ledger),
@@ -1174,7 +1535,7 @@ def _resolve(a: argparse.Namespace) -> Resolved:
             ):
                 if value is None:
                     why[key] = reason
-            return Resolved(ledger, host_ref, source, notes, why, terms, extra)
+            return Resolved(ledger, host_ref, source, notes, why, terms, extra, person_name)
         if host_ref is None:
             host_ref = proj.canonical_repo.host_ref
         if source is None:
@@ -1182,8 +1543,13 @@ def _resolve(a: argparse.Namespace) -> Resolved:
         if ledger is None or terms is None or extra is None:
             try:
                 env = config.load_environment()
-            except (config.ConfigError, OSError) as exc:
-                reason = f"the environment config did not load: {config.error_line(exc)}"
+            except (config.ConfigError, OSError, ValueError, RecursionError) as exc:
+                # Same as the person lookup above: name the kind of failure, never echo the
+                # config's text, which can carry person.name.
+                reason = (
+                    "the environment config did not load: "
+                    f"{_environment_failure(exc, config.environment_path())}"
+                )
                 for key, value, what in (
                     ("ledger", ledger, "ledger path"),
                     ("sensitive_terms", terms, "sensitive-terms path"),
@@ -1200,12 +1566,21 @@ def _resolve(a: argparse.Namespace) -> Resolved:
                     terms = project_dir / SENSITIVE_TERMS_RELPATH
                 if extra is None:
                     extra = project_extra_path(env.data_root, name)
-    return Resolved(ledger, host_ref, source, notes, why, terms, extra)
+    return Resolved(ledger, host_ref, source, notes, why, terms, extra, person_name)
 
 
 # --------------------------------------------------------------------------- #
 # check
 # --------------------------------------------------------------------------- #
+def _extra_matcher(extra: _LoadedExtra) -> re.Pattern | None:
+    """The configured extra sanitize pattern compiled ignoring case, as paths are masked by it;
+    None when there is none or it could not be read."""
+    pattern = extra[0]
+    if pattern is None or not pattern.configured:
+        return None
+    return re.compile(pattern.pattern, re.IGNORECASE)
+
+
 def run_check(
     tree: Path,
     *,
@@ -1213,18 +1588,22 @@ def run_check(
     host_ref: str | None,
     source: Path | None,
     ci_yml: Path | None = None,
-    dropped: Sequence[str] = (),
+    dropped: Sequence[str] | None = None,
     why: Mapping[str, str] | None = None,
     sensitive_terms: Path | None = None,
     sanitize_extra: Path | None = None,
+    person_name: str | None = None,
 ) -> tuple[int, list[str]]:
     """Run every check over the cut at ``tree``. Returns ``(exit code, output lines)``.
 
     ``why`` is :attr:`Resolved.why`: the config error behind a ``None`` field, which the
     check that needed the field names instead of asking for a flag. ``sensitive_terms`` is
     the local-only term list (:func:`check_sensitive_terms`) and ``sanitize_extra`` the
-    local-only extra sanitize pattern (:func:`check_sanitize_terms`); None is
-    ``not configured``."""
+    local-only extra sanitize pattern (:func:`check_sanitize_terms`); None for either is cannot
+    measure (with or without a ``why``), and a path that does not exist is ``not configured``.
+    ``person_name`` is the bare personal name
+    (:func:`report_person_name`); None is ``not measured``. ``dropped`` is the paths ``cut``
+    left out of the tree; None is unknown (:func:`check_excluded_paths`)."""
     why = why or {}
     files = _load_cut(tree)
     ci = ci_yml if ci_yml is not None else tree / ".github" / "workflows" / "ci.yml"
@@ -1233,13 +1612,8 @@ def run_check(
     # no line of the output.
     loaded = _load_sensitive_terms(sensitive_terms, why.get("sensitive_terms"))
     extra = _load_extra_pattern(sanitize_extra, why.get("sanitize_extra"))
-    extra_pattern = extra[0]
-    extra_rx = (
-        re.compile(extra_pattern.pattern, re.IGNORECASE)
-        if extra_pattern is not None and extra_pattern.configured
-        else None
-    )
-    show = _path_display(files, loaded[0], dropped, extra_rx)
+    person, person_why = _person_matcher(person_name)
+    show = _path_display(files, loaded[0], dropped or (), _extra_matcher(extra), person)
     hard = [
         check_cut_shape(tree),
         check_ledger(ledger, why.get("ledger")),
@@ -1255,6 +1629,7 @@ def run_check(
         report_sha_citations(files, source, why.get("source"), show),
         report_tracker_refs(files),
         report_install_evidence(files, tree, source, why.get("source")),
+        report_person_name(files, person, person_why or why.get("person"), show),
     ]
     lines = [ln for r in hard + reports for ln in r.lines()]
     if any(r.status == UNMEASURABLE for r in hard):
@@ -1276,9 +1651,11 @@ def _cmd_check(a: argparse.Namespace) -> int:
         host_ref=r.host_ref,
         source=r.source,
         ci_yml=Path(a.ci_yml) if a.ci_yml else None,
+        dropped=None,  # only cut knows what it dropped
         why=r.why,
         sensitive_terms=r.sensitive_terms,
         sanitize_extra=r.sanitize_extra,
+        person_name=r.person_name,
     )
     print("\n".join(lines))
     return code
@@ -1319,9 +1696,44 @@ def _hermetic_env(tmp: Path, identity_email: str | None = None) -> dict[str, str
     return env
 
 
-def build_cut(source: Path, rev: str, out: Path, author_email: str) -> dict:
+@contextlib.contextmanager
+def _git_stderr_withheld(withhold: bool) -> Iterator[None]:
+    """Re-raise a :func:`_run` failure without git's stderr when ``withhold`` is set.
+
+    git names the path it failed on ("cannot create directory at '<path>'"), and the cut runs
+    before any check can mask it. Dropping the whole message is simpler than masking each
+    held path and its every directory prefix inside free text, and it cannot miss one; the
+    subcommand and exit code still say which step failed."""
+    try:
+        yield
+    except GitFailed as exc:
+        if not withhold or exc.command is None:
+            raise
+        raise GitFailed(
+            f"{exc.command} ... exited {exc.returncode}; git's message is withheld because a "
+            "source path holds a masked term (or the terms list or extra pattern could not be "
+            "read): rerun that git step by hand to see it",
+            exc.command,
+            exc.returncode,
+        ) from None
+
+
+def build_cut(
+    source: Path,
+    rev: str,
+    out: Path,
+    author_email: str,
+    *,
+    held: Callable[[str], bool] = _holds_nothing,
+) -> dict:
     """Build the single-commit repo at ``out``. Returns what it built. Writes nothing outside
-    ``out`` (bar a temp dir holding one empty config file) and never touches the source's refs."""
+    ``out`` (bar a temp dir holding one empty config file) and never touches the source's refs.
+
+    A refusal that names source-tree paths runs before any check can mask them, so it masks
+    them itself: a path ``held`` claims (:func:`_path_holder`) prints as
+    ``<source path #K>``, its position in the source tree's listing. When ``held`` claims
+    any source path, a failed git call that writes the cut prints without git's stderr
+    (:func:`_git_stderr_withheld`)."""
     if not NOREPLY_EMAIL_RE.match(author_email):
         raise CutRefused(
             "--author-email must be a GitHub noreply address "
@@ -1330,7 +1742,10 @@ def build_cut(source: Path, rev: str, out: Path, author_email: str) -> dict:
     if rev.startswith("-"):
         raise CutRefused(f"--rev {rev!r} looks like an option")
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
-        raise CutRefused(f"{out} exists and is not an empty directory; the cut never overwrites")
+        raise CutRefused(
+            f"{out} exists and is not an empty directory; the cut never overwrites: "
+            "delete it or choose a new empty --out"
+        )
     if not source.is_dir():
         raise CutRefused(f"source {source} is not a directory")
     probe = _git(source, "rev-parse", "--git-dir", check=False)
@@ -1343,7 +1758,12 @@ def build_cut(source: Path, rev: str, out: Path, author_email: str) -> dict:
     source_tree = _git(source, "rev-parse", f"{source_sha}^{{tree}}").stdout.decode().strip()
 
     entries = _ls_tree(source, source_tree)
-    gitlinks = [e.path for e in entries if e.kind != "blob"]
+    position = {e.path: i for i, e in enumerate(entries, 1)}
+
+    def show(path: str) -> str:
+        return f"<source path #{position[path]}>" if held(path) else path
+
+    gitlinks = [show(e.path) for e in entries if e.kind != "blob"]
     if gitlinks:
         raise CutRefused(
             f"the source tree has {len(gitlinks)} submodule entr(ies) ({', '.join(gitlinks)}); "
@@ -1352,8 +1772,12 @@ def build_cut(source: Path, rev: str, out: Path, author_email: str) -> dict:
     kept = [e for e in entries if not is_excluded(e.path)]
     dropped = [e.path for e in entries if is_excluded(e.path)]
 
+    withhold = any(held(e.path) for e in entries)
     out.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="agentflow-cut-") as tmp_name:
+    with (
+        tempfile.TemporaryDirectory(prefix="agentflow-cut-") as tmp_name,
+        _git_stderr_withheld(withhold),
+    ):
         tmp = Path(tmp_name)
         env = _hermetic_env(tmp)
         empty_template = tmp / "empty-template"
@@ -1393,7 +1817,7 @@ def build_cut(source: Path, rev: str, out: Path, author_email: str) -> dict:
         written = _git(out, "ls-tree", "-r", "-z", "--name-only", tree_id, env=env).stdout
         written_paths = {p.decode("utf-8", "surrogateescape") for p in written.split(b"\0") if p}
         if len(written_paths) != len(kept):
-            missing = sorted({e.path for e in kept} - written_paths)
+            missing = [show(p) for p in sorted({e.path for e in kept} - written_paths)]
             raise GitFailed(
                 f"the cut's tree holds {len(written_paths)} files, {len(kept)} were kept; not "
                 f"written: {', '.join(missing[:10])}{' ...' if len(missing) > 10 else ''}"
@@ -1436,6 +1860,19 @@ def build_cut(source: Path, rev: str, out: Path, author_email: str) -> dict:
     }
 
 
+def _cut_path_holder(r: Resolved) -> Callable[[str], bool]:
+    """The paths :func:`build_cut` must not print whole, from the same terms list, extra
+    pattern and personal name the check masks by. A terms list or extra pattern that is
+    configured but cannot be read withholds EVERY path: which ones hold a term is unknowable,
+    and the check that would say so has not run yet."""
+    terms, terms_result = _load_sensitive_terms(r.sensitive_terms, r.why.get("sensitive_terms"))
+    extra = _load_extra_pattern(r.sanitize_extra, r.why.get("sanitize_extra"))
+    if (terms_result is not None and terms_result.status == UNMEASURABLE) or extra[1] is not None:
+        return lambda _path: True
+    person, _ = _person_matcher(r.person_name)
+    return _path_holder(terms, _extra_matcher(extra), person)
+
+
 def _cmd_cut(a: argparse.Namespace) -> int:
     r = _resolve(a)
     # First, before any note: the notes explain this line, and stderr is unbuffered.
@@ -1450,7 +1887,7 @@ def _cmd_cut(a: argparse.Namespace) -> int:
             "canonical_repo.local_checkout exists"
         )
     out = Path(a.out)
-    built = build_cut(r.source, a.rev, out, a.author_email)
+    built = build_cut(r.source, a.rev, out, a.author_email, held=_cut_path_holder(r))
     print(f"source {built['source']}")
     print(f"tree {built['tree']}")
     print(f"commit {built['commit']}")
@@ -1465,6 +1902,7 @@ def _cmd_cut(a: argparse.Namespace) -> int:
         why=r.why,
         sensitive_terms=r.sensitive_terms,
         sanitize_extra=r.sanitize_extra,
+        person_name=r.person_name,
     )
     print("\n".join(lines))
     return code
@@ -1479,7 +1917,11 @@ def _common(sp: argparse.ArgumentParser) -> None:
         help="project routing key (ledger, owner and source from config); required unless "
         "--ledger, --source and --host-ref are all given. The session default is never used",
     )
-    sp.add_argument("--ledger", help="explicit key-rotation ledger path (default: from config)")
+    sp.add_argument(
+        "--ledger",
+        help="explicit key-rotation ledger path (default: from config). Without --project, "
+        "also pass --sensitive-terms and --sanitize-extra-pattern, or those checks cannot measure",
+    )
     sp.add_argument(
         "--sensitive-terms",
         dest="sensitive_terms",
@@ -1494,16 +1936,26 @@ def _common(sp: argparse.ArgumentParser) -> None:
         "absent = not configured)",
     )
     sp.add_argument(
+        "--person-name",
+        dest="person_name",
+        help="override the personal name the person-name report looks for "
+        "(default: config person.name)",
+    )
+    sp.add_argument(
         "--ci-yml",
         dest="ci_yml",
         help="explicit ci.yml for the sanitize pattern (default: the cut's own)",
     )
     sp.add_argument(
         "--source",
-        help="working checkout that shas resolve against (default: canonical_repo.local_checkout)",
+        help="working checkout that shas resolve against (default: canonical_repo.local_checkout). "
+        "Without --project, also pass --sensitive-terms and --sanitize-extra-pattern",
     )
     sp.add_argument(
-        "--host-ref", dest="host_ref", help="<owner>/<repo> (default: canonical_repo.host_ref)"
+        "--host-ref",
+        dest="host_ref",
+        help="<owner>/<repo> (default: canonical_repo.host_ref). Without --project, also pass "
+        "--sensitive-terms and --sanitize-extra-pattern",
     )
 
 

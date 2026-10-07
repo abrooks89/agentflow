@@ -42,6 +42,7 @@ SKILLS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILLS_ROOT))
 
 from agentflow import issue_intake as ii  # noqa: E402
+from agentflow.config import WorkSource  # noqa: E402
 from agentflow.issue_intake import (  # noqa: E402
     Issue,
     IssueIntakeError,
@@ -144,8 +145,10 @@ deploy lock: holder: none
 
 | id | work_item | lane | claimed_by | state | waiting_on | notes |
 |---|---|---|---|---|---|---|
-| E-0101 | gh#12 mid-build | jr-dev-2 | jr-dev-2 | building | - | - |
+| E-0101 | gh#12 mid-build | jr-dev-2 | jr-dev-2 | building | - | see gh#17 |
 | E-0102 | gh#13 not started | jr-dev-2 | - | ready | - | - |
+| E-0103 | gh#15 shipped | jr-dev-1 | jr-dev-1 | done | - | - |
+| E-0104 | gh#16 pulled back | jr-dev-1 | - | withdrawn | - | - |
 
 ## Questions
 
@@ -163,17 +166,20 @@ def _write_registry(dirpath, text=_REGISTRY):
     return p
 
 
-def test_a_claim_counts_from_an_agents_row_and_a_claimed_queue_row(tmp_path):
+def test_held_counts_an_agents_row_a_claimed_row_and_an_unclaimed_ready_row(tmp_path):
     refs, note = ii._claimed_refs(_write_registry(tmp_path))
     blob = " ".join(refs)
     assert "gh#11" in blob        # Agents row phase
     assert "gh#12" in blob        # claimed Queue row
+    assert "gh#13" in blob        # published, unclaimed: already handed out
     assert note == ""
 
 
-@pytest.mark.parametrize("ref,where", [("gh#13", "an UNCLAIMED queue row"),
-                                       ("gh#14", "a Directive")])
-def test_a_number_mentioned_where_nobody_claimed_it_is_not_in_flight(tmp_path, ref, where):
+@pytest.mark.parametrize("ref,where", [("gh#14", "a Directive"),
+                                       ("gh#15", "a claimed DONE queue row"),
+                                       ("gh#16", "a WITHDRAWN queue row"),
+                                       ("gh#17", "a live row's notes cell")])
+def test_a_number_mentioned_where_nobody_holds_it_is_not_in_flight(tmp_path, ref, where):
     """The over-broad version of this read the whole file and called all of these in flight."""
     refs, _ = ii._claimed_refs(_write_registry(tmp_path))
     assert ref not in " ".join(refs), where
@@ -191,6 +197,23 @@ def test_a_half_written_registry_degrades_instead_of_killing_the_mirror(tmp_path
     assert note != ""
 
 
+def test_a_queue_section_whose_table_is_gone_degrades_with_a_note_like_selectable_refuses(tmp_path):
+    """The heading survives, the table does not. The parser alone reads that as zero rows - an
+    idle board - so the mirror listed every held bug as selectable with no note, while the
+    `selectable` CLI refused the same file. Both now read the board through one checked path."""
+    damaged = _REGISTRY.replace(
+        "| id | work_item | lane | claimed_by | state | waiting_on | notes |\n"
+        "|---|---|---|---|---|---|---|\n", "")
+    path = _write_registry(tmp_path, damaged)
+
+    refs, note = ii._claimed_refs(path)
+
+    assert refs == []
+    assert "file_damaged" in note and "in-flight grouping skipped" in note
+    with pytest.raises(ii.IssueIntakeError):
+        ii.read_held_set(path)
+
+
 # --------------------------------------------------------------------------- #
 # _run_mirror - the command itself
 # --------------------------------------------------------------------------- #
@@ -206,7 +229,7 @@ def env(tmp_path):
 def proj():
     return SimpleNamespace(
         canonical_repo=SimpleNamespace(host_ref=HOST_REF),
-        work_source=SimpleNamespace(kind="github-issues"),
+        work_source=WorkSource(kind="github-issues"),
     )
 
 
@@ -234,14 +257,18 @@ def test_the_command_writes_the_index_and_the_current_month(env, proj):
     assert len(list(_bugs(env).glob("closed-*.md"))) == 1
 
 
-def test_a_claimed_bug_lands_in_the_in_flight_group_via_the_registry(env, proj):
-    """End to end: the registry claim on gh#12 reaches the rendered grouping."""
+def test_a_held_bug_lands_in_the_in_flight_group_via_the_registry(env, proj):
+    """End to end: the held rows on gh#12 and gh#13 reach the rendered grouping; the done
+    row on gh#15 does not."""
     _run(env, proj, issues=[Issue(number=12, title="mid-build", labels=("bug", "triaged")),
-                            Issue(number=13, title="not started", labels=("bug", "triaged"))])
+                            Issue(number=13, title="not started", labels=("bug", "triaged")),
+                            Issue(number=15, title="shipped", labels=("bug", "triaged"))])
     body = (_bugs(env) / "index.md").read_text(encoding="utf-8")
-    flight = body.split("## Triaged")[0]
+    flight, rest = body.split("## Triaged")
     assert "#12" in flight
-    assert "#13" not in flight
+    assert "#13" in flight
+    assert "#15" not in flight
+    assert "#15" in rest
 
 
 def test_running_twice_against_unchanged_state_leaves_the_files_alone(env, proj):

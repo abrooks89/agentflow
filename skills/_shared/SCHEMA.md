@@ -91,8 +91,8 @@ lock_dir: path                       # R — mkdir edit-lock dir (/tmp POSIX | ~
 shell:    enum[posix|powershell]     # R
 editor_cmd: string                   # O, default "${EDITOR:-code}"
 suite_root: path                     # R — agentflow install root (jr-dev skills inherit from lead-dev here)
-worktree_root: path                  # R — root every lane's per-epic worktree is created under: <worktree_root>/<project>/<epic-slug>
-status_board_url_template: string | null  # O, default null — e.g. "http://host:8889/{slug}"; null ⇒ print status.md path
+worktree_root: path                  # R — root every lane's per-epic worktree is created under: <worktree_root>/<project>/<epic-branch> (claim branch name; <epic-slug> in a hand run)
+status_board_url_template: string | null  # O, default null — e.g. "https://board.example/{slug}"; null ⇒ print status.md path
 
 vault:                               # O block — omit/null to disable wiki mirror + knowledge capture
   root:                 path         # R* iff vault present
@@ -127,7 +127,7 @@ parallel_builders:                   # O — the opt-in multi-builder module (de
 | `shell` | enum[posix\|powershell] | R | |
 | `editor_cmd` | string | O (default `${EDITOR:-code}`) | |
 | `suite_root` | path (dir) | R | install root; jr-dev skills inherit from `<suite_root>/skills/lead-dev/SKILL.md` |
-| `worktree_root` | path (dir) | R | per-machine absolute root under which every lane's per-epic worktree is created, laid out `<worktree_root>/<project>/<epic-slug>`. No default: a silently-defaulted worktree path is how a lane ends up building in a directory nobody chose. |
+| `worktree_root` | path (dir) | R | per-machine absolute root under which every lane's per-epic worktree is created, laid out `<worktree_root>/<project>/<epic-branch>`: the claim branch name `e<NNNN>-<short>` in a fleet run, `<epic-slug>` in a hand run with no registry row. No default: a silently-defaulted worktree path is how a lane ends up building in a directory nobody chose. |
 | `status_board_url_template` | string \| null | O (default null) | null ⇒ print `status.md` path |
 | `vault.root` | path (dir) | R\* | required iff `vault:` block present. **Exported to the mirror as `WIKI_VAULT_PATH`** — the helper otherwise defaults to a hardcoded path, so a root nobody passes is a root nobody uses. |
 | `vault.subdir` | string | O (default `wiki/epics`) | layout is `<root>/<subdir>/<project>/<slug>/<kind>.md` |
@@ -151,7 +151,8 @@ parallel_builders:                   # O — the opt-in multi-builder module (de
   `worktree_root` must be directories.
 - **worktree_root:** absolute (or `~`-expanded) per-machine path, resolved beside
   `suite_root` in the builder. It is the root every lane's per-epic worktree is created
-  under — `<worktree_root>/<project>/<epic-slug>` — so one machine has one worktree home
+  under — `<worktree_root>/<project>/<epic-branch>`, the claim branch name in a fleet run and
+  `<epic-slug>` in a hand run — so one machine has one worktree home
   and all fleets share it, partitioned by project. Absence is a hard `ConfigError` on
   `worktree_root`, reason `required key 'worktree_root' is missing`, and the remediation
   below **verbatim** — not the generic `add '<field>:' (string)` the other required keys
@@ -164,7 +165,7 @@ parallel_builders:                   # O — the opt-in multi-builder module (de
 
   <!-- remediation:worktree_root:begin -->
   ```text
-  add 'worktree_root: ~/worktrees' - an EXISTING directory under which each lane's per-epic worktree is created as <worktree_root>/<project>/<epic-slug>; create it first, then re-run. See SCHEMA.md.
+  add 'worktree_root: ~/worktrees' - an EXISTING directory under which each lane's per-epic worktree is created as <worktree_root>/<project>/<epic-branch> (the claim branch name, e<NNNN>-<short>; <epic-slug> in a hand run); create it first, then re-run. See SCHEMA.md.
   ```
   <!-- remediation:worktree_root:end -->
 
@@ -266,6 +267,7 @@ procedure rather than schema and are not restated here.
         │   ├── hot-<lane>.md # PROJECTION over pages/ — one per lane. Generated.
         │   └── digest.md    # human-facing, written by the STEWARD on its sweep
         └── status/       # orchestrator status boards        — <slug>.status.md / <slug>/status.md
+                          #   ONE board per slug, in either form: a second refuses the epic (neither done nor selectable) until one remains
                           # + registry.md / registry-log.md (Fleet Registry, the single coordination surface all SEVEN loops share; see docs/REGISTRY.md)
                           #   Queue ids are `E-<NNNN>-<short-name>`: see "Epic identity vs priority" below.
                           # + <agent>-state.md (per-agent loop state — lead-dev-state.md, jr-dev-1-state.md, …)
@@ -277,7 +279,11 @@ The `queue/` directory is **retired**: all per-agent loop state consolidates at
 questions files are gone — questions are registry `## Questions` rows (`docs/REGISTRY.md`).
 
 The disk epic-survey (`agentflow.epic_survey`, §4.9) globs this layout by default
-(`projects/*/design/specs/*.md`, `projects/*/design/plans/*.md`, `projects/*/status`). Passing
+(`projects/*/design/specs/*.md`, `projects/*/design/plans/*.md`, `projects/*/status`), and each
+of the two bucket globs also reaches one level down into every entry of
+`epic_survey.TERMINAL_PARTITIONS` (`projects/*/design/specs/done/*.md`,
+`projects/*/design/specs/archived/*.md`, and the same two under `plans/`), derived by
+`epic_survey._bucket_globs` so a record `reconcile` files away stays surveyed. Passing
 `survey_epics(..., project=<name>)` replaces that `*` segment with the project name, so the survey
 sees ONLY `projects/<name>/` — **the builder loops (`lead-dev`, `jr-dev-*`, `auditor`, `steward`)
 must pass it**, and this is code-enforced scope, not a naming convention: two fleets share one
@@ -450,6 +456,9 @@ work_source:                         # O
                                      #   flagged in the resolved config block whenever
                                      #   git_host.cli would reach the tracker.
   bug_triage: bool                   # O, default false — dev-manager triages open issues (§3.4); lead-dev builds only issues labeled `triaged`
+  open_issue_page: int               # O, default 200, must be >= 1 — how many open issues one issue-intake read
+                                     #   answers for; past it the list modes and claim/release refuse. Raise it
+                                     #   here when the tracker legitimately outgrows it (there is no CLI flag).
 
 generation_skills:                   # O — Delegated skills that *create* work (lead-dev only)
   polishing: skill-path | null       # O — a polish-mode equivalent
@@ -510,6 +519,7 @@ vault:                               # O block — this project's vault; vault.r
 | `excluded_domains` | list[string] | O | never auto-dispatched; per-epic `build_approved_by:` overrides |
 | `work_source.kind` | enum[github-issues\|gitea\|filesystem\|none] | O (default filesystem) | |
 | `work_source.bug_triage` | bool | O (default false) | dev-manager triages open issues (§3.4); lead-dev builds only issues labeled `triaged` (`agentflow.issue_intake`) |
+| `work_source.open_issue_page` | int >= 1 | O (default 200) | the open-issue page `agentflow.issue_intake` reads; more open than this and the list modes and claim/release refuse, naming this key. Below 1 or non-int hard-fails |
 | `generation_skills.polishing` | skill-path \| null | O | Delegated (lead-dev only) |
 | `generation_skills.provision` | skill-path \| null | O | Delegated (lead-dev only) |
 | `audit` | block | O | the auditor loop's per-project dial; whole block optional, every field defaulted |
@@ -562,7 +572,10 @@ vault:                               # O block — this project's vault; vault.r
   `generation_skills.*`, `verification.strategy` when a path): presence-checked
   (`Path.exists()` / `os.access(x, X_OK)` for scripts). A missing *required* delegated
   path hard-fails; a missing *optional* one degrades the dependent
-  step to its Forced "skip silently" behavior.
+  step to its Forced "skip silently" behavior. A delegated path to a shipped skill may
+  point under the suite checkout or under the Claude config dir's `skills/<name>/`: provision deploys that copy at step 7, so its pre-deploy
+  loads (steps 2 and 5) accept it when the suite holds the same file, and step 10 checks the
+  deployed path strictly.
 - **audit (whole block O, all fields defaulted):** absent block ⇒ every field its declared
   default (`window=7`, `roles=[]`, `idle_wake_minutes=60`, `notify=true`). `window` and
   `idle_wake_minutes` are ints (bool rejected); `roles` a list of strings; `notify` a bool.
@@ -660,6 +673,17 @@ project's.**
 | `projects/<any other project>.md`, or another project's `data_root` subtree | **never** |
 
 Edits are **additive or field-scoped**. Never delete or repoint a field another project reads.
+
+**Deploying a skill change is not a reason to cross that line.** A loop makes a `SKILL.md`
+change live with `python install/provision.py --deploy-only`, which runs the skill-deploy step
+alone: it reads the suite checkout, writes only the Claude config dir, and touches no project's
+`data_root` subtree. Run it from the primary checkout after the merge lands, never from a
+per-epic worktree: deployed skills point into the checkout that ran the deploy, so a worktree
+deploy leaves every seat pointing at a directory that is deleted after merge, and the tool
+refuses it. A loop never runs a full `provision` to deploy a skill. The full install's
+data_root scaffold step, which seeds every configured project's subtree write-if-absent, is the
+one documented exception to the "never" row above, and it belongs to whoever installs or
+re-provisions the box - not to a loop building one project.
 
 **Why this is not a blanket ban.** The `## Files` section is part of what a human approves at
 promotion, and promotion IS the standing approval (`dev-manager` §7c) - so a config edit named

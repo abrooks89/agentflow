@@ -86,7 +86,7 @@ rm -f /tmp/autodoc-env.current
 # already holds every one of these names. `eval "$(python ...)"` cannot see a refusal: eval
 # returns the status of the text it evaluates, and a refusal prints none. Capturing first and
 # exiting on the capture's status stops the run at the refusal, whatever the shell inherited.
-unset AUTODOC SUITE_ROOT PROJECT REPO BRANCH
+unset AUTODOC SUITE_ROOT PROJECT REPO BRANCH GIT_HOST_KIND LOCAL_CHECKOUT
 AUTODOC_CFG="$(python - <<'PY'
 import os
 import shlex
@@ -140,6 +140,9 @@ emit("SUITE_ROOT", e.suite_root)
 emit("PROJECT", name)
 emit("REPO", proj.canonical_repo.host_ref)
 emit("BRANCH", proj.canonical_repo.base_branch)
+# Step 1 picks its clone by host kind and falls back to the checkout already on disk.
+emit("GIT_HOST_KIND", e.git_host.kind)
+emit("LOCAL_CHECKOUT", proj.canonical_repo.local_checkout)
 PY
 )" || exit 1
 eval "$AUTODOC_CFG"
@@ -148,6 +151,7 @@ eval "$AUTODOC_CFG"
 [ -n "$SUITE_ROOT" ] || exit 1
 [ -n "$PROJECT" ] || exit 1
 [ -n "$REPO" ] && [ -n "$BRANCH" ] || exit 1
+[ -n "$GIT_HOST_KIND" ] && [ -n "$LOCAL_CHECKOUT" ] || exit 1
 # ROOT-vs-NAME COHERENCE, the check /autodoc-update Step 1 makes against the same manifest field.
 # A project with no override of its own resolves to the machine-level root, and that root may
 # hold ANOTHER project's corpus: the populated-root STOP under Inputs is prose, and --force skips it, so
@@ -191,6 +195,8 @@ env_put AUTODOC "$AUTODOC"
 env_put SUITE_ROOT "$SUITE_ROOT"
 env_put REPO "$REPO"
 env_put BRANCH "$BRANCH"
+env_put GIT_HOST_KIND "$GIT_HOST_KIND"
+env_put LOCAL_CHECKOUT "$LOCAL_CHECKOUT"
 env_put REPO_STEM "$REPO_STEM"
 env_put VALIDATE_MERMAID "$VALIDATE_MERMAID"
 # Written LAST, so it exists only across a preamble that ran to completion.
@@ -245,13 +251,47 @@ so there is nothing to clean up.
 Clone fresh into a gitignored scratch dir inside the autodoc folder so `/autodoc-update` can `git pull`
 and diff later. Do NOT commit the clone into the autodoc's git repo.
 
+Where the clone comes from follows `git_host.kind` and `canonical_repo.local_checkout`, both
+resolved by the preamble. `gh repo clone` runs only for a `github` host with `gh` on PATH. Every
+other case, and a `gh` clone that fails, uses plain `git clone --depth 1 --branch "$BRANCH"`
+against the local checkout's own `origin`, so a Gitea, GitLab or SSH remote clones with the
+credentials that checkout already uses. With no origin, or one that does not answer, the last
+resort is a `file://` clone of the local checkout itself: it documents that checkout's `$BRANCH`,
+which can lag the host, and the run says so on stderr.
+
 ```bash
-. "$(cat /tmp/autodoc-env.current)" || exit 1   # AUTODOC, REPO, BRANCH, REPO_STEM, env_put
+. "$(cat /tmp/autodoc-env.current)" || exit 1   # AUTODOC, REPO, BRANCH, REPO_STEM, GIT_HOST_KIND, LOCAL_CHECKOUT, env_put
 SRC="$AUTODOC/.source/$REPO_STEM"
-mkdir -p "$AUTODOC/.source"
-# gh provides the token for private repos
-if [ -d "$SRC/.git" ]; then git -C "$SRC" fetch --depth 1 origin "$BRANCH" && git -C "$SRC" reset --hard "origin/$BRANCH"
-else gh repo clone "$REPO" "$SRC" -- --depth 1 --branch "$BRANCH"; fi
+mkdir -p "$AUTODOC/.source" || exit 1
+# A clone that needs a password fails and falls through to the next source instead of hanging.
+export GIT_TERMINAL_PROMPT=0
+if [ -d "$SRC/.git" ]; then
+  git -C "$SRC" fetch --depth 1 origin "$BRANCH" && git -C "$SRC" reset --hard "origin/$BRANCH" || exit 1
+else
+  ORIGIN="$(git -C "$LOCAL_CHECKOUT" remote get-url origin 2>/dev/null)" || ORIGIN=""
+  CLONED=""
+  # gh supplies the token for a private GitHub repo, and it can reach nothing else.
+  if [ "$GIT_HOST_KIND" = github ] && command -v gh >/dev/null 2>&1; then
+    gh repo clone "$REPO" "$SRC" -- --depth 1 --branch "$BRANCH" && CLONED="gh:$REPO"
+  fi
+  if [ -z "$CLONED" ] && [ -n "$ORIGIN" ]; then
+    git clone --depth 1 --branch "$BRANCH" "$ORIGIN" "$SRC" && CLONED="$ORIGIN"
+  fi
+  if [ -z "$CLONED" ]; then
+    # --depth needs a file:// URL; a bare path would ignore it. A drive-letter path needs the third slash.
+    case "$LOCAL_CHECKOUT" in
+      /*) LOCAL_URL="file://$LOCAL_CHECKOUT" ;;
+      *)  LOCAL_URL="file:///$LOCAL_CHECKOUT" ;;
+    esac
+    echo "WARN: no clone from the host (origin: ${ORIGIN:-none}); cloning the local checkout's $BRANCH, which can lag the host" >&2
+    git clone --depth 1 --branch "$BRANCH" "$LOCAL_URL" "$SRC" || {
+      echo "FATAL: no source clone - the host clone failed and $LOCAL_CHECKOUT has no local branch $BRANCH to clone" >&2
+      exit 1
+    }
+    CLONED="$LOCAL_URL"
+  fi
+  echo "clone source: $CLONED"
+fi
 COMMIT=$(git -C "$SRC" rev-parse HEAD) || exit 1
 env_put SRC "$SRC"
 env_put COMMIT "$COMMIT"
@@ -293,13 +333,19 @@ COMM="$AUTODOC/.source/.communities.json"
 env_put INV "$INV"
 env_put GRAPH_DB "$GRAPH_DB"
 env_put COMM "$COMM"
-( cd "$SUITE_ROOT/skills/autodoc-init/references/inventory" && test -d node_modules || npm install )
-node "$SUITE_ROOT/skills/autodoc-init/references/inventory/extract-inventory.js" "$SRC" "$INV" "$REPO" "$COMMIT"
+( cd "$SUITE_ROOT/skills/autodoc-init/references/inventory" && { test -d node_modules || npm install; } ) || exit 1
+# Every command below ends in `|| exit 1`: this block has no `set -e`, and a failed step that
+# falls through regroups communities from the PREVIOUS run's graph and documents a commit
+# the graph never indexed. The previous run's inventory and graph lines are
+# removed first, because emit-graph writes only on success and `cli build` would otherwise
+# re-ingest the stale file. Nothing reads either one before this block regenerates it.
+rm -f "$INV" "$GRAPH_JSONL" || exit 1
+node "$SUITE_ROOT/skills/autodoc-init/references/inventory/extract-inventory.js" "$SRC" "$INV" "$REPO" "$COMMIT" || exit 1
 # AST edge extraction -> graph store -> derived communities (the graph CLI is
 # `python -m autodoc_graph.cli`, provisioned into the suite venv by install step 6)
-node "$SUITE_ROOT/skills/autodoc-init/references/inventory/emit-graph.js" "$SRC" "$GRAPH_JSONL" "$REPO_STEM" "$COMMIT" "$REPO"
+node "$SUITE_ROOT/skills/autodoc-init/references/inventory/emit-graph.js" "$SRC" "$GRAPH_JSONL" "$REPO_STEM" "$COMMIT" "$REPO" || exit 1
 python -m autodoc_graph.cli build --db "$GRAPH_DB" --corpus "$REPO_STEM" --jsonl "$GRAPH_JSONL" \
-  --repo-ref "$REPO" --project "$PROJECT" --branch "$BRANCH"
+  --repo-ref "$REPO" --project "$PROJECT" --branch "$BRANCH" || exit 1
 # COMM_PINS: one `--pin PREFIX=NAME` pair per entry of the profile's optional
 # `communities.pins` block, BUILT HERE, before the call that consumes it. Pin names
 # may contain spaces, so it is an array read one per line and expanded quoted.
@@ -317,7 +363,11 @@ COMM_PINS=()
 while IFS= read -r pin; do
   [ -n "$pin" ] && COMM_PINS+=(--pin "$pin")
 done <<< "$PINS_TXT"
-python -m autodoc_graph.cli communities --db "$GRAPH_DB" --corpus "$REPO_STEM" --emit "$COMM" "${COMM_PINS[@]}"
+# Braced rather than a trailing `|| exit 1`, so the call line still ends in the quoted
+# pins expansion; the guard is the same.
+{
+  python -m autodoc_graph.cli communities --db "$GRAPH_DB" --corpus "$REPO_STEM" --emit "$COMM" "${COMM_PINS[@]}"
+} || exit 1
 ```
 
 `COMM_PINS` is an empty bash array unless the project profile's optional `communities.pins`
@@ -384,10 +434,18 @@ Workflow({
     maxAgents:          32,                     // hard ceiling; over-budget fails BEFORE dispatch
     diagramReserve:     2,                      // diagram batches reserved in the pre-dispatch check
     diagramBatch:       8,                      // preferred diagram targets per agent (each still gated individually)
-    maxDiagramBatch:    12                      // widen-to-fit cap when the remaining budget is tight
+    maxDiagramBatch:    12,                     // widen-to-fit cap when the remaining budget is tight
+    checkRecordsCmd:    "python -m autodoc_graph.cli check-records --db \"$GRAPH_DB\" --corpus \"$REPO_STEM\""
   }
 })
 ```
+
+`checkRecordsCmd` is the write-time citation check. Each map agent appends `--records <its
+own file>` and re-runs the command until it exits 0, so a `documents` citation with a wrong kind, an
+absent symbol, or a kind the extractor never indexes is fixed when it is written instead of refusing
+`graph records` in Step 4 after the whole fan-out. It checks against the store's symbol tier rather
+than `.inventory.json`, because the checklists agents copy from also list the `module` and member
+symbols that only the store holds. The command fails loudly when the store from Step 2.5 is missing.
 
 **Records are DISK-BASED**: every agent writes its records JSON to
 `<runDir>/records/<label>.json` and returns only a light manifest (paths + counts) — page
@@ -415,7 +473,7 @@ or raise `maxAgents` deliberately; never re-run and hope.
 
 Pass `validateMermaidCmd` so the Diagram phase's gate resolves under the suite root (never a
 personal absolute path). Substitute the resolved values of `$SUITE_ROOT`/`$SRC`/`$AUTODOC`/`$REPO`/
-`$VALIDATE_MERMAID`/`$COMMIT`/`$RUN_DIR` as the carrier holds them
+`$VALIDATE_MERMAID`/`$COMMIT`/`$RUN_DIR`/`$GRAPH_DB`/`$REPO_STEM` as the carrier holds them
 (`cat "$(cat /tmp/autodoc-env.current)"`), not from memory.
 
 Build the community args from `.communities.json` (Step 2.5): pass `units` verbatim (minus each
@@ -556,8 +614,8 @@ unit as a smoke slice) and re-render. Never hand-patch or auto-fix the rendered 
 render would silently undo it.
 
 Blocker classes (exit 1): unexplained symbol-coverage gaps, non-existent `source_paths`,
-unresolved frontmatter relational links, non-existent diagram `%% source:` paths. Warnings
-(orphans, alias collisions, field formats, …) are reported, not fatal.
+an endpoint page's unresolved `request_model`/`response_model` link, unresolved frontmatter
+relational links, non-existent diagram `%% source:` paths. Warnings (orphans, alias collisions, field formats, …) are reported, not fatal.
 
 ### 5b — Coverage gate
 
@@ -577,14 +635,42 @@ autodoc complete with unexplained coverage gaps.
 
 ```bash
 . "$(cat /tmp/autodoc-env.current)" || exit 1   # SUITE_ROOT, RENDER_TARGET, AUTODOC, SRC, INV
-cat > /tmp/golden-gate.json <<'EOF'
-{ "pageSetSymmetricDiffBudget": 12 }
-EOF
-node "$SUITE_ROOT/skills/autodoc-init/references/inventory/golden-gate.js"   "$RENDER_TARGET" "$AUTODOC" /tmp/golden-gate.json "$SRC" "$INV"
+INVDIR="$SUITE_ROOT/skills/autodoc-init/references/inventory"
+# Count baseline content pages with the loader and filter the gate compares (nav excluded, and
+# pages the renderer does not own, such as a Review Backlog, dropped), so "empty" here and in
+# page-set mean the same thing. Paths go in argv, never the program text. The baseline comes
+# FIRST: graph-check.js and golden-gate.js each run their own CLI when argv[1] ends in their name.
+BASELINE_PAGES=$(node -e '
+const { pathToFileURL } = require("node:url");
+const load = (p) => import(pathToFileURL(p).href);
+Promise.all([load(process.argv[2]), load(process.argv[3])])
+  .then(([m, g]) => console.log(g.ownedPages(m.listPages(process.argv[1], { excludeNav: true })).length))
+  .catch((e) => { console.error(e.message); process.exit(1); });
+' "$AUTODOC" "$INVDIR/graph-check.js" "$INVDIR/golden-gate.js") || { echo "FATAL: could not count baseline content pages in $AUTODOC" >&2; exit 1; }
+case "$BASELINE_PAGES" in
+  ''|*[!0-9]*) echo "FATAL: baseline page count is not a number: '$BASELINE_PAGES'" >&2; exit 1 ;;
+esac
+if [ "$BASELINE_PAGES" -eq 0 ]; then
+  echo "golden gate mode: lost-only (pageSetLostBudget 0) - first build, baseline has 0 content pages"
+  printf '%s\n' '{ "pageSetLostBudget": 0 }' > /tmp/golden-gate.json
+else
+  echo "golden gate mode: symmetric (pageSetSymmetricDiffBudget 12) - re-init over $BASELINE_PAGES content pages"
+  printf '%s\n' '{ "pageSetSymmetricDiffBudget": 12 }' > /tmp/golden-gate.json
+fi
+node "$INVDIR/golden-gate.js" "$RENDER_TARGET" "$AUTODOC" /tmp/golden-gate.json "$SRC" "$INV"
 ```
 
-The budget is a **declared, human-reviewed number** (the example 12 is about 10% of a 116-page
-baseline) — never widen it mid-run to make the gate pass; a blown budget means the
+The block picks the page-set mode from the baseline and prints which one it picked and why:
+
+- **First build** — the baseline holds zero content pages (nav and scaffold files, `type: meta`
+  notes and a root `Review Backlog*.md` do not count).
+  Every rendered page is new, so a symmetric budget can only fail; the gate runs lost-only with
+  `{ "pageSetLostBudget": 0 }` and its PASS line reports the created count. Page-set still runs.
+- **Re-init over a populated tree** (`--force`) — the render must reproduce the tree, so any
+  difference in either direction counts against `{ "pageSetSymmetricDiffBudget": 12 }`.
+
+The symmetric budget is a **declared, human-reviewed number** (the example 12 is about 10% of a
+116-page baseline) — never widen it mid-run to make the gate pass; a blown budget means the
 mapping genuinely diverged and a human decides whether that is progress or regression. The gate
 prints one PASS/FAIL line per assertion (page-set, type-match, frontmatter, links-resolve,
 link-recall, source-paths, blocker-parity, coverage-parity) and exits non-zero on any FAIL.
@@ -622,17 +708,34 @@ dir and `diff -r` — any difference is a renderer bug.
 Replacing the live tree is NEVER a side effect of a run. Only after every Step 5 gate is green
 AND the human approves the swap:
 
+The baseline goes to `${AUTODOC}.pre-store.bak`, or, when an earlier cutover already holds that
+name (a `--force` re-init), to a fresh `${AUTODOC}.pre-store.<UTC stamp>.bak` beside it. Moving
+onto a name that exists would put the live tree INSIDE the old backup, and every path below would
+then miss. Each move stops the block on failure, and a `.source` move that fails puts the
+baseline back, so the live tree is never a render with no clone behind it.
+
 ```bash
 . "$(cat /tmp/autodoc-env.current)" || exit 1   # AUTODOC, RENDER_TARGET, STAMP
-mv "$AUTODOC" "${AUTODOC}.pre-store.bak"       # the frozen baseline is kept, not overwritten
-mv "$RENDER_TARGET" "$AUTODOC"
+BAK="${AUTODOC}.pre-store.bak"
+if [ -e "$BAK" ]; then BAK="${AUTODOC}.pre-store.$(date -u +%Y%m%dT%H%M%SZ).bak"; fi
+if [ -e "$BAK" ]; then echo "FATAL: backup name $BAK is taken; wait a second and re-run the cutover" >&2; exit 1; fi
+mv "$AUTODOC" "$BAK" || exit 1                 # the frozen baseline is kept, not overwritten
+mv "$RENDER_TARGET" "$AUTODOC" || {
+  mv "$BAK" "$AUTODOC" || echo "FATAL: the render did not move in and the baseline did not move back; it is at $BAK - move it to $AUTODOC by hand" >&2
+  exit 1
+}
+if ! mv "$BAK/.source" "$AUTODOC/.source"; then   # clone + graph.db + artifacts travel
+  echo "FATAL: $BAK/.source did not move into the live tree; the baseline is restored and the render is back at $RENDER_TARGET" >&2
+  mv "$AUTODOC" "$RENDER_TARGET" && mv "$BAK" "$AUTODOC"
+  exit 1
+fi
 # The render stamp describes a directory that no longer exists; it goes with it.
 if [ -n "$STAMP" ]; then rm -f "$STAMP"; fi
-mv "${AUTODOC}.pre-store.bak/.source" "$AUTODOC/.source"   # clone + graph.db + artifacts travel
 # Skill-owned files the renderer does not write:
 for f in CLAUDE.md log.md hot.md .gitignore; do
-  [ -f "${AUTODOC}.pre-store.bak/$f" ] && cp "${AUTODOC}.pre-store.bak/$f" "$AUTODOC/$f"
+  if [ -f "$BAK/$f" ]; then cp "$BAK/$f" "$AUTODOC/$f" || exit 1; fi
 done
+echo "cutover done; baseline kept at $BAK"
 ```
 
 The renderer's `.rendered-by-store` marker travels with the tree, and it is what routes the
@@ -688,7 +791,8 @@ node "$SUITE_ROOT/skills/autodoc-init/references/inventory/run-complete.js" "$AU
 ```
 
 Exits non-zero naming the first failure: empty/incomplete `.manifest.json.pages`, a manifest
-key with no file on disk, a page count that disagrees with the tree, a `log.md` with no entry
+key with no file on disk, a page count that disagrees with the tree, a manifest `source_path`
+that is missing or names no `.git` clone (the next `/autodoc-update` fetches from it), a `log.md` with no entry
 for this run's date+sha (short sha = first 8 chars of the full sha — run-complete.js matches
 exactly that prefix; full 40-char shas also pass), or a `hot.md` that is stale or over the
 hot-cache contract (≤400 words file / ≤120 words Latest). **A non-zero exit means the run is

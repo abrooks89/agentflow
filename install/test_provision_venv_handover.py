@@ -236,7 +236,7 @@ def sealed_doctor():
     A sandbox that holds for three flags and leaks on the fourth is not a sandbox."""
     with mock.patch.dict(
         sys.modules,
-        {"agentflow.doctor": mock.Mock(diagnose=lambda *_a: [], render=lambda _d: "(stubbed)",
+        {"agentflow.doctor": mock.Mock(diagnose=lambda *_a, **_k: [], render=lambda _d: "(stubbed)",
                                        examined_a_project=lambda _f: False,
                                        unexamined_verdict=lambda r, _dir: r)},
     ):
@@ -314,6 +314,130 @@ def test_the_child_inherits_the_argv_MAIN_PARSED_not_the_process_argv(tmp_path, 
     argv = calls[0]
     for flag in passed:
         assert flag in argv, f"the child lost {flag!r} and would resolve it against the real box"
+
+
+class _UnhandledStepError(Exception):
+    """Not RuntimeError/OSError/ImportError, which `_apply` turns into a return code; this one
+    propagates out of `main()`, which is the path a `finally` exists for."""
+
+
+def test_the_handover_replays_exactly_opts_invoked_argv(opts, monkeypatch):
+    """The child's argv is the interpreter, this script, the run's own `invoked_argv` and the
+    resume point -- in that order, nothing added and nothing dropped. Read from anywhere else
+    (the process argv, shared module state), a sandboxed run hands its child someone else's
+    flags."""
+    monkeypatch.setattr(sys, "argv", ["provision.py", "--from-the-process-argv"])
+    monkeypatch.delenv(provision._REEXEC_MARKER, raising=False)
+    venv_py = opts.suite_root / ".venv" / "python"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_text("", encoding="utf-8")
+    opts.invoked_argv = ("--config-home", "/sandbox/cfg", "--no-auto-allow")
+
+    calls = []
+    with mock.patch.object(provision, "_venv_python", lambda _o: venv_py), \
+         mock.patch.object(provision.subprocess, "call",
+                           lambda argv, **k: calls.append(argv) or 0):
+        with pytest.raises(provision._HandOff):
+            provision._reexec_into_venv(opts, resume_from=5)
+
+    assert calls == [[str(venv_py), provision.os.path.abspath(provision.__file__),
+                      "--config-home", "/sandbox/cfg", "--no-auto-allow",
+                      "--resume-from", "5"]]
+
+
+def test_provision_keeps_NO_module_level_argv():
+    """The argv lives on the run's Options. A module global is shared by every in-process
+    `main()`, so one call's flags could reach another call's child."""
+    assert not hasattr(provision, "_INVOKED_ARGV")
+    assert provision.Options.__dataclass_fields__["invoked_argv"].default == ()
+
+
+@pytest.mark.parametrize("case", ["applied", "raised"])
+def test_main_threads_its_argv_through_Options(tmp_path, monkeypatch, sealed_doctor, case):
+    """Every step sees the argv `main()` parsed on the Options it was handed, whether the run
+    completes or a step raises out of it."""
+    monkeypatch.delenv(provision._REEXEC_MARKER, raising=False)
+    seen = []
+
+    def run(o):
+        seen.append(o.invoked_argv)
+        if case == "raised":
+            raise _UnhandledStepError("a step failed in a way the installer does not handle")
+
+    steps = [provision.Step(n=n, title=f"step {n}", run=run) for n in range(5, 8)]
+    passed = ["--resume-from", "5",
+              "--suite-root", str(tmp_path), "--config-home", str(tmp_path / "cfg"),
+              "--settings-file", str(tmp_path / "s.json"), "--claude-root", str(tmp_path / "cl")]
+    with mock.patch.object(provision, "build_steps", lambda _o: steps), \
+         mock.patch.object(provision, "_print_verification_readiness", lambda _r: None), \
+         mock.patch.object(provision, "_verification_readiness", lambda _o: []):
+        if case == "raised":
+            with pytest.raises(_UnhandledStepError):
+                provision.main(list(passed))
+        else:
+            assert provision.main(list(passed)) == 0
+
+    assert seen and seen[0] == tuple(passed), "the run must carry the argv main() parsed"
+
+
+def test_concurrent_mains_hand_each_child_its_OWN_argv(tmp_path, monkeypatch):
+    """Two in-process `main()` calls on different threads, both inside a run at the same time:
+    each one's handover must spawn its child with its own flags. A barrier holds both runs at
+    step 4 until both have parsed, which is the interleaving a shared global gets wrong."""
+    import threading
+
+    monkeypatch.delenv(provision._REEXEC_MARKER, raising=False)
+    # A shell-level value both runs must leave exactly as found: each passes its own home
+    # explicitly and never writes the variable.
+    monkeypatch.setenv("AGENTFLOW_CONFIG", str(tmp_path / "outer"))
+    venv_py = tmp_path / ".venv" / "python"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_text("", encoding="utf-8")
+    barrier = threading.Barrier(2, timeout=30)
+    calls = {}
+    lock = threading.Lock()
+
+    def step(n):
+        def _run(o):
+            if n == 4:
+                barrier.wait()
+                provision._reexec_into_venv(o, resume_from=5)
+        return _run
+
+    steps = [provision.Step(n=n, title=f"step {n}", run=step(n)) for n in range(1, 8)]
+
+    def fake_call(argv, **_k):
+        with lock:
+            calls[argv[argv.index("--config-home") + 1]] = argv
+        return 0
+
+    def argv_for(name):
+        return ["--suite-root", str(tmp_path), "--config-home", str(tmp_path / name),
+                "--settings-file", str(tmp_path / f"{name}.json"),
+                "--claude-root", str(tmp_path / f"{name}-cl")]
+
+    results, errors = {}, []
+
+    def drive(name):
+        try:
+            results[name] = provision.main(argv_for(name))
+        except Exception as exc:  # surfaced below; a thread's exception is otherwise lost
+            errors.append(exc)
+
+    with mock.patch.object(provision, "build_steps", lambda _o: steps), \
+         mock.patch.object(provision, "_venv_python", lambda _o: venv_py), \
+         mock.patch.object(provision.subprocess, "call", fake_call):
+        threads = [threading.Thread(target=drive, args=(name,)) for name in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+    assert not errors, errors
+    assert results == {"a": 0, "b": 0}
+    for name in ("a", "b"):
+        child = calls[str(tmp_path / name)]
+        assert child[2:-2] == argv_for(name), f"run {name!r} spawned a child with another argv"
 
 
 def test_an_out_of_range_resume_point_FAILS_rather_than_installing_nothing(tmp_path,
@@ -412,7 +536,6 @@ def test_the_TRANSCRIPT_IS_IN_ORDER_with_a_real_child_and_a_real_pipe(tmp_path):
         # The handover spawns `<this> <provision.py> <argv> --resume-from 5`. Point it at a real
         # interpreter so a real process actually runs; the argv makes that process a dry run.
         provision._venv_python = lambda _o: Path(sys.executable)
-        provision._INVOKED_ARGV = {child_argv!r}
 
         opts = provision.Options(
             dry_run=False, suite_root=Path({str(sandbox / "suite")!r}),
@@ -420,6 +543,7 @@ def test_the_TRANSCRIPT_IS_IN_ORDER_with_a_real_child_and_a_real_pipe(tmp_path):
             settings_file=Path({str(sandbox / "settings.json")!r}),
             autodoc=False, autodoc_reason="test",
             claude_root=Path({str(sandbox / "claude")!r}), force=False,
+            invoked_argv=tuple({child_argv!r}),
         )
 
         print("PARENT-SPOKE-FIRST")

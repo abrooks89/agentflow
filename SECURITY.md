@@ -41,10 +41,11 @@ same file).
 - **A CI gate keeps personal and machine-specific literals out.** The `sanitize-gate` job in
   [`.github/workflows/ci.yml`](.github/workflows/ci.yml) fails the build on absolute home paths
   with a real account name and similar machine-specific literals. A maintainer supplies patterns
-  specific to their own install through a repository variable, which the CI gate appends to its
-  pattern, and a local file outside the repository, which the publish cut and the wiki residue
-  check read. Neither ships, so a public copy's gate checks the generic shapes only. It checks
-  every first-party text file in the tree and every pull request's title and body.
+  specific to their own install through a repository secret, which the CI gate appends to its
+  pattern and the run logs mask, and a local file outside the repository, which the publish cut
+  and the wiki residue check read. Neither ships, so a public copy's gate checks the generic
+  shapes only. It checks every first-party text file in the tree and every pull request's title
+  and body.
   [`CONTRIBUTING.md`](CONTRIBUTING.md) explains how to run it locally.
 
 ## Known trade-offs

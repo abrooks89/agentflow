@@ -1,4 +1,6 @@
 harness/toy-repo/
+# The toy repo's origin: a local bare repo seed_toy_repo.py builds (gh#1105).
+harness/toy-origin/
 harness/records/
 harness/BASELINE.md
 harness/POST-PORT-RESULT.md

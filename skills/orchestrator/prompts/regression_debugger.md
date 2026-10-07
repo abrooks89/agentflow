@@ -38,8 +38,9 @@ Use the `../../_vendored/systematic-debugging/SKILL.md` skill exactly. Specifica
 
 1. Reproduce: run `{{TEST_COMMAND}}` against `{{WORKTREE}}` — the runner's own path flag where it
    has one (`python -m pytest {{WORKTREE}}/<path>`, `npm --prefix {{WORKTREE}} ...`), otherwise the
-   tree named in the command itself (`cd {{WORKTREE}} && {{TEST_COMMAND}}`) — and confirm the
-   listed tests fail
+   tree named in the command itself inside a subshell (`( cd {{WORKTREE}} && {{TEST_COMMAND}} )`;
+   never a bare `cd`, which persists in the shell and on Windows wedges the tree's removal) — and
+   confirm the listed tests fail
 2. Bisect between `{{LAST_GREEN_COMMIT}}` and HEAD to find the introducing commit. `git bisect` is
    stateful, so **every** step carries the path, not just the first:
    `git -C {{WORKTREE}} bisect start`, `git -C {{WORKTREE}} bisect bad HEAD`,

@@ -244,7 +244,7 @@ def test_a_missing_self_wake_tool_is_reported():
 
 
 def test_the_wave_tool_is_required_only_when_the_caller_says_so():
-    """Two of the six loops dispatch waves; the others must not be blocked on a tool they never call.
+    """Only some loops dispatch waves (`NEEDS_WAVE`); the others must not be blocked on a tool they never call.
 
     A preflight that demanded every tool of every caller would be refused into irrelevance on
     the first lane that does not need it.

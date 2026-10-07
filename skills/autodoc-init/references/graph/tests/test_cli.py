@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -204,11 +205,18 @@ def _extra_args(cmd, tmp_path):
         rec.write_text(json.dumps({"pages": [], "reports": [], "meta_pages": [],
                                    "diagrams": []}), encoding="utf-8")
         return ["--records", str(rec), "--sha", "s1", "--date", "2026-09-29"]
+    if cmd == "check-records":
+        rec = tmp_path / "records.json"
+        rec.write_text(json.dumps({"pages": []}), encoding="utf-8")
+        return ["--records", str(rec)]
+    if cmd == "migrate-diagrams":
+        validator = Path(__file__).resolve().parents[5] / "scripts" / "validate_mermaid.py"
+        return ["--validator", str(validator)]
     return []
 
 
 _NON_BUILD = ("stats", "prune", "verify", "check", "render", "reports-stale",
-              "communities", "records")
+              "communities", "records", "check-records", "migrate-diagrams")
 
 
 @pytest.mark.parametrize("cmd", _NON_BUILD)

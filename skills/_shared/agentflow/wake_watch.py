@@ -55,11 +55,13 @@ is that this command holds no state, keeps no timer of its own and can be run by
 its own liveness is the scheduler's problem, and every scheduler worth using reports a job that
 stopped firing. What this module CANNOT do is notice that it was never invoked.
 
-**AND IT CANNOT CONFIRM DELIVERY.** ``ntfy.notify()`` returns None whether it POSTed, was
-switched off by ``notify.kind: none``, or found no destination in the environment — so a send
-that quietly went nowhere is indistinguishable here from one that landed. Only a raising sender
-is visible. That is stated because a watcher that overstates its own reach is the failure mode
-this whole epic is about; the remedy (a return value from ``notify()``) is tracked separately.
+**AND IT DOES NOT CONFIRM DELIVERY.** ``ntfy.notify()`` returns ``False`` when it sent nothing
+(switched off by ``notify.kind: none``, or no destination in the environment) and ``True`` when
+the sender returned, but this module does not read that value: ``pushed`` records that a send
+was ATTEMPTED, so a send that quietly went nowhere is indistinguishable here from one that
+landed. Only a raising sender is visible. That is stated because a watcher that overstates its
+own reach is the failure mode this whole epic is about. And even ``True`` means only that ntfy
+accepted the POST, never that a human read it.
 """
 
 from __future__ import annotations
@@ -91,7 +93,7 @@ class WatchResult:
     that only gets numbers cannot name the lane, and naming the lane is the entire product.
 
     ``pushed`` is *a send was attempted*, never *a human was reached*: see the module docstring
-    on why delivery is not observable from here. ``findings`` being false with ``pushed`` false
+    on why delivery is not observed here. ``findings`` being false with ``pushed`` false
     is the quiet, correct case.
     """
 
@@ -196,9 +198,10 @@ def render(result: WatchResult) -> str:
 def push_body(result: WatchResult) -> str:
     """The ntfy body: every finding, one per line, and the no-action disclaimer.
 
-    PUBLIC because it is the only part of the send a caller can actually check. ``notify()``
-    returns None whether it POSTed or not, so "what would this run have said to a human" is not
-    answerable from the outside unless the body is reachable as a value. The drill asserts on it
+    PUBLIC because it is the only part of the send a caller can actually check. This module
+    does not read ``notify()``'s return value, and ``pushed`` records only that a send was
+    attempted, so "what would this run have said to a human" is not answerable from the outside
+    unless the body is reachable as a value. The drill asserts on it
     for exactly that reason.
 
     Folded to ASCII at this call site rather than left to ``notify()``'s assertion, and that is
@@ -314,11 +317,14 @@ def _resolve(args: argparse.Namespace) -> tuple[Path, str]:
     """Registry path and project name, resolved THE WAY EVERY OTHER COMMAND RESOLVES THEM.
 
     ``registry._resolve_registry_path`` is reached rather than reimplemented, so the precedence
-    (``--file`` beats ``$AGENTFLOW_REGISTRY`` beats ``--project`` under ``data_root``) and the
-    bare-slug rule on ``--project`` cannot drift into a second, subtly different answer. This is
-    the same reuse ``wiki._resolve_wiki_root`` makes of the same function, and for the same
-    reason: a watcher pointed at a different board than the fleet writes to would report an
-    all-clear about a registry nobody uses.
+    and the rules on ``--project`` cannot drift into a second, subtly different answer. That
+    precedence (gh#715): ``--file`` wins outright; otherwise ``--project`` - a bare slug that
+    must name a configured project - resolves under ``data_root``, and ``$AGENTFLOW_REGISTRY``
+    is used only when no ``--project`` is given. Given both, the env var does NOT win: the two
+    must name the same board or the command refuses (``registry_board_conflict``).
+    ``wiki._resolve_wiki_root`` holds to the same rules (registry's slug regex, the same
+    configured-project check) for the same reason: a watcher pointed at a different board than
+    the fleet writes to would report an all-clear about a registry nobody uses.
     """
     path = registry._resolve_registry_path(args)
     return path, registry._resolve_project(args, path)
@@ -348,9 +354,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     The operative rule follows from that, and it is the one an operator has to wire: **CAPTURE
     STDOUT AND STDERR, NOT ONLY THE EXIT CODE.** The report is written to stdout BEFORE any push
     is attempted, so it survives a delivery fault; ``notify()`` prints its own warning to stderr
-    when notifications are on but nothing is configured, and returns None whether it POSTed or
-    not, so a green exit with an unconfigured channel is a silence that looks exactly like
-    health.
+    when notifications are on but nothing is configured, and this command does not read
+    ``notify()``'s return value (``pushed`` means a send was attempted), so a green exit with an
+    unconfigured channel is a silence that looks exactly like health.
     """
     # First, before any output: a legacy cp1252 stdout cannot carry a non-cp1252
     # character a lane wrote (gh#574).
@@ -373,7 +379,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "  survive an ntfy outage. A misconfigured channel prints a warning to stderr" + _NL +
             "  and still exits 0, so a job wired to the exit code alone reports permanent" + _NL +
             "  health over a fleet nobody is watching." + _NL +
-            "  Delivery is not observable from here: notify() returns nothing either way."
+            "  Delivery is not observed here: a push counts as attempted, not delivered."
         ),
     )
     ap.add_argument("--project", default=None, help="project whose registry to read")

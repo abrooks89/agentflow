@@ -45,9 +45,9 @@ WHAT IT DOES NOT PROVE, said here rather than left for an auditor to discover:
     MACHINE has no agentflow session open at the time; that is a property of the operator's
     desktop, not of this code. The claim earned here is that the watcher needs nothing alive.
   * **No packet leaves the machine, so delivery is not proven.** Step 8 injects a sender and
-    inspects the payload. `ntfy.notify()` returns None whether it POSTed, was switched off, or
-    found no destination in the environment, so an end-to-end delivery claim is not available to
-    any caller - see `agentflow.wake_watch.__doc__`.
+    inspects the payload. `ntfy.notify()` returns True only when the sender returned without
+    raising, and even then it means ntfy accepted the POST, not that a human read it - so an
+    end-to-end delivery claim is not available to any caller. See `agentflow.wake_watch.__doc__`.
   * **The drill schedules nothing, and cannot see whether anything else did.** The watcher is a
     command; invoking it on a cadence is the suite's one permitted daemon (the single-daemon
     rule, 2026-09-22) and lives in an OS scheduler entry, not in here. This drill registers none
@@ -345,8 +345,9 @@ def run_drill(out_dir: Path, now: datetime | None = None) -> str:
 
     # --- 8. the push leg, with the sender injected -----------------------------
     # The one limb that cannot be a subprocess: proving the alert leaves the module means reading
-    # the payload, and `ntfy.notify()` reports nothing back to its caller. The sender injection
-    # point `agentflow.ntfy` already defines is how this is read without a packet on the wire.
+    # the payload; `ntfy.notify()` reports only whether a send was made, not what it said.
+    # The sender injection point `agentflow.ntfy` already defines is how this is read without
+    # a packet on the wire.
     with _forced_push_path() as sent:
         watched = wake_watch.watch(
             reg, project="demo", now=now,
@@ -419,8 +420,8 @@ def run_drill(out_dir: Path, now: datetime | None = None) -> str:
         "   registers none and reads none. A watcher nobody invokes is silent, and no limb here",
         "   can see that.",
         "2. **`--no-notify` and an injected sender mean no packet left the machine**, so delivery",
-        "   is unproven. `notify()` returns None whether it POSTed, was switched off, or found no",
-        "   destination, so no caller anywhere can prove delivery today.",
+        "   is unproven. Even a True from `notify()` means only that ntfy accepted the POST, not",
+        "   that a human read it, so no caller anywhere can prove delivery today.",
         "3. **Outside a loop is proven to a process boundary and no further.** The subprocess has",
         "   no sweep, no loop and no session in it. Whether the MACHINE had an agentflow session",
         "   open while this ran is a property of the desktop, not of this code.",

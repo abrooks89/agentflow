@@ -322,20 +322,22 @@ CLAUSES: dict[str, dict[str, object]] = {
             "the word issue": _token_part("issue", "issues"),
         },
     },
-}
-
-#: Clauses required of the SEAT only. The report renders rows the collector already
-#: type-constrains, so it has no free-prose site for a registry id and states no rule about one;
-#: the seat composes those rows and those sentences itself, so it needs the per-surface breakdown.
-SEAT_CLAUSES: dict[str, dict[str, object]] = {
     "registry-ids-carry-a-subject": {
-        "why": "a bare Q-/B- id is the seat's own most-repeated offence; the id needs its subject",
+        "why": "a bare Q-/B- id is unreadable on any surface; the id needs its subject beside it",
         "parts": {
             "a question id": _pattern_part(_Q_ID),
             "a blocker id": _pattern_part(_B_ID),
             "the word subject": _token_part("subject"),
         },
     },
+}
+
+#: Clauses required of the SEAT only. Both surfaces print registry ids, so both owe the subject
+#: clause above: the report's CHANGED SINCE and LANES once printed `Q-` ids bare on the theory
+#: that the collector's row types made them safe, and they did not. What stays seat-only is the
+#: sha-level breakdown of commits and PRs - the seat writes those into free prose itself, while
+#: the report prints them from rows that carry no name to pair with them.
+SEAT_CLAUSES: dict[str, dict[str, object]] = {
     "prs-and-commits-are-fine-as-they-are": {
         "why": "the surface where the number IS the identifier, named so the rule is checkable",
         "parts": {

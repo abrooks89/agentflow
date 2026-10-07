@@ -103,7 +103,10 @@ interactive. Never infer fleet mode from anything else (cwd, epic state, time of
    **A question that should not have been asked comes back off the board:**
    `python -m agentflow.registry retract --actor <fleet_context> --id Q-NNNN --reason
    "<what collapsed>"`. Raiser only, open only, terminal, and NOT `answered` - nothing was
-   decided. Use it the moment you notice the premise died.
+   decided. Use it the moment you notice the premise died. `retract` and `apply` both refuse
+   with `waited_on_live` while a Queue row is still parked on the id: before `apply`, the
+   claimant resumes it (`release --state building`); before `retract`, it resumes it or
+   re-parks it on the new id.
 2. Keep the existing `ScheduleWakeup` poll cadence. On each poll wake, lock-free re-read the
    registry instead of waiting for a button: `state: answered` → map the `answer` text through
    the SAME canonical-reply mapping as a free-text chat reply, take the matching branch, and
@@ -158,7 +161,7 @@ Every session-level transition emits an event via `agentflow.status_writer.appen
 | `session_unpaused:` | Step 3, when state.paused becomes False | `by user` |
 | `escalation_opened:` | inside open_escalation() | `<id> task <N>: <q>` |
 | `escalation_answered:` | inside `answer_escalation()` (called by Step 3 or by orchestrator on chat-reply) | `<id> answered` |
-| `wave_dispatched:` | Step 7 (existing — keep "Wave N dispatch:") | unchanged |
+| `wave_dispatched:` | Step 7 item 4 sub-step 2 (the decision note is separate: `wave <n> dispatched: tasks [...] run <runId>`, sub-step 3) | `Wave <N>` |
 | `wave_completed:` | Step 7 (existing — keep "Wave N complete:") | unchanged |
 | `test_run:` | Step 5, after every regression run | `green/red, regressions=<N>` (also calls record_test_run) |
 | `session_ended:` | Step 9, status→done | `<N> tasks, <N> waves, total <T>` |
@@ -316,10 +319,11 @@ edits whatever it inherited. The git placeholders in this section come off the r
    differently-named worktree, or one a human created by hand, is a *stated* fact; computing a
    path first would override an explicit human statement, which is the same ambient-beats-stated
    failure this rule exists to remove.
-2. No `worktree:` field → fall back to the documented layout
+2. No `worktree:` field → fall back to the hand-run layout
    `<worktree_root>/<project>/<epic-slug>`: `worktree_root` from
    `agentflow.config.load_environment()`, `<project>` from the plan's `project:`, `<epic-slug>`
-   from the epic slug computed at bootstrap.
+   from the epic slug computed at bootstrap. A fleet plan always declares the field, because its
+   tree is named after the claim branch, which this computation cannot know.
 3. **Neither resolves** (no `worktree:` field AND no `project:` on the plan, or `worktree_root`
    unresolvable) → **fail loudly, do not proceed**:
 
@@ -327,7 +331,7 @@ edits whatever it inherited. The git placeholders in this section come off the r
    ESCALATION: Target tree unresolvable.
    This epic has no worktree to build in and one cannot be computed. Add a
    `worktree:` field to the plan frontmatter naming the epic's git worktree
-   (conventionally <worktree_root>/<project>/<epic-slug>), or add the plan's
+   (conventionally <worktree_root>/<project>/<epic-branch>), or add the plan's
    `project:` field so the fallback layout resolves. Then restart the orchestrator.
    ```
 
@@ -415,12 +419,14 @@ After acquiring the lock and pulsing, inspect `status.restart_history`:
 
   1. Append a tier-1 decision: `"session resumed via watchdog auto-restart; reason=<reason from latest restart_history[-1]>"`.
 
-  2. Run `git -C <worktree> log --since=<previous last_wake>`. Log any commits as orphan-recovery candidates in a tier-2 decision.
+  2. Run the restart log over every ref that can hold a wave's commit. When `plan.per_wave_worktrees` is True: `git -C <worktree> log <epic_branch> --branches='<plan.slug>-w[0-9]*' --since=<previous last_wake>`. The digit after `-w` keeps out another epic whose slug starts with `<plan.slug>-w` (slug `auth` and an epic `auth-webhooks`). A wave commits on its own wave branch, in a sibling tree, and reaches the epic branch only at merge-back, so a commit made before the restart can sit on a wave branch alone; a log of the epic branch does not show it. When `plan.per_wave_worktrees` is False: `git -C <worktree> log --since=<previous last_wake>`. Log any commits as orphan-recovery candidates in a tier-2 decision, naming the branch that holds each (`git -C <worktree> branch --contains <sha>`).
 
   3. If `status.tasks[*].state` shows a task in `in_flight` AND no completion was recorded:
-     - Search `git -C <worktree> log --since=<previous last_wake>` for a commit whose message matches the wave's expected task signature (e.g. `feat(T<n>):` or `Task <n>`).
-     - If found: record the wave as COMPLETED for that task, set `state = "code_review"`, advance to the reviewer step normally.
-     - If not found: mark the wave ABANDONED (`state = "ready"`), schedule re-dispatch as the next action, log tier-2 decision "wave abandoned at restart; will redispatch".
+     - Search the restart log from sub-step 2 (the wave branches too, on the per-wave path) for a commit whose message matches the wave's expected task signature (e.g. `feat(T<n>):` or `Task <n>`).
+     - If found on the epic branch, or on the task's own recorded `state.tasks[tid].wave_branch`: record the wave as COMPLETED for that task, set `state = "code_review"`, advance to the reviewer step normally. Keep `wave_worktree_path` and `wave_branch` for a commit on the wave branch: the Step 7 review gates read that tree, and the merge-back on approval lands the commit.
+     - If found only on a best-of-N candidate branch (`<plan.slug>-w<n>-t<id>-c<i>`): no judge picked it and nothing landed it, so the task did not complete. Handle it as not found (below). The release frees the task's tree, so the Step 1.2.5 prune in this same wake finds the candidate trees orphaned and keeps each candidate branch that holds unmerged commits, with a tier-2 decision naming it.
+     - If found only on any other branch (another task's wave branch, or a branch of another epic the pattern still matches): it is not this task's commit. Handle it as not found (below).
+     - If not found: mark the wave ABANDONED (`state = "ready"`), schedule re-dispatch as the next action, log tier-2 decision "wave abandoned at restart; will redispatch". When the task records a `wave_worktree_path`, release that tree and clear its fields first (**Releasing a wave tree**, Step 1.2.5).
 
 **Step 1.2.5 — Orphan wave worktree prune (conditional).**
 
@@ -428,22 +434,154 @@ If `plan.per_wave_worktrees` is True:
 
 ```python
 from agentflow.wave_worktree import prune_orphan_worktrees
+live_paths = {t.wave_worktree_path for t in state.tasks.values() if t.wave_worktree_path}
 summary = prune_orphan_worktrees(
     repo_path=worktree,   # resolved in Step 1.1 — never Path.cwd()
     epic_slug=plan.slug,
+    live_paths=live_paths,
 )
 ```
+
+**Pass `live_paths` on every call.** This step runs on every wake, including the reconcile wake
+and a fallback wake that fires while a wave workflow is still running. A tree a task still
+records in `wave_worktree_path` belongs to that task: an in-flight agent may be building in it,
+and a single-shot task's commit sits in it until merge-back on approval. A prune without the
+live set force-removes that tree, and the merge-back that follows fails because its source
+directory is gone. Kept trees come back in `summary.branches_kept` and need no decision.
+
+A best-of-N candidate tree (`<slug>-w<n>-t<id>-c<i>`, created by the workflow, one per
+candidate) is never recorded in state, yet its agent may still be building in it. The prune keeps
+it, tree and branch, whenever its task's own `<slug>-w<n>-t<id>` tree is in `live_paths`, and
+lists it in `summary.branches_kept` with the rest. Nothing else is needed for that: Step 7.0
+records the task's tree before the workflow fires, and the path is cleared only once the workflow
+has finished or is treated as dead (every release below). The match includes the wave number, so
+it holds because Step 7.0 names the task's tree with the same wave number the workflow later
+gives its candidates. A candidate whose task tree is not live is an orphan like any other.
+The workflow removes every candidate tree on each of its exits; an unlanded winner keeps only its
+branch, which holds the commit. A best-of-N task that ends `blocked` keeps its tree recorded, so
+its candidate trees stay too when any is left, which is only a tree whose cleanup failed (listed in
+the return's `cleanup_failures`). It stays until the release that clears the task's path, and the
+first prune after that release removes it.
+
+The live set stays honest only because every path that sends a task back to `ready` first
+releases its tree (see **Releasing a wave tree** below): a cleared path is the only thing that
+lets a dead tree become an orphan again.
 
 For each branch in `summary.branches_preserved`: append tier-2 decision
 `"preserved unmerged wave branch {branch} after crash — inspect via `git -C {worktree} log {branch}`"`.
 For each branch in `summary.branches_deleted`: append tier-1 decision
 `"pruned merged-back wave branch {branch}"`.
+For each entry in `summary.failed`: append tier-2 decision
+`"could not prune wave worktree {entry.path} (branch {entry.branch}): {entry.stderr}"`, and when
+`entry.has_unmerged_commits` is True, append
+`" — branch {entry.branch} holds unmerged commits; inspect via `git -C {worktree} log {entry.branch}` before deleting it"`.
+A failed entry does not stop the wake: the prune has already handled every other orphan. Its
+directory or branch can outlive the failure even after git stops listing the tree, so a later
+prune may not see it; the decision is the record to clean it up from. On Windows the usual cause
+is a process whose cwd is still inside that tree.
 
-If `summary.worktrees_removed > 0`: persist `status.md`.
+If `summary.worktrees_removed > 0` or `summary.failed` is non-empty: persist `status.md`.
 
 If `plan.per_wave_worktrees` is False: skip silently.
 
+**Releasing a wave tree (every return to `ready`).** A task re-dispatched from `ready` gets a new
+tree under the next wave number, so the tree it had is never used again. Whenever a step sends a
+task with a non-null `state.tasks[tid].wave_worktree_path` back to `ready` (the restart abandon in
+Step 1.2, the Step 4.0 timeout `requeue`, the Step 7 reconcile `requeue`, and a human reset of a
+`blocked` task), release that tree first, then clear the fields. A best-of-N task marked `done`
+at reconcile releases its tree the same way, since nothing built in it, and so does a best-of-N task the BLOCKED handler re-dispatches after an unlanded winner, or merges back itself, any task the `verifier_blocker_persistent` handler re-dispatches, any task the hallucinated-denial branch re-dispatches, and any task the first-BLOCKED handler re-dispatches (Step 7). An adversarial task whose
+workflow proved its land (**Adversarial land proof**, Step 4 reconcile) only has its fields
+cleared, whatever its outcome: the workflow already removed that tree and branch, and a release
+would fail on a branch that is gone. A `done` single-shot
+task keeps its path only when its merge-back failed, so the user can inspect that tree:
+
+```python
+from agentflow.wave_worktree import release_wave_worktree
+released = release_wave_worktree(
+    path=Path(state.tasks[tid].wave_worktree_path),
+    branch=state.tasks[tid].wave_branch,
+    main_worktree=worktree,   # resolved in Step 1.1 — never Path.cwd()
+)
+state.tasks[tid].wave_worktree_path = None
+state.tasks[tid].wave_branch = None
+```
+
+Log `released.branches_preserved` and `released.failed` with the same decisions the prune above
+uses: a requeued task may have committed before it stalled, and its branch is then the only copy
+of that work. Clear the fields even when the release failed: the tree is then an orphan, and the
+next wake's prune retries it. Leaving the path set would keep a dead tree live on every later
+wake. With `plan.per_wave_worktrees` False the fields are never set and there is nothing to
+release. A requeue, or a human reset of a task the timeout ladder blocked, releases a tree only
+after **Stopping a wave run before a requeue** (below) has stopped the run or found it already
+over; a removal that still fails (on Windows, a held cwd refuses it) lands in `released.failed`
+for the next prune to retry.
+
+**Stopping a wave run before a requeue (the Step 4.0 timeout `requeue` and `block` rungs and the
+Step 7 reconcile `requeue`).** A wave run belongs to the whole wave group, not to one task:
+stopping it stops every task it builds, including a sibling partway through its merge-back into
+the shared epic tree. Read the run id from the task's latest dispatch decision note
+(`wave <n> dispatched: tasks [...] run <runId>`, Step 7 item 4 sub-step 3): it is the token after
+the final ` run ` in the summary (`run (\S+)$`), and the bracketed list names the group. With no
+readable run id, go straight to the last case below. Throughout, "requeued" includes a Step 4.0
+`block` in the same pass, whose task a stopped or finished run leaves `blocked` with its tree.
+- If any task the note lists is still `in_flight` and is not being requeued in this same pass, do
+  not stop the run: defer. Keep the task's tree and its fields and leave the task as it is, not
+  `ready`. A later wake or the group's reconcile applies this rule again; once the run has ended
+  on its own, the stop below answers "No task found" and the release goes ahead. The exception is
+  a blocking sibling with no readable dispatch time (its `since` missing or unparseable): it never
+  times out, so the defer would never end. Do not defer then; take the last case below and open
+  its tier-3 escalation.
+- When every task the note lists that is still `in_flight` is being requeued in this same pass,
+  call `TaskStop` on the run id. If the stop succeeds, or fails with "No task found" (the run
+  already finished), release the task's wave tree and clear its fields (**Releasing a wave
+  tree**, above), then reset the task to `ready`.
+- If no run id is readable, or the stop fails with any other error, the run may still be building
+  in that tree: keep the tree and its fields, do not reset the task to `ready`, and open a tier-3
+  escalation naming the task, its tree and the stop error (the rule a launch with no readable
+  `runId` follows, Step 7.0). The open escalation holds the task until it is answered: Step 3
+  exits before Step 4 while it is unanswered, so a later Step 4.0 pass does not re-fire the same
+  timeout into a second escalation. Unlike a defer, this case keeps any increment Step 4.0 made
+  this pass: a human has looked at the task by the time the escalation is answered, so its next
+  timeout after that blocks it rather than requeuing it again.
+
 ### Step 2: Dispatch orc-bootstrap subagent (load state + pre-flight audit + ready set)
+
+**Step 2.0 — Reconcile the board with the plan (every wake, before orc-bootstrap).**
+
+A plan may gain tasks mid-epic; the board follows it on the next wake. Removing a task from the
+plan also requires removing it from `status.md`, or the epic halts on it. The ready set is
+computed from `plan.tasks` while every state write goes through `state.tasks`, which bootstrap
+fills once, so the two sets are diffed here through the one helper the inline fallback also
+calls. orc-bootstrap stays read-only: the board it reads is already reconciled and persisted.
+
+`state` here is the in-memory board Step 1 already holds, never a fresh `read_status`: Step 1's
+wake counter, events and decisions are not persisted yet, and a re-read would drop them.
+
+```python
+from agentflow.plan_parser import parse_plan, reconcile_board
+from agentflow.status_writer import sync_orphan_escalations, write_status
+
+plan = parse_plan(plan_path)
+board = reconcile_board(plan, state)
+for tid in board.orphaned_done:
+    # Logged, not recorded as a decision: the set is stable, so a decision would repeat every wake.
+    print(f"task {tid} is done on the board and no longer in the plan; left alone")
+escalations_changed = sync_orphan_escalations(state, board)
+if board.orphaned_open:
+    persist_and_exit(state, status_path)  # no dispatch: not a dependency deadlock
+    return
+if board.added or escalations_changed:
+    # Persisted BEFORE orc-bootstrap reads the board, so no ready-task write hits a missing key.
+    write_status(status_path, state)
+```
+
+`reconcile_board` adds each plan-only task as `pending` with its plan phase and appends a tier-1
+decision naming it. A board-only task that is not `done` halts the epic with exactly the text
+`orphan_escalation_text` returns, never the deadlock escalation; a board-only `done` task is
+logged and left alone. `sync_orphan_escalations` keeps exactly one open escalation per orphaned
+task across wakes, keeps a `blocked` or held status instead of overwriting it, and answers an
+orphan escalation once the operator has fixed the board or the plan, which returns the epic to
+`running` when nothing else is open.
 
 Dispatch the `orc-bootstrap` named subagent. It loads state, runs the pre-flight dependency
 audit and computes the ready set in its own isolated context, returning a typed JSON struct the orchestrator parses with one call.
@@ -536,12 +674,21 @@ def _handle_bootstrap_malformed(exc: BootstrapMalformed, state, retry_count: int
 
 def _fallback_inline_state_load(state, plan_path, status_path, worktree):
     # Inline reads — the state load, pre-flight audit and ready-set compute orc-bootstrap does
-    from agentflow.plan_parser import parse_plan, compute_ready_set
-    from agentflow.status_writer import read_status
+    from agentflow.plan_parser import compute_ready_set, parse_plan, reconcile_board
+    from agentflow.status_writer import read_status, sync_orphan_escalations, write_status
     import subprocess
 
     plan = parse_plan(plan_path)
     state = read_status(status_path)
+    # Same reconcile as Step 2.0, before any ready-set compute: the emergency path writes ready
+    # tasks through the same board.
+    board = reconcile_board(plan, state)
+    escalations_changed = sync_orphan_escalations(state, board)
+    if board.orphaned_open:
+        persist_and_exit(state, status_path)
+        return
+    if board.added or escalations_changed:
+        write_status(status_path, state)
     # `-C worktree` is load-bearing on the emergency path too: this process's cwd is the
     # launch directory, so a bare `git log` scans a tree this epic never touched.
     subprocess.run(["git", "-C", str(worktree), "log", "--oneline",
@@ -625,7 +772,7 @@ unchanged.
     needed). Append a tier-2 decision: `blocked_reopen: user coarse-override; underlying tasks
     may still be marked blocked`. This is a coarse override — individual `state.tasks[tid]` that
     were marked blocked are NOT reset by this button. The user can either (a) manually flip
-    those tasks back to `ready` via frontmatter edit (zeroing each one's `timeout_count`; see Step 4.0), or (b) leave them `blocked`: they stay out
+    those tasks back to `ready` via frontmatter edit (zeroing each one's `timeout_count`, and confirming its run is over per **Stopping a wave run before a requeue** before releasing its wave tree; see Step 4.0 `block`), or (b) leave them `blocked`: they stay out
     of the ready set, so they are not re-dispatched, and when nothing else can run the deadlock
     check (bootstrap, or the Step 6 fallback) stops the epic again. Fall through to
     Step 4 in the same wake.
@@ -821,10 +968,10 @@ for any task whose wave has exceeded its deadline. The helper is pure: it reads
 `timeout_count` to pick `event.suggested_action` but never writes it, so **this step owns the increment**.
 
 For each `TimeoutEvent` (with `tid = event.task_id`):
-- Append a tier-2 decision (`append_decision(state, task=event.task_id, tier=2, summary=event.summary, evidence_path=f"status.md tasks.{event.task_id}.since={event.dispatched_at}")`). There is no per-task dispatch record to link (the wave variant script is per wave and step 5 deletes it), so the evidence is the dispatch timestamp Step 7 wrote, which names the dispatch this timeout measured from.
+- Append a tier-2 decision (`append_decision(state, task=event.task_id, tier=2, summary=event.summary, evidence_path=f"status.md tasks.{event.task_id}.since={event.dispatched_at}")`). There is no per-task dispatch record to link (the wave variant script is per wave and step 5 deletes it), so the evidence is the dispatch timestamp Step 7 wrote, which names the dispatch this timeout measured from. A pass whose `requeue` or `block` defers (below) skips this entry.
 - Increment `state.tasks[tid].timeout_count += 1` BEFORE applying the action, then apply `event.suggested_action`:
-  - `requeue` (first timeout for this task — `state.tasks[tid].timeout_count == 1` after this step's increment): reset the task to `state = "ready"`, clear `state.tasks[tid].since`, and let Step 7 re-dispatch on the next wave cycle.
-  - `block` (second timeout for this task — `state.tasks[tid].timeout_count >= 2` after this step's increment): mark `state.tasks[tid].state = "blocked"`, open an escalation explaining the repeated timeout, and let Step 3's blocked-branch surface the escalation. A human who resets this task to `ready` also sets `state.tasks[tid].timeout_count = 0`: the reset starts a fresh ladder, and a count left at 2 would block the task on its very next timeout.
+  - `requeue` (first timeout for this task — `state.tasks[tid].timeout_count == 1` after this step's increment): the run may still be building, so apply **Stopping a wave run before a requeue** (Step 1.2.5) before any release. When it releases the tree (**Releasing a wave tree**) and resets the task to `state = "ready"`, also clear `state.tasks[tid].since` and let Step 7 re-dispatch on the next wave cycle. When it defers, take back this pass's increment (`state.tasks[tid].timeout_count -= 1`): nothing was requeued, so the ladder has not moved. A deferring pass also skips the per-pass tier-2 decision above (the defer is decidable first: the rule reads only the dispatch note and the board) and logs at most one tier-1 `deferred: sibling <ids> still in flight` note per dispatch, so a defer that spans many wakes does not add an entry on each.
+  - `block` (second timeout for this task — `state.tasks[tid].timeout_count >= 2` after this step's increment): the run may still be building, so apply **Stopping a wave run before a requeue** (Step 1.2.5) before marking the task blocked. When it defers, handle the pass as the `requeue` rung does: take back this pass's increment (`state.tasks[tid].timeout_count -= 1`) and log at most one tier-1 `deferred: sibling <ids> still in flight` note per dispatch; the task stays `in_flight` with its tree, and a later pass blocks it. Otherwise mark `state.tasks[tid].state = "blocked"`, open an escalation explaining the repeated timeout and whether the run was stopped (in the rule's last case, put this in its tier-3 escalation rather than opening a second), and let Step 3's blocked-branch surface the escalation. A human who resets this task to `ready` also sets `state.tasks[tid].timeout_count = 0`: the reset starts a fresh ladder, and a count left at 2 would block the task on its very next timeout. No step notices a reset, so whoever makes it first confirms the run is over, as **Stopping a wave run before a requeue** would (that escalation says whether it was stopped), then releases the task's wave tree and clears its fields (**Releasing a wave tree**, Step 1.2.5); a blocked task keeps its tree until then, since a human may inspect it.
 - Persist status.md (`write_status`) once all events are applied. An unpersisted increment is lost at the next wake, and the ladder never reaches `block`.
 
 This sub-step MUST run **before** the commit-on-branch reconcile (Step 2 bootstrap result OR the fallback inline block) so a wave that timed out but happens to share a commit-message signature with an unrelated landing commit is still detected as a timeout, not a false-positive completion.
@@ -843,9 +990,10 @@ If `since` > 2 hours with no commit: mark `blocked`, open escalation.
 If any tasks completed since `state.last_green_commit`:
 1. Run `plan.test_commands["regression"]` against `<worktree>` — a plan-authored command string
    carries no tree, so give it one the same way a wave does: the runner's own path flag where it
-   has one, otherwise `cd <worktree> && <command>`. Run from the launch directory it would test
-   whatever happens to be there, and a regression check that passed on the wrong tree is worse
-   than one that did not run.
+   has one, otherwise a subshell, `( cd <worktree> && <command> )`. Never a bare `cd`: it
+   persists in the shell and wedges worktree removal on Windows. Run from the launch directory
+   it would test whatever happens to be there, and a regression check that passed on the wrong
+   tree is worse than one that did not run.
 2. Failures present → this is a true regression (implementer's new tests are guaranteed green at task-complete time)
 3. Dispatch `prompts/regression_debugger.md` subagent (synchronous):
    - Populate `{{WORKTREE}}` with `<worktree>` (Step 1.1). **Required** — the prompt bisects,
@@ -872,7 +1020,9 @@ The orchestrator applies the returned `bootstrap.ready_tasks` list directly in S
 This step is a no-op when the bootstrap path runs successfully.
 
 **Fallback:** When running in inline state-load mode (see Step 2 Fallback subsection),
-compute the ready set inline:
+compute the ready set inline. `_fallback_inline_state_load` has already run `reconcile_board`, so
+every task in `ready_ids` has a board entry and a board-only task that is not `done` has already
+halted the wake:
 
 ```python
 done = {tid for tid, ts in state.tasks.items() if ts.state == "done"}
@@ -887,35 +1037,57 @@ handler resets it.
 Deadlock check: if no ready tasks AND no in-flight tasks AND not all tasks are done:
 set `state.status = "blocked"`, open escalation, ntfy HARD_FAILURE, exit. The escalation names
 every `blocked` task and says that answering it does not reset them; the reset step is to set
-`state.tasks[<tid>].state` to `ready` (and its `timeout_count` to `0`, so a task blocked by Step 4.0's timeout ladder starts a fresh one) in the status.md frontmatter for each task to run again.
+`state.tasks[<tid>].state` to `ready` (and its `timeout_count` to `0`, so a task blocked by Step 4.0's timeout ladder starts a fresh one) in the status.md frontmatter for each task to run again, confirming its run is over per **Stopping a wave run before a requeue** (Step 4.0 `block`) before releasing its wave tree and clearing its fields (**Releasing a wave tree**, Step 1.2.5).
 
 ### Step 7: Dispatch ready tasks
 
 **Step 7.0 — Per-wave worktree setup (conditional).**
 
-For each ready task about to dispatch in this wave:
+Step 7.0 runs once per parallel-safe group, at the start of that group's item 4 sub-step 1,
+just before its `build_wave_args` call, for each task in that group. Each group is its own wave
+with its own number: item 4 sub-step 2 calls `increment_wave` once per group, so a wake that
+dispatches two groups gives them two consecutive numbers. Read `state.total_waves + 1` at that
+group's own Step 7.0, after the previous group's increment, never once for the whole wake: a
+number read before the first group's increment names the second group's trees after the first
+group's wave, while its workflow names its candidates after its own.
 
 - If `plan.per_wave_worktrees` is `True`:
   ```python
   from agentflow.wave_worktree import create_wave_worktree
+  group_wave_n = state.total_waves + 1   # this group's number; its increment_wave runs after build_wave_args
   wave_path = create_wave_worktree(
       repo_path=worktree,   # resolved in Step 1.1 — never Path.cwd()
       epic_slug=plan.slug,
-      wave_n=state.total_waves + 1,  # increment happens after, so +1
+      wave_n=group_wave_n,
       task_id=task.id,
       base_branch=epic_branch,
   )
   ```
   Record `state.tasks[task.id].wave_worktree_path = str(wave_path)` and
-  `state.tasks[task.id].wave_branch = f"{plan.slug}-w{state.total_waves+1}-t{task.id}"`.
+  `state.tasks[task.id].wave_branch = f"{plan.slug}-w{group_wave_n}-t{task.id}"`.
   Persist `status.md`.
+
+  **Every exit between Step 7.0 and the workflow launch releases this group's trees.** Until
+  item 4 sub-step 3 launches the workflow, no agent builds in a tree Step 7.0 made, and nothing
+  else will release it. So any exit before that launch (the empty-body refusal, any other
+  exception `build_wave_args` raises, `wave_script_dir` or `bake_wave_script` raising, or a
+  Workflow call that errored, so no run launched) releases every tree Step 7.0 made for this
+  group and clears its fields (**Releasing a wave tree**, Step 1.2.5), resets any group task
+  already marked `in_flight` back to `ready`, persists `status.md`, and only then raises,
+  escalates or exits. Item 4 sub-step 1 spells out the empty-body case. Release only when the
+  launch definitely did not happen: a Workflow call that returned without error but with no
+  readable `runId` may have started a run that builds in these trees, so keep the trees and
+  fields and open a tier-3 escalation naming the group's tasks and trees instead. An exit after
+  item 4 sub-step 2 comes after `increment_wave`: the counter has moved and the `wave_dispatched`
+  session event stands, so also append a tier-2 decision `"wave {n} not sent: {reason}"`; the
+  next dispatch takes the next number.
 - If `plan.per_wave_worktrees` is `False` (legacy): create no per-wave worktree — every task in
   the wave builds directly in `<worktree>`. **The subagents must still be TOLD that path** (see
   the worktree-context block below, which is emitted on this path too, naming `<worktree>` where
   the per-wave path would otherwise appear). Nothing puts the subagents in the right tree for them,
   so silence on this path means the wave builds wherever the harness dropped it.
 
-1. Parse the `## Files:` section of each ready task body in the plan markdown (not frontmatter — the body)
+1. Parse the Files section (`#### Files:`, or the legacy `## Files:` / `**Files:**`) of each ready task body in the plan markdown (not frontmatter — the body)
 2. Group ready tasks into "parallel-safe" groups: tasks whose Files: lists are disjoint can run together
 3. **Assemble operational-context block** (per-dispatch; read fresh — no caching):
    - If `plan.extra_context_files` is non-empty, for each `ContextFile` in order:
@@ -942,25 +1114,33 @@ For each ready task about to dispatch in this wave:
      block to the wave subagent prompt. Let `{wave_tree}` be
      `state.tasks[task.id].wave_worktree_path` when `plan.per_wave_worktrees` is True, and
      `<worktree>` when it is False; let `{wave_ref}` be `state.tasks[task.id].wave_branch` or the
-     epic branch, correspondingly.
+     epic branch, correspondingly. **Fill `{wave_tree}` and `{wave_ref}` at item 4 sub-step 1,
+     not here.** On the per-wave path those fields do not exist yet: Step 7.0 writes them at the
+     start of item 4 sub-step 1, once per group. Read them after that group's Step 7.0, immediately
+     before the "Prepend the worktree-context block" step there. A value read at this point is
+     null, or a previous wave's path, and the whole wave then builds in the wrong tree. Item 3
+     fixes only the block's text and its place in the prompt.
 
      ```
      ## Worktree context (read FIRST, before any other action)
 
-     Build in `{wave_tree}`, a git worktree on branch `{wave_ref}`. Your FIRST action
-     must be:
+     Build in `{wave_tree}`, a git worktree on branch `{wave_ref}`. Name that tree in
+     every command:
 
-         cd {wave_tree}
+     - Every git call carries `-C {wave_tree}`: `git -C {wave_tree} add`,
+       `git -C {wave_tree} commit`, and the rest.
+     - Every file edit and test run uses an absolute path under `{wave_tree}`. Where a
+       runner takes a path flag, use it (`npm --prefix {wave_tree} test`); where it has
+       none, wrap it in a subshell: `( cd {wave_tree} && <command> )`.
+     - Never a bare `cd`. The shell's working directory persists across calls, and on
+       Windows a directory that is a live process's working directory cannot be removed,
+       so the tree's cleanup fails. This session was launched from a directory that is
+       not a repository, so a command that names no tree resolves against nothing.
 
-     Then carry `-C {wave_tree}` on every git call anyway — `git -C {wave_tree} add`,
-     `git -C {wave_tree} commit`, and the rest. The `cd` sets a default for YOUR shell;
-     it does not follow your own fan-out agents or every tool call, and this session was
-     launched from a directory that is not a repository, so anything that misses the
-     default resolves against nothing. File edits and test runs target paths under
-     `{wave_tree}`. Do NOT work in another tree. Do NOT `git checkout` other branches.
+     Do NOT work in another tree. Do NOT `git checkout` other branches.
 
-     The orchestrator will merge your branch back into the epic branch after your
-     spec + code-quality reviewers pass. You do not need to push or PR — just commit.
+     Your branch is merged back into the epic branch for you. You do not need to push
+     or PR — just commit.
      ```
 
      Place this block ABOVE the operational-context block. On the legacy (`False`) path the
@@ -970,51 +1150,68 @@ For each ready task about to dispatch in this wave:
    - **Use-Case trailer injection (per ready task, Hop 3 of the use-case traceability spine):** if `plan.tasks[tid].use_cases` is non-empty, prepend a single `Use-Case: <comma-joined UC-IDs>` line to that task's brief body (above any operational-context block). The implementer prompt turns each ID into a `Use-Case: <id>` git trailer on every commit, so the flow-page ingestion (autodoc-update) can attach the UC to its flow page. Tasks with no `use_cases` get no line — behavior unchanged.
 4. For each parallel-safe group (each Wave), dispatch the group as ONE Workflow instead of N Task subagents — **fire-and-reconcile**:
 
-   1. `increment_wave(state)` and `append_session_event(state, "wave_dispatched", f"Wave {state.total_waves}")` — keep the existing "Wave N dispatch:" decision-log entry format for dashboard back-compat.
-   2. Build args:
+   1. Run Step 7.0 for this group's tasks first, then build args **before** touching the wave counter — `wave_n` is the number this wave is about to get (`state.total_waves + 1`, the same `group_wave_n` this group's Step 7.0 just named its trees with), so a refusal leaves `state.total_waves` unchanged:
       ```python
       from agentflow.wave_dispatch import build_wave_args, fallback_delay_seconds
       args = build_wave_args(
           plan=plan, plan_path=plan_path, group_task_ids=group_ids,
-          status_path=status_path, wave_n=state.total_waves,
+          status_path=status_path, wave_n=state.total_waves + 1,  # incremented in sub-step 2
           base_branch=epic_branch, repo_path=worktree,  # Step 1.1 — never Path.cwd()
           ntfy_url=os.environ.get("NTFY_URL"), ntfy_topic=os.environ.get("NTFY_TOPIC"),
           skill_dir=skill_dir)  # the orchestrator skill root — resolves each task's contract_path
       ```
+      **Empty-body refusal.** `build_wave_args` raises `ValueError` when a group task's body in the plan is empty (`Task <tid> has an empty body in <plan path>: ...`). The implementer sees only that body, so the task cannot run. Do not dispatch the wave and do not increment the wave counter. Handle only a message matching `^Task (\d+) has an empty body`; any other exception is not this refusal, so release this group's Step 7.0 trees and clear their fields (**Releasing a wave tree**, Step 1.2.5), then re-raise it. On the refusal itself, release every wave tree Step 7.0 created for this group and clear its fields (**Releasing a wave tree**, Step 1.2.5): the counter stays put, so the re-dispatch after the answer reuses the same wave number, and a tree left behind holds that branch name. Then raise a tier-3 escalation: take the task id from that match and call `open_escalation(state, task=<tid>, question=f"Task {tid} has an empty body in {plan_path}; re-run /solution to restore the body, then answer to resume.")` (it sets `status = "escalation"` itself), then `agentflow.ntfy.notify_once(state, key=f"empty_task_body_{tid}", trigger_type=TriggerType.HARD_FAILURE, epic=state.epic, detail=<the same question>)`, persist `status.md`, and exit.
       `skill_dir` selects each task's wave-contract prompt (`prompts/implementer-with-verifier-loop.md`, or `prompts/implementer-with-tdd-loop.md` for `type: tdd` tasks) as `tasks[*].contract_path`; the workflow's implementer prompt instructs the wave subagent to Read and follow it.
       **`repo_path` is the only tree any wave subagent is ever told** — it surfaces as `A.repo_path`
       in `workflows/wave_group.js` and lands in the implementer prompt as "in repo …". A wrong or
       unresolved value here does not fail; it silently builds the whole wave somewhere else. That is
       why Step 1.1 escalates rather than defaulting.
       **Prepend the worktree-context block (item 3 above) to every task's `body` in
-      `args["tasks"]` before firing — unconditionally, for every task in the wave.** `body` is
-      the only channel that reaches the subagent: `wave_group.js` embeds it verbatim and carries
-      nothing else from `tasks[*]`. A block that is declared "always emitted" but only written
+      `args["tasks"]` before firing — unconditionally, for every task in the wave.** Fill its
+      `{wave_tree}` and `{wave_ref}` now, from the `wave_worktree_path` and `wave_branch` this
+      group's Step 7.0 just recorded. `body` is
+      the only free-text channel that reaches the implementer's prompt: `wave_group.js` embeds it
+      verbatim, and the other `tasks[*]` fields it reads are structured inputs, not prose. A block that is declared "always emitted" but only written
       into `body` alongside some other block is not emitted at all on the path where that other
       block is empty, which is the common case. Then, if the operational-context block is
       non-empty, prepend its rendered text as well (below the worktree block, per item 3's
       ordering).
-   3. Mark each group task `state.tasks[tid].state = "in_flight"`, set `state.tasks[tid].since = now` as a UTC ISO 8601 timestamp (the dispatch time: reconcile only counts an outcome note written after it), and record the run by launching the wave Workflow. **DISPATCH MECHANISM (load-bearing): bake the args in.** The wave runs from a baked variant script, never from `Workflow(scriptPath=wave_group.js, args=<dict>)`. The Workflow tool does not bind the `args` global for `wave_group.js` in this harness (`const A = args` resolves to undefined and the wave fails at `A.tasks.map`), and workflow scripts cannot read files or env, so the inputs must be inlined as a literal. Call `agentflow.wave_dispatch.bake_wave_script(args, skill_dir, tag=f"{plan.slug}-w{state.total_waves}", out_dir=wave_script_dir(load_environment().data_root, plan.project))` (`from agentflow.config import load_environment`; `from agentflow.wave_dispatch import bake_wave_script, wave_script_dir`; `plan.project` is the same `<name>` step 5 of the bootstrap used for the status.md path — if the plan has no `project:`, `wave_script_dir` raises before touching the filesystem: add the field to the plan frontmatter (the bootstrap asked for it) rather than guessing a name) to write the variant to **`<data_root>/projects/<name>/status/workflows/wave_group_<tag>.js`** with the args object inlined as a literal, then call the **Workflow tool** with `scriptPath` = that variant path and **NO `args` param**. Save the returned `runId` to `state.tasks[tid].wave_runid` (free-form decision-log note is fine if the field is absent). Persist status.md. **The variant is project runtime state, not suite code** — it carries this project's absolute paths, so it lives under the project's `status/`, never beside the template in the orchestrator skill directory (`bake_wave_script` refuses that directory; the template `workflows/wave_group.js` stays read-only). The variant path is deterministic from (`data_root`, `plan.project`, `plan.slug`, wave number) — nothing needs to be persisted to find it again; step 5 deletes it.
+      **When `plan.per_wave_worktrees` is True, `build_wave_args` sets `wave_worktree` and
+      `wave_branch` on every task in `args["tasks"]`**, derived from `repo_path`, the plan slug,
+      `wave_n` and the task id exactly as Step 7.0 named the tree, and raises `ValueError` naming
+      the path when that tree does not exist; when False it sets neither. The
+      workflow reads them for adversarial tasks only: an adversarial task that carries both is
+      landed by the workflow (see the merge-back notes under the review gates below), one that
+      carries neither is treated as having built in the epic tree and is not merged by the
+      workflow, and one that carries only one of the two is reported `blocked` without running.
+      Leaving both off on the per-wave path is caught at reconcile (**Adversarial land proof**),
+      which merges the tree back itself.
+   2. Only after `build_wave_args` returns: `increment_wave(state)` and `append_session_event(state, "wave_dispatched", f"Wave {state.total_waves}")`. The wave's only decision-log entry is the dispatch decision note sub-step 3 appends once the run id is known; there is no other dispatch entry format. `state.total_waves` now equals `args["wave_n"]`.
+   3. Mark each group task `state.tasks[tid].state = "in_flight"`, set `state.tasks[tid].since = now` as a UTC ISO 8601 timestamp (the dispatch time: reconcile only counts an outcome note written after it), and record the run by launching the wave Workflow. **DISPATCH MECHANISM (load-bearing): bake the args in.** The wave runs from a baked variant script, never from `Workflow(scriptPath=wave_group.js, args=<dict>)`. The Workflow tool does not bind the `args` global for `wave_group.js` in this harness (`const A = args` resolves to undefined and the wave fails at `A.tasks.map`), and workflow scripts cannot read files or env, so the inputs must be inlined as a literal. Call `agentflow.wave_dispatch.bake_wave_script(args, skill_dir, tag=f"{plan.slug}-w{state.total_waves}", out_dir=wave_script_dir(load_environment().data_root, plan.project))` (`from agentflow.config import load_environment`; `from agentflow.wave_dispatch import bake_wave_script, wave_script_dir`; `plan.project` is the same `<name>` step 5 of the bootstrap used for the status.md path — if the plan has no `project:`, `wave_script_dir` raises before touching the filesystem: add the field to the plan frontmatter (the bootstrap asked for it) rather than guessing a name) to write the variant to **`<data_root>/projects/<name>/status/workflows/wave_group_<tag>.js`** with the args object inlined as a literal, then call the **Workflow tool** with `scriptPath` = that variant path and **NO `args` param**. Record the returned `runId` in the dispatch decision note: for each group task, `append_decision(state, task=tid, tier=1, summary=f"wave {n} dispatched: tasks [{ids}] run {runId}")`, with `n = state.total_waves` and `ids` the group's task ids, comma-separated. That note is the only record of the run id: a requeue (Step 4.0, and the reconcile below) reads it back to stop the run, and step 5 reads `n` from it. Persist status.md. **The variant is project runtime state, not suite code** — it carries this project's absolute paths, so it lives under the project's `status/`, never beside the template in the orchestrator skill directory (`bake_wave_script` refuses that directory; the template `workflows/wave_group.js` stays read-only). The variant path is deterministic from (`data_root`, `plan.project`, `plan.slug`, wave number) — nothing needs to be persisted to find it again; step 5 deletes it. If `wave_script_dir` or `bake_wave_script` raises, or the Workflow call errors, no workflow holds this group's trees: release them first (**Every exit between Step 7.0 and the workflow launch releases this group's trees**, Step 7.0). A call that returned without error but with no readable `runId` may have launched a run: escalate, never release.
    4. **Fire-and-reconcile.** ScheduleWakeup with `delaySeconds = fallback_delay_seconds(plan, group_ids)` (the wedge-catcher fallback ≈ wave_deadline + slack) and exit the turn. The workflow's completion notification is the primary, fast wake; the fallback only fires if it wedged.
    5. **On the reconcile wake** (notification or fallback): the wave-event reporter has already written each task's terminal state to status.md. For each group task:
-      - Compute `committed_task_ids` from `git -C <worktree> log --since=<state.tasks[tid].since>` (commit-signature match), as today.
+      - Compute `committed_task_ids` per group task with a commit-signature match over the log of the refs that can hold the task's commit. When `plan.per_wave_worktrees` is True: `git -C <worktree> log <state.tasks[tid].wave_branch> <epic_branch> --since=<state.tasks[tid].since>`. A single-shot task's commit sits on its wave branch, in the sibling tree, until merge-back on approval, so a log of the epic branch alone does not contain it; a task that merges back inside the workflow lands on the epic branch. When `plan.per_wave_worktrees` is False: `git -C <worktree> log --since=<state.tasks[tid].since>`.
       - `actions = reconcile_group_from_status_git(state, group_ids, committed_task_ids)`.
-      - Delete the wave's baked variant — it is runtime state that has served its purpose: `out_dir = wave_script_dir(load_environment().data_root, plan.project); remove_wave_script(out_dir / f"wave_group_{plan.slug}-w{wave_n}.js", out_dir=out_dir)` where `wave_n` is the `state.total_waves` value step 3 baked with — write it into the dispatch decision-log entry (`wave <n> dispatched: tasks [...]`) so the reconcile wake reads it back rather than re-deriving it from a counter that may have moved (idempotent; returns False if already gone). A variant that outlives its wave means this step never ran.
+      - Delete the wave's baked variant — it is runtime state that has served its purpose: `out_dir = wave_script_dir(load_environment().data_root, plan.project); remove_wave_script(out_dir / f"wave_group_{plan.slug}-w{wave_n}.js", out_dir=out_dir)` where `wave_n` is the `state.total_waves` value step 3 baked with — read it back from the dispatch decision note step 3 wrote (`wave <n> dispatched: tasks [...] run <runId>`) rather than re-deriving it from a counter that may have moved (idempotent; returns False if already gone). A variant that outlives its wave means this step never ran.
       - If the aggregate workflow return is available, run `parse_wave_return(...)` and cross-check against status.md; on disagreement, trust status.md + git and log a tier-2 decision. The exception is a task whose return carries a non-empty `report_failures` list: a durable write for it was refused, dropped or never confirmed, so its status.md entry may be stale. For that task, trust the workflow return, re-issue that task's state write, rebuilt from the return's outcome, since a `report_failures` entry names what failed but not the fields (`python -m agentflow.wave_event task-state ...` with only the fields the reporter accepts) before reconciling. The return's `commit` goes through the same rule `wave_group.js` applies: trimmed first, `none`, `null`, `n/a` (any case) and empty mean no commit and add no `--commit`, and only 7 to 64 hex characters reach `--commit`; anything else is left off and never passed raw. Log the failures as a tier-2 decision.
       - Apply `coerce_wave_outcome` to every task result (defense-in-depth — see the coercion block below).
-      - For `actions[tid] == "needs_review"` AND the task ran single-shot (`needs_orchestrator_review == True`): run the orchestrator review gates below (unchanged spec-reviewer then code-quality-reviewer loop). For best-of-N/adversarial tasks (`needs_orchestrator_review == False`): reviews already ran inside the workflow — mark done on approved, escalate otherwise.
+      - For `actions[tid] == "needs_review"` AND the task ran single-shot (`needs_orchestrator_review == True`): run the orchestrator review gates below (unchanged spec-reviewer then code-quality-reviewer loop). For best-of-N/adversarial tasks (`needs_orchestrator_review == False`): reviews already ran inside the workflow — mark done on approved, escalate otherwise. When a best-of-N task is marked done, release the per-task tree Step 7.0 recorded for it and clear its fields (**Releasing a wave tree**, Step 1.2.5): its candidates built in their own trees, so that tree was never used, and only the single-shot merge-back below clears a path otherwise.
+      - **Adversarial land proof** (per-wave path, adversarial task with a non-null `state.tasks[tid].wave_worktree_path`). The workflow's word that it landed the task is its return: `merge_exit_code == 0` and `branch == state.tasks[tid].wave_branch`. On a fallback wake with no return, the proof is that `git -C <worktree> rev-parse --verify --quiet refs/heads/<wave_branch>` finds no branch and the task's status.md commit is an ancestor of the epic HEAD (`git -C <worktree> merge-base --is-ancestor <commit> HEAD`). Never infer a land from a `done` state alone: a task dispatched without its wave tree in args reports `done` with its commit still on the wave branch.
+        - Proven, whatever the outcome (`done`, or blocked by the refuter panel or an inside review after the land): clear `wave_worktree_path` and `wave_branch` without a release, since the workflow removed that tree and branch and a release would fail on the missing branch. A tree the workflow failed to remove is listed in the return's `cleanup_failures`; once its path is cleared the next prune removes it as an orphan.
+        - Not proven and the task is `done`: run the single-shot `merge_back` on its recorded tree (below) and follow that section's landed / not-landed handling, so a commit left on the wave branch reaches the epic branch or escalates.
+        - Not proven and the task is not `done` (an unlanded or self-blocked task): keep the fields. The workflow kept that tree because it holds the only copy of the commit, and the release on its return to `ready` checks the branch for unmerged commits before removing it.
       - For `actions[tid] == "escalate"`: the wave reported the task `blocked`, or recorded a non-done outcome for it during this dispatch. Never reset it to `ready`. Take its outcome from the parsed return's `effective_outcome` when the return is available, otherwise from `reported_wave_outcome(state, tid)` (`from agentflow.wave_dispatch import reported_wave_outcome`), which reads the reporter's `wave outcome:` note, and route it to the matching handler below. On a fallback wake with no outcome recorded, open an Escalation for the task naming it as blocked with the outcome unknown, and exit rather than re-dispatching: a blocked task may be a tier-3 question, and re-dispatching it answers that question without the human. The same holds for any outcome no handler below names, including `unknown_outcome` and any garbled value: route it to the tier-3 escalation handler, never to re-dispatch. The ready set excludes `blocked` tasks (Step 6), so a task marked `blocked` stays out of dispatch until a human or a handler resets it.
-      - For `actions[tid] == "requeue"`: the task never reported a terminal state, has no commit and recorded no outcome, so it wedged. Reset to `ready`; Step-4 wave-timeout handling governs repeat offenders.
+      - For `actions[tid] == "requeue"`: the task never reported a terminal state, has no commit and recorded no outcome, so it wedged, and the group's run may still be building. Apply **Stopping a wave run before a requeue** (Step 1.2.5), which releases the tree (**Releasing a wave tree**) and resets the task to `ready` only once the run is stopped or already over; Step-4 wave-timeout handling governs repeat offenders.
       - For `effective_outcome == "escalation_required"`: existing escalation handler (below).
-      - For `effective_outcome == "verifier_blocker_persistent"` / `test_failure_persistent`: hard subagent failure — the reporter has already written `blocked`, and `blocked` never re-enters the ready set, so set `state.tasks[tid].state = "in_flight"` (and `since = now`) explicitly, then re-dispatch once with more context; if still blocked, mark task `blocked`, set `status=blocked`, ntfy HARD_FAILURE, exit. Record `verifier_iterations` and findings history to the decision log.
+      - For `effective_outcome == "verifier_blocker_persistent"` / `test_failure_persistent`: hard subagent failure — the reporter has already written `blocked`, and `blocked` never re-enters the ready set, so set `state.tasks[tid].state = "in_flight"` (and `since = now`) explicitly, then re-dispatch once with more context. The re-dispatch goes back through Step 7.0, which makes a new tree under the next wave number, so before it, when the task records a `wave_worktree_path`, release that tree and clear its fields (**Releasing a wave tree**, Step 1.2.5); a tree left recorded stays live and is never pruned; if still blocked, mark task `blocked`, set `status=blocked`, ntfy HARD_FAILURE, exit. Record `verifier_iterations` and findings history to the decision log.
       - For `effective_outcome == "blocked"`: run hallucinated-denial detection first, then the BLOCKED handler (both below).
    6. Stabilization-test suggestions, merge-gate, and all Step 8/9 logic are unchanged.
 
    **Note on `task.verification is None`:** the workflow's implementer prompt degrades gracefully (empty allowlist/criteria lists). Append a WARN to `state.decisions`: *"task {tid} has no verification block — running without in-wave verifier scope; consider re-running solution to add verification frontmatter."*
 
    **Orchestrator review gates (single-shot reconcile path only):**
-   - Dispatch the **spec-reviewer-evidence-wrapper** (`prompts/spec-reviewer-evidence-wrapper.md`), **substituting `{worktree}` with `<worktree>` in the prompt**. Apply `agentflow.subagent_contract.coerce_review_verdict()` immediately on return. Loop until ✅. **Always runs** for single-shot tasks — the spec-reviewer sees the work in a different context (whole-task review, not just-completed-diff review) and catches different classes of drift.
-   - On spec-OK: dispatch the **code-quality-reviewer-evidence-wrapper** (`prompts/code-reviewer-evidence-wrapper.md`), **substituting `{worktree}` with `<worktree>` in the prompt**. Apply `coerce_review_verdict()` immediately on return. Loop until ✅. Always runs.
+   - Dispatch the **spec-reviewer-evidence-wrapper** (`prompts/spec-reviewer-evidence-wrapper.md`), **substituting `{worktree}` with `state.tasks[tid].wave_worktree_path` when `plan.per_wave_worktrees` is True, and with `<worktree>` when it is False**. On the per-wave path the task's commit sits on its wave branch in that tree until the merge-back below runs on approval; the epic tree does not contain the change yet, so a reviewer pointed there reads and tests pre-change code. Apply `agentflow.subagent_contract.coerce_review_verdict()` immediately on return. Loop until ✅. **Always runs** for single-shot tasks — the spec-reviewer sees the work in a different context (whole-task review, not just-completed-diff review) and catches different classes of drift.
+   - On spec-OK: dispatch the **code-quality-reviewer-evidence-wrapper** (`prompts/code-reviewer-evidence-wrapper.md`), **substituting `{worktree}` with `state.tasks[tid].wave_worktree_path` when `plan.per_wave_worktrees` is True, and with `<worktree>` when it is False**, for the same reason. Apply `coerce_review_verdict()` immediately on return. Loop until ✅. Always runs.
    - **On `inconclusive` coercion (either reviewer):** re-dispatch the implementer once with `agentflow.subagent_contract.build_enriched_redispatch_prompt(original, findings)`. Second `inconclusive` on same role → escalate per existing two-attempt rule.
    - On approval: mark `state.tasks[tid].state = "done"`, capture commit SHA. Record `verifier_iterations`, `verifier_verdict`, `verifier_findings_count` to `state.tasks[tid]`; append `integration_test_suggestions` (if any) for the end-of-epic stabilization-test summary.
    - **On approval, if `plan.per_wave_worktrees` is True:** call `agentflow.wave_worktree.merge_back`:
@@ -1026,9 +1223,16 @@ For each ready task about to dispatch in this wave:
          branch=state.tasks[tid].wave_branch,
      )
      ```
+     `merge_back` fast-forwards when the epic branch has not moved since the wave tree was created, and otherwise lands the wave branch through a merge commit. Siblings in one parallel-safe group all start from the same epic HEAD, so every sibling after the first lands that way. The task commit is never rebased: its sha stays the one the wave tree committed, and the `committed_task_ids` log above (which does not follow first parents only) still finds it behind the merge commit. A conflict aborts the merge and leaves the epic branch and tree exactly as they were, and `merge_back` returns `success: False` with git's conflict output in `stderr`. A merge commit also runs the merge hooks and needs a committer identity, which a fast-forward never did, so a failing hook, a missing identity, a busy index or a dirty tree each refuse the land the same way. The fetch goes to a ref private to the wave branch, never to the shared `FETCH_HEAD`, so concurrent merge-backs into one epic tree cannot merge each other's tip.
      - On `result.success`: `cleanup_wave_worktree(path, branch, main_worktree, preserve_branch=False)`; clear `state.tasks[tid].wave_worktree_path` and `.wave_branch`; append tier-1 decision `"wave merged back: {branch} → epic"`.
      - On `result.success is False`: tier-3 escalation — append decision `"merge-back failed for {branch}: {result.stderr}"`, set `state.status = "escalation"`, ntfy `MERGE_BACK_FAILED`, persist `status.md`, exit dispatch loop. Do NOT delete the wave worktree (user inspects manually).
-     (Best-of-N tasks merge back inside the workflow via the worktree CLI; this orchestrator-side merge-back applies to the single-shot per-wave-worktree path.)
+     This orchestrator-side merge-back applies to the single-shot per-wave-worktree path. **Best-of-N and adversarial tasks land inside the workflow instead.** `wave_group.js` runs the worktree CLI's `merge-back` for the judged winner and reads its result `{merge_exit_code, success, stderr}`; it counts the winner as landed only on exit 0 with `success: true`. Group tasks run concurrently, so the epic branch moving under that merge is an ordinary outcome, not an edge case: it lands through a merge commit. Concurrent lands are not serialised: a conflict, or any other refused merge (a failing hook, a missing committer identity, an index another land holds), leaves the winner unlanded.
+     - Landed (on the first attempt or the retry below): the workflow removes the winner's worktree and branch and every losing candidate's, then runs the inside reviews (and the refuter panel when the task is adversarial).
+     - Not landed (any other result, including a land agent that returned nothing): the workflow retries the land once, because a concurrent land in the same group (an index it holds, an epic branch it moved) is the usual refusal, and keeps the winner's tree only through that retry. Refused again, it removes every candidate tree, the winner's included, and deletes the losers' branches, but keeps the winner's branch (`cleanup --preserve-branch`), which holds the only copy of the commit. The tree adds nothing to the branch (merge-back fetches a branch from any tree of the repository), and a kept tree leaks one tree per re-dispatch. It skips the inside reviews and reports the task `blocked` with a `wave outcome: blocked (...)` note that carries merge-back's stderr, and returns `outcome: "blocked"` with `merge_exit_code`, `merge_stderr`, the kept `branch` and the unlanded `winner_commit` (never `commit`). Reconcile routes it to the BLOCKED handler.
+     - A candidate cleanup that does not exit 0 is listed in the return's `cleanup_failures` and in a task note; it does not change the outcome. Remove each listed tree with the worktree CLI's `cleanup` command.
+     - All candidates failed tests: no candidate is eligible, so the workflow removes every candidate's tree and branch, reports the task `blocked` with a `wave outcome: verifier_blocker_persistent (...)` note, and returns that outcome.
+     - Judge votes: each judge returns a 0-based index into the eligible candidates. A vote that is missing, not an integer, or out of range is dropped, and only the remaining votes are tallied. When no valid vote remains, the workflow reports the task `blocked` with the note `wave outcome: blocked (best-of-N: no valid judge vote)`, removes every candidate's tree and branch (with no winner, no candidate holds a commit that will land), and returns `outcome: "blocked"` with empty `judge_votes`. It does not throw, so the task stays in the wave's return and reaches the BLOCKED handler like any other blocked task.
+     - **Adversarial tasks** land through the same merge-back and the same landed / not-landed handling, with the task's own wave tree and branch (`wave_worktree`, `wave_branch`, set on its args at Build args above) in place of a winner. The workflow runs `merge-back` once the implementer reports `done` and before the refuter panel and the inside reviews, because those read the epic tree. Landed: it removes the wave tree and branch, then runs the refuter panel and the inside reviews. Not landed: it keeps the tree, skips the reviews, and returns the same blocked shape as an unlanded best-of-N winner, with the implementer's commit as `winner_commit`. An implementer that reports `done` while counting one or more blockers in `verifier_findings_count` is not landed either: that outcome is `verifier_blocker_persistent`, which is re-dispatched, and the retry must not build on a blocked commit. The workflow keeps the tree, skips the reviews, writes `blocked` with the verifier fields and a `wave outcome: verifier_blocker_persistent` note, and returns that outcome with the commit as `winner_commit`. An adversarial task whose args carry no wave tree built in the epic tree, and nothing is merged; one whose args carry only one of `wave_worktree` and `wave_branch` is reported `blocked` before its implementer runs. The implementer's `verifier_verdict` and `verifier_findings_count` ride the task's state write and its return, so `coerce_wave_outcome` (below) sees a self-reported blocker. A refuter-panel or review block after a landing leaves the commit on the epic branch, as it does for a best-of-N winner.
    - **Stabilization-test suggestions:** if a task result includes `integration_test_suggestions` (any outcome — done, warnings, or even verifier_blocker_persistent), call `agentflow.stabilization_tests.append_suggestions(epic_slug, epic_name, suggestions)` for each one. Creates `stabilization-tests/<epic-slug>.md` on first write. Step 9 surfaces the count at epic completion.
 
 **Wave auto-mode contract:**
@@ -1108,6 +1312,7 @@ is_hallucinated_denial = (
 
 If `is_hallucinated_denial`:
 - Append a tier-2 decision: `f"Wave T{tid} returned hallucinated-denial signature (outcome=blocked, no files, no commits, blocked_reason mentions permission/approve). Re-dispatching with EMPIRICISM PREFACE."`
+- Before the re-dispatch, set `state.tasks[tid].state = "in_flight"` (and `since = now`): the reporter has already written `blocked`, which never re-enters the ready set. The re-dispatch goes back through Step 7.0, which makes a new tree under the next wave number, so before it, when the task records a `wave_worktree_path`, release that tree and clear its fields (**Releasing a wave tree**, Step 1.2.5); a tree left recorded stays live and is never pruned.
 - Re-dispatch the wave (this counts as the first BLOCKED for two-attempt-rule purposes), but **prepend** the following EMPIRICISM PREFACE to the wave prompt verbatim, BEFORE any other content:
 
   ```
@@ -1146,8 +1351,16 @@ If `is_hallucinated_denial`:
 
   This branch fires INSTEAD OF the existing first-blocked / second-blocked handling — externally-resolvable blockers do not count toward the two-attempt rule because the failure is environmental, not subagent quality. The two-attempt rule still applies for non-external blockers.
 
-- First time on this task: re-dispatch with more context (per `subagent-driven-development` rules)
-- Second BLOCKED return on same task (any role, within wake or across wakes): mark task `blocked`, set `status = "blocked"`, ntfy HARD_FAILURE via `agentflow.ntfy.notify_once(state, key=f"hard_failure_task_{tid}", trigger_type=TriggerType.HARD_FAILURE, ...)`, exit
+- **Unlanded best-of-N winner** (a `best_of_n` return carrying `winner_commit` and `branch`): the workflow already retried the land and removed every candidate tree, and the winner's branch holds the commit. Append a tier-2 decision `"best-of-N winner {branch} not landed ({winner_commit}); branch kept, inspect with git -C <worktree> log {branch}"`, where `<worktree>` is the Step 1.1 epic tree (the winner's own tree is gone). Then try ONE merge-back of the kept branch (`<winner-branch>`, the return's `branch`) from the epic tree. Branches are shared by every tree of the repository, so the epic tree serves as the tree merge-back fetches from:
+  ```python
+  from agentflow.wave_worktree import merge_back
+  result = merge_back(wave_worktree=worktree, main_worktree=worktree, branch=<winner-branch>)  # Step 1.1 tree for both
+  ```
+  - On `result.success`: the winner has landed, as it would have inside the workflow. Delete the kept branch (`git -C <worktree> branch -d <winner-branch>`), release the task's Step 7.0 tree and clear its fields (**Releasing a wave tree**, Step 1.2.5), append tier-1 decision `"best-of-N winner {branch} merged back by the orchestrator"`, set the task's commit to `winner_commit` and `state = "code_review"`, and run the orchestrator review gates (Step 7 reconcile) with `{worktree}` substituted by `<worktree>`: a landed winner gets the inside reviews, and the workflow skipped them for this one. Skip the merge-back on approval there, since the commit is already on the epic branch. This is not a BLOCKED return, so nothing counts toward the two-attempt rule.
+  - On `result.success is False`: append tier-2 decision `"merge-back of kept branch {branch} failed: {result.stderr}; delete {branch} by hand once inspected"`. Before the re-dispatch, set `state.tasks[tid].state = "in_flight"` (and `since = now`) and release the task's Step 7.0 tree and clear its fields (**Releasing a wave tree**, Step 1.2.5), then re-dispatch through Step 7 (Step 7.0, then item 4), so the new task tree carries the new wave number its candidates get. A task tree left recorded stays live on every later wake and is never pruned. Name every kept branch still undeleted in any escalation this task later raises. Nothing deletes the kept branch automatically: it may hold a judged winner's only copy, so the epic's final report lists every one that survives (**Kept winner branches**, Step 9.2 item 7b).
+  - An unlanded winner counts toward the two-attempt rule like any BLOCKED return: the re-dispatch above is the first-time handling, and a second unlanded return on the same task (or any second BLOCKED) follows Second BLOCKED below. The one merge-back try still runs first on that second return; only when it fails does Second BLOCKED replace the re-dispatch.
+- First time on this task: set `state.tasks[tid].state = "in_flight"` (and `since = now`), then re-dispatch with more context (per `subagent-driven-development` rules). The re-dispatch goes back through Step 7.0, which makes a new tree under the next wave number, so before it, when the task still records a `wave_worktree_path`, release that tree and clear its fields (**Releasing a wave tree**, Step 1.2.5). A tree left recorded stays live and is never pruned. The release keeps a branch that holds commits the epic does not (an unlanded adversarial commit, for one) and lists it in `released.branches_preserved`; log it as that section says.
+- Second BLOCKED return on same task (any role, within wake or across wakes): mark task `blocked`, set `status = "blocked"`, ntfy HARD_FAILURE via `agentflow.ntfy.notify_once(state, key=f"hard_failure_task_{tid}", trigger_type=TriggerType.HARD_FAILURE, ...)`, exit. The HARD_FAILURE detail names every surviving kept branch of the epic, computed as the **Kept winner branches** list (Step 9.2 item 7), since a halted epic never reaches the final report that would list them.
 
 ### Step 8: Phase transition
 
@@ -1376,6 +1589,8 @@ to the human in its note, a fleet run trades it away, and the decision-log entry
 6. Send ntfy EPIC_DONE (detail includes the stabilization summary line when present) via `agentflow.ntfy.notify_once(state, key="epic_done", trigger_type=TriggerType.EPIC_DONE, ...)`
 7. **Merge gate (substeps 7a-7d):** open the PR, enter `awaiting_merge_decision`, and on next wake act on the user's `state.merge_decision` value.
 
+   **Kept winner branches list (computed once, before 7a).** Every branch named in a `merge-back of kept branch {branch} failed` decision (Step 7, unlanded best-of-N winner) that still exists (`git -C <worktree> rev-parse --verify --quiet refs/heads/{branch}` finds it), each with its tip (`git -C <worktree> rev-parse {branch}`). A branch deleted by hand since is left out. The PR body (7b) and the merge-decision summary (7c) both render this list, so it does not depend on a PR opening.
+
    **7a — Final integration commit (if any uncommitted scope changes)**
    - Run `git -C <worktree> status --short`.
    - If any tracked-but-unstaged changes scoped to this epic's files exist, **scope-stage** them (`git -C <worktree> add <explicit-paths>` — never `git add -A` / `git add .`) and commit with `git -C <worktree> commit -m "chore({epic-slug}): final integration cleanup"`.
@@ -1405,6 +1620,7 @@ to the human in its note, a fleet run trades it away, and the decision-log entry
        - Stabilization-test queue summary from `agentflow.stabilization_tests.render_summary(epic_slug)`. If the helper returns `None`, **omit this section entirely** — do not write an empty placeholder.
        - Dual-review status: security ✅ + code ✅ from Step 9.1 (verbatim verdicts + reviewer commit SHAs).
        - Decision-log highlights: filter `state.decisions` to entries with `tier == 2` and render as a bulleted list.
+       - **Kept winner branches:** the **Kept winner branches list** computed before 7a, one bullet per branch with its tip, saying it is kept on purpose and is deleted by hand once inspected. Omit the section when the list is empty.
        - A `Review:` line, per `<suite_root>/skills/_shared/PR-PROSE.md` *Review pointer*, so the body is final at create:
          - **Fleet-context run with a source issue** (the `gh#N` on the `Source:` line above): before `gh pr create`, post the review comment on that issue with `gh issue comment -R <gh-repo> <N> --body-file <file>`. Its content is the one `skills/lead-dev/SKILL.md` §4 describes, built from the Step 9.1 verdicts. Write the URL the command prints as `Review: <url>`.
          - **Otherwise:** write `Review: none`. The dual-review section above already carries the verdicts in the body.
@@ -1437,6 +1653,7 @@ to the human in its note, a fleet run trades it away, and the decision-log entry
    - **Render a bootstrap-style summary** (prose, immediately before the AskUserQuestion call — user sees this in the same chat turn as the buttons):
      > "Epic **{epic_name}** is ready to merge. PR: {pr_url}
      > Dual-review: security ✅ · code ✅ (from Step 9.1 verdicts)
+     > Kept winner branches: {the Kept winner branches list computed before 7a; omit this line when it is empty}
      > Choose how to proceed:"
    - **Call `AskUserQuestion`** (fires on the transition wake only — guard with `merge_decision_prompted` below):
 
@@ -1445,7 +1662,7 @@ to the human in its note, a fleet run trades it away, and the decision-log entry
      question: "How should the PR for {epic_name} be handled?"
      options:
        - label: "Merge PR"
-         description: "gh pr merge -R <gh-repo> <pr-number> --squash; mark epic done"
+         description: "gh pr merge -R <gh-repo> <pr-number> --squash --delete-branch; mark epic done"
        - label: "Hold"
          description: "Leave PR open; mark status done_on_hold"
        - label: "Abandon"
@@ -1501,7 +1718,7 @@ to the human in its note, a fleet run trades it away, and the decision-log entry
 
          ```
          python -m agentflow.registry deploy-lock assert --actor <loop> --project <name> \
-           && gh pr merge -R <gh-repo> <pr-number> --squash
+           && gh pr merge -R <gh-repo> <pr-number> --squash --delete-branch
          ```
 
          `assert` is read-only and lock-free (exit `0` iff the holder is `<loop>` and the hold is
@@ -1515,7 +1732,7 @@ to the human in its note, a fleet run trades it away, and the decision-log entry
        contradicting Directive prints and still exits 0 and `&&` would carry you straight past it.
        (It does exit 2 for a registry it could not read, so a caller still reads the status.)
        Full contract: `skills/lead-dev/SKILL.md` §4.
-     - **A red required check** follows `skills/lead-dev/SKILL.md` §4 *Re-running CI*: re-run with
+     - **A red, missing or pending required check** follows `skills/lead-dev/SKILL.md` §4 *Re-running CI*: re-run with
        `gh run rerun <run-id> --failed -R <gh-repo>` only; a text-gate failure is fixed in the text
        and never re-run; a job that failed with 0 steps is a billing block, reported once (to the
        user when standalone) and never re-run to probe.
@@ -1524,9 +1741,14 @@ to the human in its note, a fleet run trades it away, and the decision-log entry
        §4, never re-run.
      - **The merge itself.** On a **fleet-context run this bullet is discharged by the chained
        command above** — do not also run a bare merge, or the PR is merged twice. Standalone:
-       `gh pr merge -R <gh-repo> <pr-number> --squash` (default merge mode; substitute `--merge` or
-       `--rebase` if the repo convention dictates, but always pass an explicit merge-mode flag).
+       `gh pr merge -R <gh-repo> <pr-number> --squash --delete-branch` (default merge mode;
+       substitute `--merge` or `--rebase` if the repo convention dictates, but always pass an
+       explicit merge-mode flag, and always `--delete-branch`: the remote head is removed at the
+       source, and `agentflow.refs` removes the local branch it leaves).
      - Verify the merge landed: `gh pr view -R <gh-repo> <pr-number> --json mergedAt` — `mergedAt` must be non-null.
+       This check also settles a non-zero exit from any of the merge commands above: `gh pr merge`
+       can fail after the merge lands (the remote branch delete failing, say), so a non-null
+       `mergedAt` means merged, and the merge is never re-run.
      - **Auto-doc refresh (best-effort; autodoc-enabled project only).** Now that the epic's code is on
        `<canonical_repo.host_ref>` `main`, refresh the managed code wiki (`autodoc_root`) from the just-merged commits.
        Gate it: run ONLY if this epic's source repo is the autodoc-enabled project's repo (`<canonical_repo.host_ref>` — i.e. the
@@ -1534,7 +1756,10 @@ to the human in its note, a fleet run trades it away, and the decision-log entry
        the autodoc-enabled one (the project whose `autodoc_root` is configured) — autodoc
        only documents that project, so an update elsewhere is a no-op or wrong. When it applies, run
        `/autodoc-update` (the vault's autodoc-update skill; from outside the vault, follow
-       `<vault.autodoc_update_skill>`): it `git diff`s the project repo since
+       `<vault.autodoc_update_skill>`) with the project exported: `export AUTODOC_PROJECT=<name>`
+       as the first line of the same shell command that runs its Step 1 block, where `<name>` is the
+       plan's `project:`. An export in a separate call does not survive, and that Step 1 refuses to
+       start without it whenever more than one profile is installed. It `git diff`s the project repo since
        `.manifest.json`'s `last_sha`, maps changed files → affected pages via the manifest reverse-index,
        and runs its refresh workflow. **Best-effort:** on any failure (or if the vault skill is absent),
        append an `autodoc_update_pending: <reason>` tier-2 decision and continue — NEVER block epic
@@ -1609,6 +1834,7 @@ Every wave subagent (implementer, verifier, reviewer) operates under a binding c
 > Implementation detail lives in `prompts/`, `agents/`, `workflows/` and `templates/` beside this file, with the shared guards in the `agentflow` package. This section documents the contract — the stable interface — not the mechanics that may evolve.
 
 ### (a) EvidenceBlock JSON — mandatory return
+**Evidence states.** Empty, unavailable, truncated and stale are different answers: `<suite_root>/skills/_shared/EVIDENCE.md`.
 
 Every subagent return **must** include the full EvidenceBlock JSON in its response. The EvidenceBlock is the structured JSON block parsed by the orchestrator (see the `Return format` section in each prompt template). A return with no parseable JSON block is treated as a hard failure — equivalent to `outcome=blocked` with `blocked_reason: "missing_evidence_block"`.
 
@@ -1699,6 +1925,7 @@ This means every wave operates within a fixed context window (its own session) a
 | Disk full / I/O error | Surface error, preserve last good status.md |
 | Regression debug agent gives up | status=blocked, ntfy HARD_FAILURE, exit |
 | Deadlock (no ready, no in-flight, not all done) | status=blocked, escalate (plan has unsatisfiable deps) |
+| Task on the board but no longer in the plan, not `done` | Step 2.0 escalates with `orphan_escalation_text(tid)` and dispatches nothing; never reported as a deadlock |
 | Lock held by another wake | Log + bail, no double-fire |
 | Wave returns `outcome=done` with `verifier_findings_count.blocker > 0` | `coerce_wave_outcome()` rewrites to `verifier_blocker_persistent`; existing escalation path (re-dispatch once with more context; if still blocked, mark task `blocked`, ntfy HARD_FAILURE, exit) takes over. Tier-2 audit decision logged. |
 | Wave subagent asks an inline clarifying question instead of using `escalation_requests` | Re-dispatch with a stronger AUTO-MODE preface (prepend the AUTO-MODE EXECUTION section verbatim to the prompt). If the wave asks inline again on the second dispatch, mark task `blocked` with `blocked_reason: "auto_mode_violation"`. Do NOT interpret inline questions as escalation requests — the format contract is strict. |

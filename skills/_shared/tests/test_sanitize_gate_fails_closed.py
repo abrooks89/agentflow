@@ -25,7 +25,7 @@ WHAT IT CANNOT PROVE
 
 The literals planted below are generic shapes the shipped pattern carries, assembled from pieces
 so this file does not trip the gate it tests. The extra pattern the step can append from a
-repository variable is out of this file's scope (EXTRA_PATTERN is cleared for every run here);
+repository secret is out of this file's scope (EXTRA_PATTERN is cleared for every run here);
 test_ci_workflow_shape.py drives that half.
 """
 

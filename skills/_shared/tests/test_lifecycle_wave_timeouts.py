@@ -318,6 +318,307 @@ def test_the_increment_check_rejects_prose_that_does_not_order_it(prose: str) ->
 
 
 # --------------------------------------------------------------------------- #
+# A requeue stops the group's wave run before it releases the tree (gh#1054).
+# --------------------------------------------------------------------------- #
+
+# Each constant is the phrase that IS the step, not a noun the rule shares with its neighbours.
+_RULE_HEADING = "**Stopping a wave run before a requeue (the Step 4.0 timeout `requeue`"
+_REFERENCE = "apply **stopping a wave run before a requeue** (step 1.2.5)"
+_DISPATCH_NOTE = "`wave <n> dispatched: tasks [...] run <runId>`"
+_OWNER = "A wave run belongs to the whole wave group"
+_PARSE = "it is the token after the final ` run ` in the summary (`run (\\S+)$`)"
+_DEFER = "do not stop the run: defer"
+_DEFER_KEEPS = "Keep the task's tree and its fields and leave the task as it is, not `ready`"
+_GROUP = (
+    "When every task the note lists that is still `in_flight` is being requeued in this same pass"
+)
+_STOP = "call `TaskStop` on the run id"
+_NOT_FOUND = 'fails with "No task found"'
+_RELEASE = "release the task's wave tree and clear its fields"
+_TO_READY = "reset the task to `ready`"
+_KEEP_BRANCH = "If no run id is readable, or the stop fails with any other error"
+_KEEP = "keep the tree and its fields"
+_NOT_READY = "do not reset the task to `ready`"
+_ESCALATE = "open a tier-3 escalation"
+_HOLDS = "The open escalation holds the task until it is answered"
+_NO_SINCE = "a blocking sibling with no readable dispatch time"
+_NO_SINCE_ESCALATES = "Do not defer then; take the last case below and open its tier-3 escalation"
+_KEEPS_COUNT = "Unlike a defer, this case keeps any increment Step 4.0 made this pass"
+_DEFERS = "When it defers"
+_TAKE_BACK = "`state.tasks[tid].timeout_count -= 1`"
+
+
+def _skill_text() -> str:
+    return (SKILLS_ROOT / "orchestrator" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def _flat(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+def _stop_rule() -> str:
+    # The rule's own heading, not the first mention of its name (a forward reference precedes it).
+    text = _skill_text()
+    assert text.count(_RULE_HEADING) == 1
+    start = text.index(_RULE_HEADING)
+    return _flat(text[start:text.index("### Step 2:", start)])
+
+
+def _bullet(text: str, opener: str) -> str:
+    (line,) = [line for line in text.splitlines() if line.lstrip().startswith(opener)]
+    return line
+
+
+def _requeue_bullets() -> dict[str, str]:
+    return {
+        "step 4.0": _bullet(_step_4_0(), "- `requeue`"),
+        "reconcile": _bullet(_skill_text(), '- For `actions[tid] == "requeue"`'),
+    }
+
+
+def _rule_is_sound(rule: str) -> bool:
+    """Parse the note; defer while a sibling still builds; stop only when the whole group is
+    requeued; release on success or "No task found"; otherwise keep, stay off `ready`, escalate."""
+    phrases = (_OWNER, _DISPATCH_NOTE, _PARSE, _DEFER, _DEFER_KEEPS, _NO_SINCE,
+               _NO_SINCE_ESCALATES, _GROUP, _STOP, _NOT_FOUND, _RELEASE, _KEEP_BRANCH, _KEEP,
+               _NOT_READY, _ESCALATE, _HOLDS, _KEEPS_COUNT)
+    if not all(p in rule for p in phrases):
+        return False
+    note, parse, defer, group, stop, not_found, release, keep_branch = (
+        rule.index(p) for p in
+        (_DISPATCH_NOTE, _PARSE, _DEFER, _GROUP, _STOP, _NOT_FOUND, _RELEASE, _KEEP_BRANCH)
+    )
+    deferred = rule[defer:group]
+    released = rule[release:keep_branch]
+    kept = rule[keep_branch:]
+    return (
+        note < parse < defer < group < stop < not_found < release < keep_branch
+        and _DEFER_KEEPS in deferred
+        # A sibling that can never time out must escalate, or the defer loops silently.
+        and deferred.index(_DEFER) < deferred.find(_NO_SINCE) < deferred.find(_NO_SINCE_ESCALATES)
+        and "TaskStop" not in deferred
+        and _RELEASE not in deferred
+        and _TO_READY in released
+        and kept.index(_KEEP) < kept.index(_NOT_READY) < kept.index(_ESCALATE) < kept.index(_HOLDS)
+        and kept.index(_ESCALATE) < kept.index(_KEEPS_COUNT)
+        and _RELEASE not in kept
+        and _TO_READY not in kept.replace(_NOT_READY, "")
+    )
+
+
+def test_the_stop_rule_stops_the_group_run_before_any_release() -> None:
+    assert _rule_is_sound(_stop_rule())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda r: r.replace(_GROUP, "Then"), id="no all-group condition"),
+        pytest.param(lambda r: r.replace(_DEFER, "stop the run anyway"), id="no defer branch"),
+        pytest.param(lambda r: r.replace(_PARSE, "it is in the summary"), id="no parse rule"),
+        pytest.param(
+            lambda r: r.replace(_STOP, "do the release step").replace(
+                _OWNER, f"{_OWNER}. First {_STOP}"
+            ),
+            id="release before the stop",
+        ),
+        pytest.param(
+            lambda r: r.replace(_ESCALATE, f"{_ESCALATE}, then {_TO_READY}"),
+            id="keep branch resets to ready",
+        ),
+        pytest.param(lambda r: r.replace(_NOT_READY, "leave the task"), id="keep branch not off ready"),
+        pytest.param(lambda r: r.replace(_HOLDS, "It is noted"), id="escalation does not hold"),
+        pytest.param(
+            lambda r: r.replace(_NO_SINCE_ESCALATES, "Defer anyway."),
+            id="sibling with no dispatch time defers forever",
+        ),
+        pytest.param(lambda r: r.replace(_KEEPS_COUNT, "It is noted"), id="keep branch count unstated"),
+    ],
+)
+def test_the_stop_rule_check_rejects_a_broken_rule(mutate) -> None:
+    rule = _stop_rule()
+    broken = mutate(rule)
+    assert broken != rule
+    assert not _rule_is_sound(broken)
+
+
+def _bullet_applies_the_rule(bullet: str, *, takes_back: bool) -> bool:
+    """The bullet names the rule before any release, does not restate it, and (Step 4.0 only)
+    takes back the increment when the rule defers."""
+    lower = bullet.lower()
+    if _REFERENCE not in lower or "releas" not in lower:
+        return False
+    if lower.index(_REFERENCE) > lower.index("releas"):
+        return False
+    # A bullet that inlines the rule drifts from it; the rule is stated once.
+    if any(r in bullet for r in ("TaskStop", "No task found", "run (\\S+)", _ESCALATE)):
+        return False
+    if takes_back:
+        return -1 < bullet.find(_DEFERS) < bullet.find(_TAKE_BACK)
+    return True
+
+
+@pytest.mark.parametrize("where", ["step 4.0", "reconcile"])
+def test_each_requeue_applies_the_stop_rule_by_name_and_does_not_restate_it(where: str) -> None:
+    assert _bullet_applies_the_rule(_requeue_bullets()[where], takes_back=where == "step 4.0")
+
+
+@pytest.mark.parametrize(
+    "where,mutate",
+    [
+        pytest.param(
+            "step 4.0",
+            lambda b: b[:b.index(" " + _DEFERS)] + b[b.index("the ladder has not moved.") + 25:],
+            id="step 4.0 drops the take-back",
+        ),
+        pytest.param(
+            "step 4.0",
+            lambda b: b.replace("- `requeue` (", "- `requeue` (release its wave tree "
+                                "(**Releasing a wave tree**) first; "),
+            id="step 4.0 releases before the rule",
+        ),
+        pytest.param(
+            "reconcile",
+            lambda b: b.replace("Apply **Stopping", "Release its wave tree and clear its fields "
+                                "(**Releasing a wave tree**), then apply **Stopping"),
+            id="reconcile releases before the rule",
+        ),
+    ],
+)
+def test_the_bullet_check_rejects_a_broken_bullet(where: str, mutate) -> None:
+    bullet = _requeue_bullets()[where]
+    broken = mutate(bullet)
+    assert broken != bullet
+    assert not _bullet_applies_the_rule(broken, takes_back=where == "step 4.0")
+
+
+def test_a_deferred_requeue_that_takes_back_its_increment_still_requeues_next_time() -> None:
+    """Step 4.0's defer: increment, then take back. The next pass must see a first timeout again,
+    or a group that outlasts one sibling's deadline would block that sibling on its next wake."""
+    state = _state({1: TaskState(state="in_flight", since=_iso(NOW - timedelta(hours=1)))})
+
+    (event,) = check_wave_timeouts(state, _plan(), NOW)
+    assert event.suggested_action == "requeue"
+    state.tasks[1].timeout_count += 1
+    state.tasks[1].timeout_count -= 1  # the rule deferred: nothing was requeued
+
+    (event,) = check_wave_timeouts(state, _plan(), NOW + timedelta(minutes=10))
+    assert event.suggested_action == "requeue"
+    assert state.tasks[1].timeout_count == 0
+
+
+def test_the_dispatch_note_records_the_run_id_after_the_launch() -> None:
+    text = _skill_text()
+    sub3 = text[text.index("   3. Mark each group task"):text.index("   4. **Fire-and-reconcile.**")]
+    record = sub3.index("Record the returned `runId` in the dispatch decision note")
+    assert sub3.index("call the **Workflow tool**") < record
+
+    (call,) = re.findall(r"`(append_decision\(.*?\))`", sub3[record:])
+    parsed = ast.parse(call, mode="eval").body
+    inspect.signature(append_decision).bind(
+        *[None] * len(parsed.args), **{kw.arg: None for kw in parsed.keywords}
+    )
+    summary = next(kw.value for kw in parsed.keywords if kw.arg == "summary")
+    assert ast.unparse(summary) == "f'wave {n} dispatched: tasks [{ids}] run {runId}'"
+
+    # One format: the old entry and the field TaskState never had are both gone.
+    assert "Wave N dispatch:" not in text
+    assert "wave_runid" not in text
+
+
+# --------------------------------------------------------------------------- #
+# The `block` rung and every reset of a blocked task stop the run first (gh#1144).
+# --------------------------------------------------------------------------- #
+
+_RULE_NAME = "**Stopping a wave run before a requeue**"
+
+
+_RESET = "A human who resets this task"
+_DEFERRED_NOTE = "at most one tier-1 `deferred: sibling <ids> still in flight` note per dispatch"
+_PLACES = ["block bullet", "block reset", "reopen as running", "deadlock reset"]
+
+
+def _block_places(text: str | None = None) -> dict[str, str]:
+    text = _skill_text() if text is None else text
+    step = text[text.index("**Sub-step 4.0"):text.index("This sub-step MUST run")]
+    block = _flat(_bullet(step, "- `block`"))
+    reopen = text[text.index("  - **Reopen as running**"):text.index("  - **Abandon**")]
+    deadlock = text[text.index("Deadlock check: if no ready tasks"):text.index("### Step 7:")]
+    return {
+        "block bullet": block,
+        "block reset": block[block.index(_RESET):],
+        "reopen as running": _flat(reopen),
+        "deadlock reset": _flat(deadlock),
+    }
+
+
+def _names_the_rule_before_any_release(place: str) -> bool:
+    # The rule's bold name, not a bare "stop rule", which "no stop rule applies" would satisfy.
+    return -1 < place.find(_RULE_NAME) < place.lower().find("releas")
+
+
+@pytest.mark.parametrize("where", _PLACES)
+def test_a_blocked_task_keeps_its_tree_until_the_stop_rule_runs(where: str) -> None:
+    assert _names_the_rule_before_any_release(_block_places()[where])
+
+
+# Each inserts a release inside its own place, after the rule's mentions earlier in the file and,
+# for the reset, after the bullet's own reference: only a per-place check catches it.
+_EARLY_RELEASE = {
+    "block bullet": ("  - `block` (", "  - `block` (release its wave tree first; "),
+    "block reset": (_RESET, f"{_RESET} releases its wave tree first, and"),
+    "reopen as running": ("  - **Reopen as running** →", "  - **Reopen as running** → release each wave tree;"),
+    "deadlock reset": ("Deadlock check: if no ready tasks",
+                       "Deadlock check: if no ready tasks, release every blocked tree, and"),
+}
+
+
+@pytest.mark.parametrize("where", _PLACES)
+def test_the_block_check_rejects_a_release_before_the_rule(where: str) -> None:
+    text = _skill_text()
+    old, new = _EARLY_RELEASE[where]
+    assert text.count(old) == 1
+    broken = _block_places(text.replace(old, new))
+    assert not _names_the_rule_before_any_release(broken[where])
+    if where == "block reset":
+        # The whole bullet still names the rule first; only the reset's own slice is broken.
+        assert _names_the_rule_before_any_release(broken["block bullet"])
+
+
+def test_the_block_rung_stops_the_run_before_it_marks_the_task_blocked() -> None:
+    bullet = _block_places()["block bullet"]
+    assert _bullet_applies_the_rule(bullet, takes_back=True)
+    assert bullet.lower().index(_REFERENCE) < bullet.index('`state.tasks[tid].state = "blocked"`')
+    # A deferring block records the defer once, as the requeue rung does (gh#1144 review M1).
+    assert -1 < bullet.find(_DEFERS) < bullet.find(_DEFERRED_NOTE)
+    assert _DEFERRED_NOTE in _requeue_bullets()["step 4.0"]
+    # The rule names the rung it now governs, and a sibling's block counts as a requeue for both
+    # sides of the defer, or a requeue and a block in one group defer each other forever (S1).
+    rule = _stop_rule()
+    assert "the Step 4.0 timeout `requeue` and `block` rungs" in rule
+    assert 'Throughout, "requeued" includes a Step 4.0 `block` in the same pass' in rule
+    assert "For the `block` rung" not in rule
+    assert _rule_is_sound(rule)
+
+
+def test_a_deferring_block_skips_the_per_pass_tier_2_entry() -> None:
+    (tier2,) = [line for line in _step_4_0().splitlines() if line.startswith("- Append a tier-2 decision")]
+    assert "A pass whose `requeue` or `block` defers (below) skips this entry." in tier2
+
+
+def test_the_release_gate_covers_a_reset_of_a_ladder_blocked_task() -> None:
+    release = _flat(_skill_text())
+    assert ("A requeue, or a human reset of a task the timeout ladder blocked, releases a tree only "
+            "after **Stopping a wave run before a requeue** (below) has stopped the run") in release
+
+
+def test_the_block_reset_names_who_confirms_the_run_is_over() -> None:
+    # No orchestrator step notices a hand reset, so the text must put the check on the resetter.
+    reset = _block_places()["block reset"]
+    assert "No step notices a reset, so whoever makes it first confirms the run is over" in reset
+
+
+# --------------------------------------------------------------------------- #
 # The ladder escalates when the caller increments.
 # --------------------------------------------------------------------------- #
 

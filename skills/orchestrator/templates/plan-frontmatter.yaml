@@ -11,18 +11,8 @@ tasks:
   #                  The wave first writes failing tests against acceptance_criteria (RED),
   #                  then implements until green, then runs the verifier loop. Use for tasks
   #                  with crisp acceptance criteria and an existing test framework.
-  #   - "scaffold" — Phase 0 only. Orchestrator dispatches the scaffolder wave (creates files
-  #                  with empty signatures + types, NO business logic). The wave MUST emit a
-  #                  `ledger_entries` JSON field listing {symbol, path, signature, kind} for
-  #                  every public symbol stubbed. After all Phase 0 tasks complete, the
-  #                  orchestrator writes the collected entries into the plan body's
-  #                  ## Ledger section (between the `<!-- ledger:auto-populated -->` anchor
-  #                  and the next `## ` heading), commits the plan as
-  #                  `chore(<slug>): ledger`, and flips `ledger.populated: true`. From
-  #                  Phase 1 onward, every implementer wave prompt is prepended with the
-  #                  Ledger section under `## Source of truth (names/paths)`.
-  #   Set on the task with: `type: tdd` / `type: scaffold`. Phases can mix standard and tdd
-  #   tasks; `scaffold` is restricted to Phase 0.
+  #   Set on the task with: `type: tdd`. Phases can mix standard and tdd tasks. Any other
+  #   value fails the plan parser.
 test_commands:
   regression: ""                       # Full test command for regression check
   fast: ""                             # Optional faster command for inner loop
@@ -51,20 +41,6 @@ slug: ""
 # starts. The inverse `blocks` relation is derived at index time. Unknown slugs
 # render as a grayed placeholder card in the swimlane view — visible but distinct.
 depends_on: []
-
-# Phase 0 Ledger — canonical name/location reference written back by scaffolder waves.
-# `populated` flips true after all Phase 0 (`type: scaffold`) tasks complete and the
-# orchestrator has injected ledger_entries into the plan body's `## Ledger` section
-# (at the `<!-- ledger:auto-populated -->` anchor). Subsequent task dispatches read
-# the populated Ledger section and inject it as `## Source of truth (names/paths)`
-# in the implementer prompt.
-#
-# Skip Phase 0 entirely when the epic is single-task or pure modification of existing
-# files. In that case set `populated: true` at plan-creation time so the orchestrator
-# does not block waiting on Phase 0 completion.
-ledger:
-  populated: false
-  anchor: "<!-- ledger:auto-populated -->"
 
 # Lifecycle state override. When absent, the dashboard infers state from filesystem
 # evidence (status.md exists → running/done; plan exists, no status → planning;

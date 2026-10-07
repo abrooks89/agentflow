@@ -33,7 +33,8 @@ tasks:
 
 # Toy calc.py single-task plan (no epic - VALID since gh#74)
 
-Identical to `plan-single-task.md` with the `epic:` frontmatter key deleted. It
+Identical to `plan-single-task.md` (minus `project:`; parse-only fixtures are never
+launched) with the `epic:` frontmatter key deleted. It
 used to prove the loud-fail behaviour; gh#74 made `epic` optional, because
 `solution/` holds human-authored operator documents as well as orchestrator plans
 and requiring orchestrator frontmatter of both dropped fifty files from every

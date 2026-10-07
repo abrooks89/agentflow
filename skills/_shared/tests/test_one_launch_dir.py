@@ -421,7 +421,7 @@ def test_documented_remediation_is_actionable_not_just_present():
     documented = _documented_worktree_root_remediation()
     assert documented.startswith("add 'worktree_root: "), documented
     assert "EXISTING" in documented, documented
-    assert "<worktree_root>/<project>/<epic-slug>" in documented, documented
+    assert "<worktree_root>/<project>/<epic-branch>" in documented, documented
 
 
 # --------------------------------------------------------------------------- #

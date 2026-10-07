@@ -13,13 +13,14 @@ WHAT IT CAN PROVE
   rather than skipping it. A private PR runs a public PR's checks minus the trim set below; a
   schedule, a dispatch and a public push run everything a public PR runs except the provenance
   gate; a private push runs nothing.
-* nightly.yml's shape: its two triggers, one call of ci.yml that fails open on its gate, the
-  only write permission on the report job, and caller permissions covering the nested jobs'.
+* nightly.yml's shape: its two triggers, one call of ci.yml that fails open on its gate and
+  passes `secrets: inherit`, the only write permission on the report job, and caller
+  permissions covering the nested jobs'.
 * Every pip `cache-dependency-path` names a file that exists.
 * The gate and report `run:` blocks, parsed out of nightly.yml rather than restated here, run
   under bash with a `gh` shim first on PATH, across every case the spec lists.
 * The sanitize gate's `run:` block, parsed out of ci.yml the same way (gh#821): the extra
-  pattern from the SANITIZE_EXTRA_PATTERN repository variable joins the tree, PR-title and
+  pattern from the SANITIZE_EXTRA_PATTERN repository secret joins the tree, PR-title and
   PR-body scans when set, the step says so in one notice line and scans the generic shapes
   when it is empty, and a broken one fails every scan closed. And that the shipped pattern
   carries only the generic shapes, pinned structurally so no private term is named here.
@@ -28,8 +29,9 @@ WHAT IT CANNOT PROVE
 * That GitHub's evaluator agrees with this one. The evaluator reads only the expression shapes
   written in ci.yml; the PR's own run and a dispatch prove the real one.
 * Anything about a live `gh` host: the shim answers from env vars and records its argv.
-* That GitHub hands a called workflow (the nightly's call) the caller repository's `vars`;
-  GitHub documents that it does, and a nightly run is what proves it.
+* That `secrets: inherit` on the nightly's call hands ci.yml the caller's SANITIZE_EXTRA_PATTERN
+  secret without a workflow_call declaration; GitHub documents that it does, and a nightly run
+  is what proves it.
 
 BASH: as in test_pr_review_pointer_gate.py, bash is derived from where `git` lives before any
 bare PATH lookup (the WSL stub in System32 is not a usable bash). With no usable bash each
@@ -190,7 +192,7 @@ def test_ci_triggers_keep_every_trigger_and_add_workflow_call(ci):
     assert on["push"]["branches"] == ["master", "main"]
     # gh#331: `edited` re-scans a title or body changed after the last commit.
     assert "edited" in on["pull_request"]["types"]
-    # A bare workflow_call: no inputs, no secrets.
+    # A bare workflow_call: no inputs, no declared secrets (the nightly's call inherits them).
     assert not on["workflow_call"]
 
 
@@ -493,7 +495,7 @@ def test_report_fails_loudly_on_a_gh_error(tmp_path, nightly, env):
 # ci.yml: the sanitize gate's extra pattern (gh#821)
 # ---------------------------------------------------------------------------
 # The shipped pattern carries generic shapes only; install-specific alternatives arrive from
-# the repository variable SANITIZE_EXTRA_PATTERN as EXTRA_PATTERN. These drive the step's own
+# the repository secret SANITIZE_EXTRA_PATTERN as EXTRA_PATTERN. These drive the step's own
 # `run:` block, parsed out of ci.yml, under bash with the gh shim first on PATH - it must make
 # no gh call at all. Every planted term is a placeholder that names nothing.
 
@@ -503,11 +505,11 @@ EXTRA_TERM = "acmeproduct"
 EXTRA_HOST = "zephyrhost"
 PLACEHOLDER_EXTRA = f"(?<!super){EXTRA_TERM}|{EXTRA_HOST}\\b"
 EXTRA_APPLIED = (
-    "sanitize gate: extra pattern from repository variable SANITIZE_EXTRA_PATTERN applied to "
+    "sanitize gate: extra pattern from repository secret SANITIZE_EXTRA_PATTERN applied to "
     "every scan"
 )
 EXTRA_NOTICE = (
-    "::notice::sanitize gate: no extra pattern configured (repository variable "
+    "::notice::sanitize gate: no extra pattern configured (repository secret "
     "SANITIZE_EXTRA_PATTERN is empty) - scanning the generic shapes only"
 )
 CLEAN = {
@@ -554,7 +556,7 @@ def _run_sanitize(
     event: str = "pull_request",
 ):
     """The step's `run:` block, against a throwaway tree. `extra=None` leaves EXTRA_PATTERN
-    unset, as on a contributor's machine; "" is the variable GitHub sends when it is empty."""
+    unset, as on a contributor's machine; "" is what GitHub sends when the secret is empty."""
     # Outside the scanned directory: the script carries the pattern, and the extra pattern
     # would otherwise find itself in the tree half.
     script = tmp_path / "sanitize.sh"
@@ -586,15 +588,24 @@ def _run_sanitize(
     return proc
 
 
-def test_sanitize_step_reads_the_extra_pattern_from_the_repository_variable(ci, nightly):
-    """Through env, from `vars`, never spliced into the script - and with no plumbing on the
-    nightly's call, because a called workflow reads the caller repository's variables."""
+def test_sanitize_step_reads_the_extra_pattern_from_the_repository_secret(ci, nightly):
+    """Through env, from `secrets`, never spliced into the script (gh#866): GitHub lists a
+    step's env at the top of its log and masks a secret there, where a `vars` value prints in
+    clear. The `_shared pytest` step reads the same secret. The nightly's call passes
+    `secrets: inherit`, because a called workflow sees none of the caller's secrets unless
+    they are passed, and an inherited secret needs no workflow_call declaration."""
     step = _sanitize_step(ci)
-    assert step["env"]["EXTRA_PATTERN"] == "${{ vars.SANITIZE_EXTRA_PATTERN }}"
+    assert step["env"]["EXTRA_PATTERN"] == "${{ secrets.SANITIZE_EXTRA_PATTERN }}"
     assert "${{" not in step["run"]
+    readers = [s["env"]["SANITIZE_EXTRA_PATTERN"] for job in ci["jobs"].values()
+               for s in job.get("steps", []) if "SANITIZE_EXTRA_PATTERN" in (s.get("env") or {})]
+    assert readers == ["${{ secrets.SANITIZE_EXTRA_PATTERN }}"], readers
+    assert not re.search(r"\$\{\{\s*vars\.SANITIZE_EXTRA_PATTERN",
+                         CI_WORKFLOW.read_text(encoding="utf-8")), "read from `vars`, unmasked"
     _, call = _caller(nightly)
-    assert "with" not in call and "secrets" not in call, call
-    assert not _on(ci)["workflow_call"], "vars need no workflow_call input"
+    assert "with" not in call, call
+    assert call.get("secrets") == "inherit", call
+    assert not _on(ci)["workflow_call"], "an inherited secret needs no workflow_call declaration"
 
 
 def test_sanitize_step_applies_the_extra_pattern_to_tree_title_and_body(tmp_path, ci, pcre_bash):
@@ -614,7 +625,7 @@ def test_sanitize_step_applies_the_extra_pattern_to_tree_title_and_body(tmp_path
     assert PLACEHOLDER_EXTRA not in out + proc.stderr, "the step echoed the extra pattern"
 
 
-@pytest.mark.parametrize("extra", ["", None], ids=["empty-variable", "unset"])
+@pytest.mark.parametrize("extra", ["", None], ids=["empty-secret", "unset"])
 def test_sanitize_step_without_an_extra_pattern_says_so_and_scans_generic_shapes(
     tmp_path, ci, pcre_bash, extra
 ):
@@ -635,7 +646,7 @@ def test_sanitize_step_without_an_extra_pattern_says_so_and_scans_generic_shapes
 def test_sanitize_step_fails_closed_on_an_extra_pattern_grep_cannot_parse(
     tmp_path, ci, pcre_bash
 ):
-    """Appended to the one pattern, a broken variable breaks every scan - each fails closed
+    """Appended to the one pattern, a broken extra pattern breaks every scan - each fails closed
     with its own message, rather than the gate falling back to the generic shapes."""
     proc = _run_sanitize(tmp_path, ci, pcre_bash, extra=f"{EXTRA_TERM}(")
     out = proc.stdout
@@ -688,7 +699,7 @@ def test_ci_yml_ships_only_the_generic_shapes():
     alternative of the shipped pattern is one of the generic shapes - so this file never has
     to name what must not be there. A new GENERIC shape belongs in GENERIC_SHAPES; anything
     install-specific belongs in the extra pattern (the local file and the repository
-    variable), never in ci.yml."""
+    secret), never in ci.yml."""
     from agentflow import pillar_residue
 
     shipped = pillar_residue.sanitize_pattern(CI_WORKFLOW)

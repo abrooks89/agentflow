@@ -55,8 +55,10 @@ Task tool (general-purpose):
     **Test commands carry the path too.** `verification.test_commands` are plan-authored strings
     with no tree in them. Give each one `{worktree}` explicitly: the runner's own path flag where
     it has one (`python -m pytest {worktree}/<path>`, `npm --prefix {worktree} ...`), and where
-    it has none, name the tree in the command itself (`cd {worktree} && <command>`) so the tree
-    is stated rather than inherited from whatever cwd the harness handed you.
+    it has none, name the tree in the command itself inside a subshell
+    (`( cd {worktree} && <command> )`) so the tree is stated rather than inherited from whatever
+    cwd the harness handed you. Never a bare `cd`: it persists in the shell after the command,
+    and on Windows a shell left inside the tree wedges its removal.
 
     {operational_context_block}     # rendered from plan.extra_context_files; see SKILL.md Step 7
 

@@ -42,6 +42,7 @@ import sys
 try:
     from agentflow.config import (
         ConfigError,
+        failure_report,
         load_environment,
         load_project,
         render_project_claude_md,
@@ -49,8 +50,8 @@ try:
         resolve_project_name,
     )
 except ImportError as exc:  # pragma: no cover - version-skew guard, not logic
-    # `render_resolved_block` / `resolve_project_name` / `render_project_claude_md`
-    # moved OUT of this hook and INTO agentflow.config, so this file now requires a
+    # `render_resolved_block` / `resolve_project_name` / `render_project_claude_md` /
+    # `failure_report` live in agentflow.config, not here, so this file requires a
     # package at least that new. If the deployed package is older (stale editable
     # install, or a clone
     # where provision.py has not run yet), say WHICH half is behind - a raw
@@ -81,9 +82,9 @@ def main() -> int:
         if repo_rules:
             out += repo_rules + "\n"
     except ConfigError as e:
-        # Full error: file, field_path, reason, remediation are all in str(e).
-        sys.stderr.write("agentflow SessionStart config injection FAILED\n")
-        sys.stderr.write(f"{e}\n")
+        # The specific error first (a seat's ntfy carries line 1), then the headline,
+        # then the full error: file, field_path, reason, remediation are all in str(e).
+        sys.stderr.write(failure_report(e, "agentflow SessionStart config injection FAILED"))
         sys.stderr.flush()
         return 1
 

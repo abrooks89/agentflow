@@ -84,7 +84,7 @@ idempotently, into that same file unless `--settings-file <path>` names another.
 ```
 AGENTFLOW_CONFIG=<config-good>        python hooks/sessionstart-inject-config.py   # exit 0  + block on stdout
 AGENTFLOW_CONFIG=<config-missing-key> python hooks/sessionstart-inject-config.py   # exit !=0 + field/remediation on stderr
-AGENTFLOW_PROJECT=<no-such-profile>   python hooks/sessionstart-inject-config.py   # exit 1  + two-line stderr (headline, then full error)
+AGENTFLOW_PROJECT=<no-such-profile>   python hooks/sessionstart-inject-config.py   # exit 1  + stderr: the error first, then the headline, then the full error
 ```
 
 Drift check — the hook's block and the CLI's block must be byte-identical for the

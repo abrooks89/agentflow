@@ -494,7 +494,8 @@ def test_diff_reports_lane_epic_question_issue_and_health_movement():
         issues={"triaged_numbers": [7, 51]},
         health={"inert_promotions": 3, "silent_lanes": 0},
     )
-    changed = fr.diff_since(prior, current, prior_path="prior.md")
+    changed = fr.diff_since(prior, current, prior_path="prior.md",
+                            raised={"Q-0003": {"raised_at": "2026-08-31T13:00Z"}})
 
     assert changed.no_prior is False
     assert changed.lane_transitions == (fr.LaneTransition("auditor", fr.LANE_LIVE, fr.LANE_SILENT),)
@@ -519,7 +520,7 @@ def test_diff_can_prove_a_quiet_period():
         health={"inert_promotions": 0},
         generated_at="2026-08-31T14:20:00+00:00",
     )
-    changed = fr.diff_since(core, dict(core, generated_at="2026-08-31T18:00:00+00:00"))
+    changed = fr.diff_since(core, dict(core, generated_at="2026-08-31T18:00:00+00:00"), raised={})
     assert changed.is_empty
     assert changed.note == "nothing changed since 2026-08-31T14:20:00+00:00"
 
@@ -584,9 +585,12 @@ def test_the_claimable_filter_follows_the_vocabulary_it_borrows(tmp_path, monkey
     `test_a_terminal_lifecycle_cannot_diverge_from_its_current_state` for why the terminal
     values themselves cannot be reached in this position today.
 
-    It is also why the fix reads `_survey.TERMINAL_CURRENT_STATES` through the module rather
-    than binding the frozenset with a `from ... import`, which would snapshot the value and be
-    a restatement in a slower disguise.
+    It is also why the fix reads its set through the module rather than binding the frozenset
+    with a `from ... import`, which would snapshot the value and be a restatement in a slower
+    disguise. Since gh#1072 that set is `_survey.UNSELECTABLE_LIFECYCLE_STATES` - the one
+    `selectable` drops by - which epic_survey derives from `TERMINAL_CURRENT_STATES` (pinned by
+    `test_the_unselectable_set_is_the_ended_set_plus_the_unreadable_boards`), so it is the set
+    varied here.
     """
     make_spec(tmp_path, "alpha", "novel", frontmatter=f"current_state: {APPROVED}\n")
 
@@ -595,8 +599,8 @@ def test_the_claimable_filter_follows_the_vocabulary_it_borrows(tmp_path, monkey
 
     monkeypatch.setattr(
         epic_survey,
-        "TERMINAL_CURRENT_STATES",
-        epic_survey.TERMINAL_CURRENT_STATES | {APPROVED},
+        "UNSELECTABLE_LIFECYCLE_STATES",
+        epic_survey.UNSELECTABLE_LIFECYCLE_STATES | {APPROVED},
     )
 
     after = fr.collect(inputs_for(tmp_path), now=NOW).work.approved_claimable
@@ -639,7 +643,9 @@ def test_a_terminal_lifecycle_cannot_diverge_from_its_current_state(tmp_path, te
     assert "live" in [row.slug for row in report.work.approved_claimable]
 
 
-@pytest.mark.parametrize("ended", sorted(epic_survey._ENDED_BOARD_STATUSES))
+@pytest.mark.parametrize(
+    "ended", sorted(epic_survey._ENDED_BOARD_STATUSES) + ["unrecognised", "duplicate"]
+)
 def test_an_ended_board_is_not_claimable_while_its_spec_still_reads_approved(tmp_path, ended):
     """gh#705: a board whose run ENDED - abandoned, failed, or done with its PR left open for a
     human merge - is not work a lane can start, whatever approval its spec still carries.
@@ -649,16 +655,32 @@ def test_an_ended_board_is_not_claimable_while_its_spec_still_reads_approved(tmp
     So the approval gate passes, the terminal-lifecycle gate passes, and without its own
     exclusion the report offers a dead run to the human as claimable. The shape is the issue's
     repro: approved spec, ended board. The live neighbour proves the fixture is claimable at all.
+
+    gh#1072 adds the two boards nobody can read a run out of: a `status:` outside the board
+    vocabulary (`unrecognised`) and a slug with two boards (`duplicate`). `selectable` refuses
+    both, so the report must not offer them either.
     """
     make_spec(tmp_path, "alpha", "ended", frontmatter=f"current_state: {APPROVED}\n")
-    make_status(tmp_path, "alpha", "ended", status=ended, done=1, total=2)
+    if ended == "unrecognised":
+        make_status(tmp_path, "alpha", "ended", status="completed", done=1, total=2)
+        expected = epic_survey.UNRECOGNISED_BOARD_STATUS
+    elif ended == "duplicate":
+        board = make_status(tmp_path, "alpha", "ended", status="running", done=1, total=2)
+        twin = board.parent / "ended" / "status.md"
+        twin.parent.mkdir(parents=True)
+        twin.write_bytes(board.read_bytes())
+        expected = epic_survey.DUPLICATE_STATUS_BOARDS
+    else:
+        make_status(tmp_path, "alpha", "ended", status=ended, done=1, total=2)
+        expected = ended
     make_spec(tmp_path, "alpha", "live", frontmatter=f"current_state: {APPROVED}\n")
 
     records, _ = fr.survey_with_skips(tmp_path, PAST_CUTOFF, project="alpha")
     ended_rec = [r for r in records if r.slug == "ended"]
-    assert ended_rec and ended_rec[0].lifecycle_state == ended, (
+    assert ended_rec and ended_rec[0].lifecycle_state == expected, (
         "pass 3 did not carry the board status through - the assertion below would prove nothing"
     )
+    assert "ended" not in [r.slug for r in epic_survey.selectable(records)]
 
     make_registry(tmp_path / "projects" / "alpha" / "status" / "registry.md")
     report = fr.collect(inputs_for(tmp_path), now=NOW)
@@ -671,7 +693,10 @@ def test_an_ended_board_is_not_claimable_while_its_spec_still_reads_approved(tmp
 
 
 def test_the_ended_board_filter_follows_the_set_it_borrows(tmp_path, monkeypatch):
-    """The ended-board exclusion reads `_survey._ENDED_BOARD_STATUSES` through the module.
+    """The ended-board exclusion reads `_survey.UNSELECTABLE_LIFECYCLE_STATES` through the module.
+
+    That set is the one `selectable` drops by (gh#1072), so the report and the builders cannot
+    disagree about which epics are claimable.
 
     Same property as `test_the_claimable_filter_follows_the_vocabulary_it_borrows`, tested the
     same way: the set gains the lifecycle word of a claimable epic with NO board, and that epic
@@ -689,8 +714,8 @@ def test_the_ended_board_filter_follows_the_set_it_borrows(tmp_path, monkeypatch
 
     monkeypatch.setattr(
         epic_survey,
-        "_ENDED_BOARD_STATUSES",
-        epic_survey._ENDED_BOARD_STATUSES | {live[0].lifecycle_state},
+        "UNSELECTABLE_LIFECYCLE_STATES",
+        epic_survey.UNSELECTABLE_LIFECYCLE_STATES | {live[0].lifecycle_state},
     )
 
     after = fr.collect(inputs_for(tmp_path), now=NOW).work.approved_claimable
@@ -1121,10 +1146,10 @@ def test_health_records_why_it_could_not_read_git_rather_than_reporting_clean(tm
 
 
 def test_health_reports_worktree_directories_no_live_lane_claims(tmp_path):
-    """At the REAL depth — `<worktree_root>/<project>/<epic-slug>`, which is what config.py's
-    own remediation and six SKILL.md files write out.
+    """At the REAL depth — `<worktree_root>/<project>/<epic-branch>`, which is what config.py's
+    own remediation and the SKILL.md files write out.
 
-    A flat fixture (`worktrees/<epic-slug>`) does not exist in production and passed against a
+    A flat fixture (`worktrees/<epic-branch>`) does not exist in production and passed against a
     listing of the ROOT, which yields PROJECT directories: every project reported as a
     permanently unclaimed worktree, and the actual abandoned per-epic worktree never seen.
     """
@@ -1319,6 +1344,30 @@ def test_registry_rows_the_parser_dropped_are_counted_and_named(tmp_path):
     assert "lead-dev" in names  # over-wide: parsed, but with every column after the pipe shifted
     assert scans["registry"].is_warning is True
     assert report.counted_skipped.is_warning is True
+
+
+@pytest.mark.parametrize("section, key", [("Agents", "nobody"), ("Queue", "Q-7"), ("Blockers", "B-1")])
+def test_registry_skips_judge_a_row_key_by_the_registrys_own_rule(tmp_path, monkeypatch, section, key):
+    """The report counts a row as skipped for its key exactly when `parse_registry` drops it, so
+    it must read the parser's `_ROW_KEY_RULES` rather than a copy that could drift from it."""
+    rows = {
+        "Agents": f"| {key} | idle | - | - | - | - | - |\n",
+        "Queue": f"| {key} | work | jr-dev-1 | - | ready | - | - |\n",
+        "Blockers": f"| {key} | jr-dev-1 | human | - | open | needs a call |\n",
+    }
+    path = tmp_path / "projects" / "alpha" / "status" / "registry.md"
+    make_registry(path, **{section.lower(): rows[section]})
+    text = path.read_text(encoding="utf-8")
+
+    def skipped():
+        reg = reg_mod.parse_registry(text)
+        return {s.name: s.reason for s in fr._registry_skips(text, reg, ())}
+
+    label, why = reg_mod._ROW_KEY_RULES[section][1:]
+    assert key in skipped() and why in skipped()[key], skipped()
+    # Loosen the registry's rule alone: the parser keeps the row, so the report must too.
+    monkeypatch.setitem(reg_mod._ROW_KEY_RULES, section, (lambda c: True, label, why))
+    assert key not in skipped(), "fleet_report kept its own copy of the key check"
 
 
 def test_health_counts_carry_their_skip_count(tmp_path):
@@ -1730,6 +1779,61 @@ def test_the_eta_lane_join_matches_a_TRUNCATED_name_and_not_a_mere_prefix(tmp_pa
     assert rows["seam-guard-for-the-publisher"].eta == ""
 
 
+@pytest.mark.parametrize("status, holds", [
+    ("building", True),
+    ("Building", True),
+    ("stalled", True),
+    ("idle", False),
+    ("IDLE", False),
+    ("`idle`", False),
+], ids=["building", "capitalised-building", "off-enum", "idle", "upper-idle", "backticked-idle"])
+def test_an_idle_agents_row_attaches_no_lane_or_eta(tmp_path, status, holds):
+    """An idle row's `work` cell still names the epic it finished. Read as a holder, it printed
+    that lane and its stale eta against an epic nobody was building. The spec is `running`, so it
+    is in progress either way and only the eta/lane join is under test; the idle test is the held
+    set's own, so an off-enum or odd-cased cell still attaches."""
+    make_spec(tmp_path, "alpha", "in-flight", frontmatter=f"current_state: {APPROVED}\n")
+    make_status(tmp_path, "alpha", "in-flight", status="running")
+    eta = stamp(NOW, hours=-1)
+    make_registry(
+        tmp_path / "projects" / "alpha" / "status" / "registry.md",
+        agents=agent_row("jr-dev-1", status, work="E-0007-in-flight",
+                         heartbeat=stamp(NOW, minutes=4), eta=eta),
+    )
+    rows = {row.slug: row for row in fr.collect(inputs_for(tmp_path), now=NOW).work.in_progress}
+    assert rows["in-flight"].lane == ("jr-dev-1" if holds else "")
+    assert rows["in-flight"].eta == (eta if holds else "")
+
+
+@pytest.mark.parametrize("status, holds", [
+    ("building", True),
+    ("Building", True),
+    ("stalled", True),
+    ("idle", False),
+    ("IDLE", False),
+    ("`idle`", False),
+], ids=["building", "capitalised-building", "off-enum", "idle", "upper-idle", "backticked-idle"])
+def test_an_idle_agents_row_does_not_claim_the_epic_it_names(tmp_path, status, holds):
+    """With no Queue row and no `running` status, the Agents row is the only possible claim. An
+    idle one names the epic it finished; counting it kept that epic in flight and out of
+    `claimable_now` until the lane's next status write."""
+    make_spec(tmp_path, "alpha", "named-epic", frontmatter=f"current_state: {APPROVED}\n")
+    make_registry(
+        tmp_path / "projects" / "alpha" / "status" / "registry.md",
+        agents=agent_row("jr-dev-1", status, work="E-0007-named-epic",
+                         heartbeat=stamp(NOW, minutes=4), eta=stamp(NOW, hours=1)),
+    )
+    work = fr.collect(inputs_for(tmp_path), now=NOW, issues=[]).work
+    in_progress = [r.slug for r in work.in_progress]
+    claimable = [r.slug for r in work.claimable_now]
+    if holds:
+        assert in_progress == ["named-epic"]
+        assert claimable == []
+    else:
+        assert in_progress == []
+        assert claimable == ["named-epic"]
+
+
 def test_health_is_not_empty_while_it_carries_directives(tmp_path):
     """"An empty section reads as 'checked, nothing there'" — so a section that renders three
     directives in force must never claim to be empty."""
@@ -1762,7 +1866,7 @@ ALL_SEATS = ("auditor", "dev-manager", "jr-dev-1", "jr-dev-2", "jr-dev-3", "lead
 
 
 def _alive_roster() -> str:
-    """Six seats, all plainly alive, so any non-LIVE state in these tests came from
+    """Every seat in ALL_SEATS, all plainly alive, so any non-LIVE state in these tests came from
     the derivation under test rather than from staleness."""
     beat = stamp(NOW, hours=0)
     return "".join(
@@ -2424,21 +2528,21 @@ def test_a_note_backlog_crossing_its_threshold_is_a_signal_in_the_diff():
     over = fr.HEALTH_THRESHOLDS["note_backlog"]
     prior = snapshot_like(health={"note_backlog": over - 1}, generated_at="2026-08-31T12:00:00+00:00")
     current = snapshot_like(health={"note_backlog": over})
-    crossings = {c.metric: c.direction for c in fr.diff_since(prior, current, prior_path="p.md").health_crossings}
+    crossings = {c.metric: c.direction for c in fr.diff_since(prior, current, prior_path="p.md", raised={}).health_crossings}
     assert crossings.get("note_backlog") == "crossed"
 
     drained = snapshot_like(health={"note_backlog": over - 1})
-    back = fr.diff_since(current, drained, prior_path="p.md").health_crossings
+    back = fr.diff_since(current, drained, prior_path="p.md", raised={}).health_crossings
     assert {c.metric: c.direction for c in back}.get("note_backlog") == "cleared"
 
 
 def test_ordinary_note_traffic_does_NOT_trip_the_backlog_alarm():
-    """The reason this threshold is not 1 like the other four. Six seats routing a note
+    """The reason this threshold is not 1 like the other four. Every seat routing a note
     apiece per wake is a healthy channel, and an alarm that fires on healthy traffic is a
     number nobody reads."""
     prior = snapshot_like(health={"note_backlog": 0}, generated_at="2026-08-31T12:00:00+00:00")
     current = snapshot_like(health={"note_backlog": 6})
-    crossings = [c.metric for c in fr.diff_since(prior, current, prior_path="p.md").health_crossings]
+    crossings = [c.metric for c in fr.diff_since(prior, current, prior_path="p.md", raised={}).health_crossings]
     assert "note_backlog" not in crossings
 
 
@@ -2592,7 +2696,7 @@ def test_a_metric_that_STAYS_over_keeps_reporting(tmp_path):
                           generated_at="2026-08-31T12:00:00+00:00")
     current = snapshot_like(health={"note_backlog": over + 150})
     crossings = {c.metric: c.direction
-                 for c in fr.diff_since(prior, current, prior_path="p.md").health_crossings}
+                 for c in fr.diff_since(prior, current, prior_path="p.md", raised={}).health_crossings}
     assert crossings.get("note_backlog") == "over"
 
 
@@ -2605,7 +2709,7 @@ def test_a_metric_ABSENT_from_the_prior_snapshot_still_reports_on_the_first_run(
                           generated_at="2026-08-31T12:00:00+00:00")
     current = snapshot_like(health={"note_backlog": over + 158})
     crossings = {c.metric: c.direction
-                 for c in fr.diff_since(prior, current, prior_path="p.md").health_crossings}
+                 for c in fr.diff_since(prior, current, prior_path="p.md", raised={}).health_crossings}
     assert crossings.get("note_backlog") == "crossed"
 
 
@@ -2613,7 +2717,7 @@ def test_a_metric_UNDER_its_threshold_reports_nothing(tmp_path):
     """The level report must not become a permanent line for a healthy metric."""
     prior = snapshot_like(health={"note_backlog": 5}, generated_at="2026-08-31T12:00:00+00:00")
     current = snapshot_like(health={"note_backlog": 6})
-    assert not fr.diff_since(prior, current, prior_path="p.md").health_crossings
+    assert not fr.diff_since(prior, current, prior_path="p.md", raised={}).health_crossings
 
 
 # --------------------------------------------------------------------------- #
@@ -2947,7 +3051,7 @@ def test_an_unresolvable_claim_keeps_the_stall_alert_silent(tmp_path):
     """`claimable_now == 0` is not evidence of an empty board when a claim could not be resolved.
 
     A stall that goes unreported wastes a wake. A stall reported falsely stops the foreman, and
-    with it three other lanes. So the alert waits for the ambiguity to clear rather than reading
+    with it every junior lane. So the alert waits for the ambiguity to clear rather than reading
     a number it knows is understated.
     """
     _colliders(tmp_path, agents=agent_row("jr-dev-2", "building", work="E-0001-acme-3-5-chat"))
@@ -3151,6 +3255,34 @@ def test_a_different_epics_claim_does_not_cover_this_worktree(tmp_path):
     assert w.unclaimed == ("e0768-account-limit-keystone",)
 
 
+@pytest.mark.parametrize("status, holds", [
+    ("building", True),
+    ("Building", True),
+    ("stalled", True),
+    ("idle", False),
+    ("IDLE", False),
+    ("`idle`", False),
+], ids=["building", "capitalised-building", "off-enum", "idle", "upper-idle", "backticked-idle"])
+def test_an_idle_agents_row_does_not_claim_the_worktree_its_work_cell_names(tmp_path, status, holds):
+    """An idle row's `work` cell still names the epic it finished. Read as a claim, it hid the
+    abandoned worktree for that epic from the drift report. The idle test is the held set's own,
+    so an off-enum or odd-cased cell still claims."""
+    worktrees = _wt_fixture(
+        tmp_path, ["e0768-account-limit-keystone"],
+        agents=agent_row("jr-dev-1", status, work="E-0768-the-fleet-cannot-survive",
+                         heartbeat=stamp(NOW, minutes=2)),
+    )
+    runner = _wt_runner([
+        str(tmp_path / "checkout"),
+        str(worktrees / "alpha" / "e0768-account-limit-keystone"),
+    ])
+    w = fr.collect(
+        inputs_for(tmp_path, worktree_root=worktrees, repo_path=tmp_path / "checkout"),
+        now=NOW, git_runner=runner,
+    ).health.worktrees
+    assert w.unclaimed == (() if holds else ("e0768-account-limit-keystone",))
+
+
 def test_the_git_command_is_pinned_because_the_parser_depends_on_it(tmp_path):
     """The porcelain format is the contract this parser reads: plain `git worktree list` prints
     one padded line per worktree with the sha and branch appended, and the `worktree ` prefix the
@@ -3312,6 +3444,31 @@ def test_a_terminal_row_does_not_lend_its_lane_to_a_later_pr(tmp_path):
         queue="| E-0228-ground-an-escalation | t | jr-dev-2 | jr-dev-2 | done | - | - |\n",
     )
     assert h.open_prs[0].lane == ""
+
+
+@pytest.mark.parametrize("status, holds", [
+    ("building", True),
+    ("Building", True),
+    ("stalled", True),
+    ("idle", False),
+    ("IDLE", False),
+    ("`idle`", False),
+], ids=["building", "capitalised-building", "off-enum", "idle", "upper-idle", "backticked-idle"])
+def test_an_idle_agents_row_does_not_lend_its_lane_to_a_pr(tmp_path, status, holds):
+    """An idle row's `work` cell is the epic it finished, not one it holds. Read as a claim, it
+    named that lane as the owner of an open PR nobody is working, hiding the orphan."""
+    runner = _pr_runner([{
+        "number": 295, "title": "t", "headRefName": "e0228-ground-an-escalation",
+        "createdAt": "2026-09-05T14:17:00Z", "updatedAt": "2026-09-05T14:17:00Z",
+        "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        "statusCheckRollup": [],
+    }])
+    h = _health_of(
+        tmp_path, runner,
+        agents=agent_row("jr-dev-1", status, work="E-0228-ground-an-escalation",
+                         heartbeat=stamp(NOW, minutes=2)),
+    )
+    assert h.open_prs[0].lane == ("jr-dev-1" if holds else "")
 
 
 def test_a_pr_with_no_checks_is_not_a_pr_whose_checks_passed(tmp_path):
@@ -3580,7 +3737,7 @@ def test_a_registry_held_decision_bearing_bug_is_counted_in_progress(tmp_path):
 def test_attach_bug_work_unions_the_awaiting_half():
     """The unit form of the above, so a regression names `_attach_bug_work` directly."""
     class _Row:
-        work, phase = "E-0800", "building gh#17"
+        work, phase, status = "E-0800", "building gh#17", "building"
 
     class _Reg:
         agents = {"lead-dev": _Row()}
@@ -3826,6 +3983,55 @@ def test_stood_down_lanes_are_counted_and_only_a_held_claim_is_called_kept(tmp_p
     assert "keeps its claim" not in by_agent["lead-dev"].why
 
 
+@pytest.mark.parametrize("status, holds", [
+    ("building", True),
+    ("Building", True),
+    ("stalled", True),
+    ("idle", False),
+    ("IDLE", False),
+    ("`idle`", False),
+], ids=["building", "capitalised-building", "off-enum", "idle", "upper-idle", "backticked-idle"])
+def test_a_stood_down_idle_row_with_a_stale_work_cell_is_not_said_to_keep_it(
+    tmp_path, status, holds,
+):
+    """An idle row's `work` cell is the epic it finished. Saying "It keeps its claim" of it
+    contradicted the held set, which already counts that row as holding nothing."""
+    make_registry(
+        tmp_path / "projects" / "alpha" / "status" / "registry.md",
+        agents=agent_row("jr-dev-1", status, work="E-0001-some-epic",
+                         phase=reg_mod.STOOD_DOWN_PHASE + ": human paused the fleet",
+                         heartbeat=stamp(NOW, hours=5)),
+    )
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=[])
+    lane = {r.agent: r for r in report.lanes.lanes}["jr-dev-1"]
+    assert lane.state == fr.LANE_STOOD_DOWN
+    assert ("It keeps its claim" in lane.why) is holds
+    assert ("It holds no claim" in lane.why) is not holds
+
+
+@pytest.mark.parametrize("status, silent", [
+    ("building", True),
+    ("Building", True),
+    ("stalled", True),
+    ("idle", False),
+    ("IDLE", False),
+    ("`idle`", False),
+], ids=["building", "capitalised-building", "off-enum", "idle", "upper-idle", "backticked-idle"])
+def test_an_idle_row_with_no_work_and_no_heartbeat_is_not_SILENT_however_it_is_spelled(
+    tmp_path, status, silent,
+):
+    """An idle, empty row with no heartbeat is a lane never started, not an undiagnosed one. The
+    idle test is the held set's own, so `IDLE` and a backticked cell read the same as `idle`."""
+    make_registry(
+        tmp_path / "projects" / "alpha" / "status" / "registry.md",
+        agents=agent_row("jr-dev-1", status),
+    )
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=[])
+    lane = {r.agent: r for r in report.lanes.lanes}["jr-dev-1"]
+    assert (lane.state == fr.LANE_SILENT) is silent
+    assert ("undiagnosed" in lane.why) is silent
+
+
 # --------------------------------------------------------------------------- #
 # SILENT says how overdue, or that nothing was promised
 # --------------------------------------------------------------------------- #
@@ -3947,6 +4153,96 @@ def test_a_missing_registry_holds_selectable_bugs_out_of_bug_claimable(tmp_path)
         "only the in-progress label was checked; the registry claim check never ran"
     )
     assert report.work.is_empty is False
+
+
+# --------------------------------------------------------------------------- #
+# The held set is read through issue_intake.read_board's refusal (gh#1005)
+# --------------------------------------------------------------------------- #
+_HELD_BUGS = [
+    Issue(number=7, title="held bug", labels=("bug", "triaged")),
+    Issue(number=9, title="free bug", labels=("bug", "triaged")),
+]
+_HELD_QUEUE = _qt("E-0001", "gh#7 held bug", state="building", claimed_by="jr-dev-1")
+
+
+@pytest.mark.parametrize(
+    "queue, agents",
+    [
+        # The parser keeps only the LAST row of a duplicated id, so gh#7's row vanishes.
+        (_HELD_QUEUE + _qt("E-0001", "gh#3 old", state="done", claimed_by="jr-dev-1"), ""),
+        # The parser drops a row with the wrong cell count.
+        (_HELD_QUEUE, "| jr-dev-2 | building | gh#9 |\n"),
+        (None, ""),
+    ],
+    ids=["duplicate-queue-id", "short-agents-row", "missing-registry"],
+)
+def test_an_unread_board_reports_the_bug_side_unread_not_a_held_set(tmp_path, queue, agents):
+    """A board `registry validate` would flag parses with rows silently gone; a held set built
+    from it offers held work as free. WORK must say the claim check never ran instead."""
+    if queue is not None:
+        make_registry(
+            tmp_path / "projects" / "alpha" / "status" / "registry.md", agents=agents, queue=queue
+        )
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=_HELD_BUGS)
+    work = report.work
+    assert work.bug_claimable.total == 0
+    assert work.bug_in_progress.total == 0
+    assert [i.number for i in work.bug_claim_ambiguous] == [7, 9]
+    assert work.bug_note.startswith(
+        "only the in-progress label was checked; the registry claim check never ran"
+    )
+    assert report.intake.selectable_note.startswith("label-only:")
+    if queue is not None:
+        assert "file_damaged" in work.bug_note
+        assert "file_damaged" in report.intake.selectable_note
+        # The board WAS read - the rest of the report used it - so INTAKE must not say it was
+        # not; it says the claim check refused it.
+        assert "the registry was not read" not in report.intake.selectable_note
+        # The rest of the report still reads the lenient parse: only the held set refuses.
+        assert report.registry_available is True
+    else:
+        assert report.intake.selectable_note.startswith("label-only: the registry was not read")
+
+
+@pytest.mark.parametrize("queue, problem", [
+    # The parser keeps the LAST of a duplicated id: the terminal twin hides the building claim.
+    (_q("E-0001-held-epic", state="building", claimed_by="jr-dev-1")
+     + _q("E-0001-held-epic", state="done", claimed_by="jr-dev-1"), "appears on 2 rows"),
+    # The parser drops an off-pattern id outright, and the claim with it.
+    (_q("E-0001-held-epic", state="building", claimed_by="jr-dev-1")
+     + _q("Q-0007", state="building", claimed_by="jr-dev-2"), "bad id 'Q-0007'"),
+], ids=["duplicate-queue-id", "off-pattern-queue-id"])
+def test_the_epic_half_of_work_refuses_a_board_the_held_set_refuses(tmp_path, queue, problem):
+    """The epic half read the lenient parse, so a duplicated id offered a held epic as
+    claimable. It now reads the board the bug half reads, and says the claim check never ran."""
+    _work_corpus(tmp_path, queue=queue)
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=[])
+    work = report.work
+    assert report.registry_available is True, "the rest of the report still reads the board"
+    assert work.claimable_now.total == 0
+    assert sorted(r.slug for r in work.claim_ambiguous) == ["free-epic", "held-epic"]
+    assert work.claim_note.startswith("no claim could be checked"), work.claim_note
+    assert "file_damaged" in work.claim_note and problem in work.claim_note, work.claim_note
+
+
+def test_the_epic_half_of_work_still_subtracts_claims_on_a_clean_board(tmp_path):
+    _work_corpus(tmp_path, queue=_q("E-0001-held-epic", state="building", claimed_by="jr-dev-1"))
+    work = fr.collect(inputs_for(tmp_path), now=NOW, issues=[]).work
+    assert work.claim_note == ""
+    assert [r.slug for r in work.claimable_now] == ["free-epic"]
+    assert [r.slug for r in work.in_progress] == ["held-epic"]
+
+
+def test_a_readable_board_still_yields_the_held_set(tmp_path):
+    make_registry(tmp_path / "projects" / "alpha" / "status" / "registry.md", queue=_HELD_QUEUE)
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=_HELD_BUGS)
+    work = report.work
+    assert work.bug_note == ""
+    assert [i.number for i in work.bug_in_progress] == [7]
+    assert [i.number for i in work.bug_claimable] == [9]
+    assert work.bug_claim_ambiguous.total == 0
+    assert report.intake.selectable_note == ""
+    assert report.intake.selectable_count == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -4150,7 +4446,8 @@ def test_bug_totals_count_every_selectable_bug_not_the_rows_intake_rendered(tmp_
     issues = [Issue(number=n, title=f"bug {n}", labels=("bug", "triaged")) for n in range(1, 49)]
     report = fr.collect(inputs_for(tmp_path), now=NOW, issues=issues)
 
-    assert report.intake.selectable_count == 48
+    # INTAKE prints the builder's number, so the bug the registry holds is out of it too.
+    assert report.intake.selectable_count == 47
     assert report.intake.selectable.shown == 10
     work = report.work
     assert work.bug_claimable.total == 47
@@ -4268,7 +4565,8 @@ def test_a_published_row_whose_name_collides_falls_to_claim_ambiguous(tmp_path):
 
 def test_a_published_unclaimed_bug_leaves_bug_claimable(tmp_path):
     """The bug half: a non-terminal row naming gh#12 with `claimed_by` `-` holds that bug in its
-    lane. It leaves `bug_claimable`, is named with its lane, and lead-dev is not credited with it."""
+    lane. It leaves `bug_claimable`, shows in the held set (`bug_in_progress`), is named with
+    its lane, and lead-dev is not credited with it."""
     _published_board(
         tmp_path, "| E-0300 | BUG gh#12 - the fix | jr-dev-2 | - | ready | - | - |\n"
     )
@@ -4279,12 +4577,73 @@ def test_a_published_unclaimed_bug_leaves_bug_claimable(tmp_path):
     report = fr.collect(inputs_for(tmp_path), now=NOW, issues=issues)
     work = report.work
     assert [i.number for i in work.bug_claimable] == [13]
-    assert work.bug_in_progress.total == 0
+    assert [i.number for i in work.bug_in_progress] == [12]
     assert [(p.name, p.lane, p.kind) for p in work.published_unclaimed if p.kind == "bug"] == [
         ("gh#12", "jr-dev-2", "bug")
     ]
     lead = {lane.agent: lane for lane in report.lanes.lanes}["lead-dev"]
     assert "1 bug claimable" in lead.why
+
+
+def test_the_cli_the_mirror_and_the_report_agree_on_the_held_set(tmp_path):
+    """One board, three views. A claimed row and an unclaimed ready row hold their bugs; a done
+    row, a withdrawn row, a row's notes cell and a coordination Note do not; a live Agents row
+    does, and an idle one does not.
+    The `selectable` CLI's list, the mirror's selectable group, INTAKE's selectable and WORK's
+    `bug_claimable` must be the same set, and the mirror's In flight group and
+    `bug_in_progress` the same held set."""
+    from agentflow import issue_intake as ii
+
+    _published_board(
+        tmp_path,
+        "| E-0301 | BUG gh#21 - claimed | jr-dev-1 | jr-dev-1 | building | - | - |\n"
+        "| E-0302 | BUG gh#22 - published | jr-dev-2 | - | ready | - | - |\n"
+        "| E-0303 | BUG gh#23 - shipped | jr-dev-1 | jr-dev-1 | done | - | - |\n"
+        "| E-0304 | BUG gh#24 - pulled | jr-dev-2 | - | withdrawn | - | - |\n"
+        "| E-0305 | BUG gh#2 - claimed | jr-dev-1 | jr-dev-1 | parked | - | see gh#25 |\n",
+    )
+    registry = tmp_path / "projects" / "alpha" / "status" / "registry.md"
+    text = registry.read_text(encoding="utf-8").replace(
+        "- **Notes** — (none)", "- **Notes** — (none)\n- lead-dev: gh#26 came up in review"
+    ).replace(
+        "| lead-dev | idle | - | - |", "| lead-dev | idle | - | reading gh#27 |"
+    ).replace(
+        "| jr-dev-2 | idle | - | - |", "| jr-dev-2 | building | - | fixing gh#29 |"
+    )
+    # LF on purpose: a CRLF write hides every section heading from the report's parser.
+    registry.write_text(text, encoding="utf-8", newline="\n")
+    issues = [Issue(number=n, title=f"bug {n}", labels=("bug", "triaged"))
+              for n in (2, 21, 22, 23, 24, 25, 26, 27, 28, 29)]
+
+    cli = {i.number for i in ii.builder_selectable(issues, ii.read_held_set(registry))}
+    refs, note = ii._claimed_refs(registry)
+    assert note == ""
+    body = ii.render_open_index(issues, set(), "2026-09-30T00:00:00Z", claimed_refs=refs)
+    flight, rest = body.split("## Triaged - selectable")
+    selectable_group = rest.split("## Awaiting")[0]
+    mirror = {n for n in (2, 21, 22, 23, 24, 25, 26, 27, 28, 29) if f"**#{n}**" in selectable_group}
+    mirror_flight = {n for n in (2, 21, 22, 23, 24, 25, 26, 27, 28, 29) if f"**#{n}**" in flight}
+    collected = fr.collect(inputs_for(tmp_path), now=NOW, issues=issues)
+    work, intake = collected.work, collected.intake
+    report = {i.number for i in work.bug_claimable}
+    intake_set = {i.number for i in intake.selectable}
+
+    assert work.bug_note == ""
+    assert intake.selectable_note == ""
+    assert cli == mirror == report == intake_set == {23, 24, 25, 26, 27, 28}
+    assert intake.selectable_count == len(cli)
+    assert mirror_flight == {i.number for i in work.bug_in_progress} == {2, 21, 22, 29}
+
+
+def test_intake_selectable_is_marked_label_only_when_the_registry_was_not_read(tmp_path):
+    """No board read means no held set to subtract. The count still prints, but it is the
+    label-only figure and says so beside it, rather than passing as the builder's list."""
+    issues = [Issue(number=n, title=f"bug {n}", labels=("bug", "triaged")) for n in (1, 2)]
+    intake = fr.collect(inputs_for(tmp_path), now=NOW, issues=issues).intake
+
+    assert intake.selectable_count == 2
+    assert intake.selectable_note.startswith("label-only")
+    assert not intake.is_empty
 
 
 # --------------------------------------------------------------------------- #
@@ -4340,7 +4699,7 @@ def test_a_lane_halted_on_a_live_open_question_is_not_stranded(tmp_path):
     assert report.blocked.stranded.total == 0
     assert [q.qid for q in report.blocked.questions] == ["Q-0001"]
     lane = {lane.agent: lane for lane in report.lanes.lanes}["jr-dev-1"]
-    assert lane.why == "self-declared halt; resumes when: Q-0001"
+    assert lane.why == "self-declared halt; resumes when: Q-0001 (which way)"
 
 
 def test_the_dead_referent_reasons_are_the_registrys_own_minus_the_live_waits():
@@ -4351,3 +4710,969 @@ def test_the_dead_referent_reasons_are_the_registrys_own_minus_the_live_waits():
     assert set(reg_mod.UNJUDGEABLE_REASONS) - set(fr.DEAD_REFERENT_FIXES) == {
         "blocker-referent", "raised-at-unreadable", "raised-at-in-future"
     }
+
+
+# --------------------------------------------------------------------------- #
+# Names beside identifiers: a registry id carries a subject, an issue its title
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Should the auditor ground against the private repo?", "Should the auditor ground against"),
+        ("which way", "which way"),
+        ("  `ship`   it?  ", "ship it"),
+        ("Pick one of the", "Pick one of"),
+        ("", ""),
+        ("   ", ""),
+    ],
+)
+def test_registry_subject_is_the_first_words_trimmed(text, expected):
+    assert fr.registry_subject(text) == expected
+
+
+def test_a_subject_never_runs_past_six_words_or_ends_on_filler_above_three():
+    subject = fr.registry_subject("one two three four five of six seven eight")
+    assert subject == "one two three four five"
+    assert len(subject.split()) <= fr.SUBJECT_MAX_WORDS
+
+
+def test_changed_since_question_ids_and_triaged_issues_carry_their_names(tmp_path):
+    make_registry(
+        tmp_path / "projects" / "alpha" / "status" / "registry.md",
+        questions=(
+            qblock("Q-0001", state="answered", raised_by="auditor", answered_by="human",
+                   question="Should the auditor ground against the private repo?",
+                   raised_at=stamp(NOW, hours=5))
+            + qblock("Q-0002", state="open", raised_by="jr-dev-1", question="which way",
+                     raised_at=stamp(NOW, hours=1))
+        ),
+    )
+    issues = [Issue(number=51, title="report omits archived epics", labels=("triaged",))]
+    prior = snapshot_like(questions={"Q-0001": "open"}, issues={"triaged_numbers": []})
+
+    changed = fr.collect(inputs_for(tmp_path), now=NOW, issues=issues, prior=prior).changed_since
+
+    assert changed.questions_opened == ("Q-0002",)
+    assert changed.questions_answered == ("Q-0001",)
+    assert changed.issues_triaged == (51,)
+    assert str(changed.named("Q-0002")) == "Q-0002 (which way)"
+    assert str(changed.named("Q-0001")) == "Q-0001 (Should the auditor ground against)"
+    assert str(changed.named(51)) == "#51 (report omits archived epics)"
+    # Every id the section prints has a name the collector found - none left for the renderer.
+    printed = (
+        changed.questions_opened + changed.questions_answered + changed.questions_applied
+        + changed.questions_retracted + changed.issues_triaged
+    )
+    assert all(changed.named(i).found for i in printed)
+    # The diffed state stays id-keyed: a subject edit must not read as a state change.
+    assert all(isinstance(q, str) and q.startswith("Q-") for q in changed.questions_opened)
+
+
+def test_an_id_with_no_subject_or_title_is_marked_never_printed_bare():
+    changed = fr._name_changes(
+        fr.ChangedSince(no_prior=False, note="", questions_opened=("Q-0099",), issues_triaged=(77,)),
+        {},
+        {},
+    )
+    assert str(changed.named("Q-0099")) == f"Q-0099 ({fr.NO_SUBJECT})"
+    assert str(changed.named(77)) == f"#77 ({fr.NO_TITLE})"
+    assert not changed.named("Q-0099").found
+    # An id the collector never saw gets the same marker, not an exception or a bare id.
+    assert str(changed.named("Q-0123")) == f"Q-0123 ({fr.NO_SUBJECT})"
+    # A row on the board whose text is blank is no better than an absent one.
+    blank = fr._name_changes(
+        fr.ChangedSince(no_prior=False, note="", questions_opened=("Q-0005",)), {"Q-0005": ""}, {}
+    )
+    assert str(blank.named("Q-0005")) == f"Q-0005 ({fr.NO_SUBJECT})"
+
+
+def test_a_halted_lanes_resume_id_carries_its_subject(tmp_path):
+    make_registry(
+        tmp_path / "projects" / "alpha" / "status" / "registry.md",
+        agents=(
+            agent_row("jr-dev-1", "halted", heartbeat=stamp(NOW, minutes=5), waiting_on="Q-0001")
+            + agent_row("jr-dev-2", "halted", heartbeat=stamp(NOW, minutes=5), waiting_on="B-0001")
+            + agent_row("auditor", "halted", heartbeat=stamp(NOW, minutes=5), waiting_on="gate green")
+        ),
+        questions=qblock("Q-0001", state="open", urgency="halted", raised_by="jr-dev-1",
+                         question="Which repo does the auditor ground against?",
+                         raised_at=stamp(NOW, hours=2)),
+        blockers="| B-0001 | jr-dev-2 | lead-dev | some-epic | open | schema migration needs a call |\n",
+    )
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=[])
+    by_agent = {lane.agent: lane for lane in report.lanes.lanes}
+
+    q = by_agent["jr-dev-1"]
+    assert q.resume_condition == "Q-0001"  # the raw id the board holds, unchanged
+    assert q.resume_label == "Q-0001 (Which repo does the auditor ground)"
+    assert q.why == "self-declared halt; resumes when: Q-0001 (Which repo does the auditor ground)"
+
+    b = by_agent["jr-dev-2"]
+    assert b.resume_label == "B-0001 (schema migration needs a call)"
+    assert "resumes when: B-0001 (schema migration needs a call)" in b.why
+
+    # Free text names no id and comes back as it was.
+    assert by_agent["auditor"].resume_label == "gate green"
+
+
+def test_a_halted_lanes_resume_id_missing_from_the_board_is_marked(tmp_path):
+    make_registry(
+        tmp_path / "projects" / "alpha" / "status" / "registry.md",
+        agents=agent_row("jr-dev-1", "halted", heartbeat=stamp(NOW, minutes=5), waiting_on="Q-0042"),
+    )
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=[])
+    lane = {lane.agent: lane for lane in report.lanes.lanes}["jr-dev-1"]
+
+    assert lane.resume_label == f"Q-0042 ({fr.NO_SUBJECT})"
+    assert f"Q-0042 ({fr.NO_SUBJECT})" in lane.why
+
+
+def test_classify_lane_without_a_board_leaves_the_id_alone():
+    """No board was read, so marking the id missing from it would be a claim nobody checked."""
+    row = reg_mod.AgentRow("jr-dev-1", "halted", "-", "-", stamp(NOW, minutes=5), "-", "Q-0001")
+    lane = fr.classify_lane(row, now=NOW, silent_agents=frozenset())
+    assert lane.why == "self-declared halt; resumes when: Q-0001"
+
+
+def test_blocked_and_decided_rows_carry_a_subject_beside_their_id():
+    q = fr.QuestionRow("Q-0001", "halted", "auditor", "Which repo does the auditor ground against?", "")
+    b = fr.BlockerRow("B-0001", "lead-dev", "human", "some-epic", "schema migration needs a call")
+    d = fr.DecidedRow("Q-0002", "which way", "left", "steward", "")
+    assert q.subject == "Which repo does the auditor ground"
+    assert b.subject == "schema migration needs a call"
+    assert d.subject == "which way"
+
+
+def test_a_stranded_lanes_waiting_on_carries_its_subject_in_blocked(tmp_path):
+    """BLOCKED ON YOU is the section read first, so a lane halted on an answered question that
+    is still on the board prints that question's subject there too - and an id the board has
+    no row for prints the marker. The raw cell stays for machines."""
+    make_registry(
+        tmp_path / "projects" / "alpha" / "status" / "registry.md",
+        agents=agent_row("jr-dev-1", "halted", heartbeat=stamp(NOW, minutes=5), waiting_on="Q-0001")
+        + agent_row("jr-dev-2", "halted", heartbeat=stamp(NOW, minutes=5), waiting_on="Q-0009"),
+        questions=qblock("Q-0001", state="answered", urgency="waiting", raised_by="jr-dev-1",
+                         question="Which repo does the auditor ground against?", default="left",
+                         raised_at=stamp(NOW, hours=40), answer="left", answered_by="human",
+                         answered_at=stamp(NOW, hours=26)),
+    )
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=[])
+    stranded = {r.agent: r for r in report.blocked.stranded}
+
+    assert stranded["jr-dev-1"].waiting_on == "Q-0001"
+    assert stranded["jr-dev-1"].waiting_on_label == "Q-0001 (Which repo does the auditor ground)"
+    assert stranded["jr-dev-2"].reason == "referent-missing"
+    assert stranded["jr-dev-2"].waiting_on_label == f"Q-0009 ({fr.NO_SUBJECT})"
+
+
+def test_a_lane_blocked_on_its_own_decision_names_the_ids_it_waits_on(tmp_path):
+    """Not halted, but holding an open question it raised and a blocker it owns: the BLOCKED
+    why-string names both with their subjects."""
+    make_registry(
+        tmp_path / "projects" / "alpha" / "status" / "registry.md",
+        agents=agent_row("lead-dev", "working", heartbeat=stamp(NOW, minutes=5)),
+        questions=qblock("Q-0003", state="open", urgency="waiting", raised_by="lead-dev",
+                         question="Should staging pin the old image?", default="no",
+                         raised_at=stamp(NOW, hours=1)),
+        blockers="| B-0002 | jr-dev-1 | lead-dev | some-epic | open | schema migration needs a call |\n",
+    )
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=[])
+    lane = {lane.agent: lane for lane in report.lanes.lanes}["lead-dev"]
+
+    assert lane.state == fr.LANE_BLOCKED
+    assert lane.why == (
+        "a decision of its own is waiting: Q-0003 (Should staging pin the old image), "
+        "B-0002 (schema migration needs a call)"
+    )
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ('Use | or "pipe" here?', "Use or pipe here"),
+        ("a|b split <b>bold</b>", "a/b split (b)bold(/b)"),
+    ],
+)
+def test_a_subject_carries_no_table_or_markup_breakers(text, expected):
+    assert fr.registry_subject(text) == expected
+
+
+def test_a_subject_is_capped_in_width_not_only_in_words():
+    subject = fr.registry_subject("see https://example.com/" + "x" * 200 + " please")
+    assert len(subject) == fr.SUBJECT_MAX_CHARS
+    assert subject.endswith("...")
+
+
+def test_an_issue_title_is_made_safe_for_a_table_cell():
+    named = fr.name_issue(5, {5: 'Fix a | b "quoted" <title>'})
+    assert str(named) == '#5 (Fix a b "quoted" (title))'
+    assert "|" not in fr.name_issue(6, {6: "x|y"}).name
+    assert len(fr.name_issue(7, {7: "w" * 200}).name) == fr.SUBJECT_MAX_CHARS
+
+
+def test_named_reads_a_digit_string_as_an_issue_number():
+    changed = fr._name_changes(
+        fr.ChangedSince(no_prior=False, note="", issues_triaged=(51,)), {}, {51: "report omits"}
+    )
+    assert str(changed.named("51")) == "#51 (report omits)"
+    assert str(changed.named("52")) == f"#52 ({fr.NO_TITLE})"
+
+
+
+# --------------------------------------------------------------------------- #
+# DECIDED and CHANGED SINCE read the cull log, not only the live board
+# --------------------------------------------------------------------------- #
+def _zulu(now: datetime, **delta) -> str:
+    """The minute-precision `Z` stamp the registry CLI writes into `answered_at`."""
+    return (now - timedelta(**delta)).strftime("%Y-%m-%dT%H:%MZ")
+
+
+def _log_qblock(qid, **fields) -> str:
+    """A culled block as the steward writes it: heading, fields, then whatever was culled next."""
+    return "\n".join([f"<!-- culled {_zulu(NOW, minutes=30)} -->", f"### {qid}"]
+                     + [f"- {k}: {v}" for k, v in fields.items()]) + "\n"
+
+
+def _culled_fixture(tmp_path: Path) -> Path:
+    status = tmp_path / "projects" / "alpha" / "status"
+    make_registry(
+        status / "registry.md",
+        questions=qblock("Q-0009", state="answered", raised_by="lead-dev", question="live one?",
+                         answer="yes", answered_by="dev-manager", answered_at=_zulu(NOW, hours=1)),
+    )
+    return _write(status / "registry-log.md", (
+        _log_qblock("Q-0006", state="applied", urgency="waiting", raised_by="jr-dev-1",
+                    question="answered before the window?", answer="yes",
+                    answered_by="steward", answered_at=_zulu(NOW, days=4))
+        + "| E-0002 | x | lead | lead-dev | done | - |  |\n\n"
+        + _log_qblock("Q-0007", state="applied", urgency="advisory", raised_by="jr-dev-1",
+                      question="ship the culled change?", answer="yes, ship it",
+                      answered_by="steward", answered_at=_zulu(NOW, hours=2))
+        + "| E-0003 | y | lead | lead-dev | done | - |  |\n\n"
+        + _log_qblock("Q-0008", state="applied", urgency="waiting", raised_by="lead-dev",
+                      question="a human call?", answer="no",
+                      answered_by="human", answered_at=_zulu(NOW, hours=3))
+        + _log_qblock("Q-0010", state="answered", urgency="waiting", raised_by="lead-dev",
+                      question="answered, culled before it was applied?", answer="yes",
+                      answered_by="human", answered_at=_zulu(NOW, hours=3))
+        # A stale copy of a LIVE id: the board wins, so it is neither listed twice nor re-stated.
+        + _log_qblock("Q-0009", state="applied", urgency="waiting", raised_by="lead-dev",
+                      question="live one?", answer="stale", answered_by="steward",
+                      answered_at=_zulu(NOW, hours=1))
+    ))
+
+
+def test_a_delegated_answer_culled_inside_the_window_is_still_DECIDED(tmp_path):
+    """The steward culls an applied question within hours and the report runs on a 24h ceiling,
+    so a question opened, answered, applied and culled between two reports is in neither
+    snapshot. Reading only the board left DECIDED empty in the common case."""
+    _culled_fixture(tmp_path)
+    prior = snapshot_like(questions={"Q-0009": "open"})
+    report = fr.collect(inputs_for(tmp_path), now=NOW, prior=prior, issues=[])
+
+    decided = {d.qid: d for d in report.decided.questions}
+    assert sorted(decided) == ["Q-0007", "Q-0009"]
+    assert report.decided.questions.total == 2
+    assert decided["Q-0007"].answered_by == "steward"
+    assert decided["Q-0007"].answer == "yes, ship it"
+    assert decided["Q-0009"].answered_by == "dev-manager", "the live board beats a stale log copy"
+    assert report.decided.partial_note == ""
+
+    # Filed under the CURRENT state only, as `diff_since` files a live question.
+    changed = report.changed_since
+    assert "Q-0007" in changed.questions_applied
+    assert "Q-0007" not in changed.questions_answered
+    assert "Q-0008" in changed.questions_applied, "CHANGED SINCE lists a human answer too"
+    assert "Q-0010" in changed.questions_answered
+    assert "Q-0010" not in changed.questions_applied
+    assert "Q-0008" not in decided
+    assert "Q-0006" not in changed.questions_answered + changed.questions_applied
+    assert "Q-0006" not in decided, "answered before the window"
+    assert changed.named("Q-0007").name, "a culled id still carries its subject"
+
+
+def test_a_culled_answer_in_the_window_starts_minute_is_not_lost(tmp_path):
+    """The prior report stamps to the second and `answered_at` to the minute. An answer at
+    06:00:50 records as 06:00Z, which compared earlier than a 06:00:37 window start, so it fell
+    in neither report."""
+    status = tmp_path / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md")
+    _write(status / "registry-log.md", _log_qblock(
+        "Q-0011", state="applied", urgency="waiting", raised_by="jr-dev-1", question="edge?",
+        answer="yes", answered_by="steward", answered_at="2026-08-31T06:00Z"))
+    prior = snapshot_like(generated_at="2026-08-31T06:00:37+00:00")
+    report = fr.collect(inputs_for(tmp_path), now=NOW, prior=prior, issues=[])
+    assert [d.qid for d in report.decided.questions] == ["Q-0011"]
+
+
+def test_a_repeated_field_in_a_culled_block_keeps_its_LAST_value():
+    """The live board parser keeps the last value of a repeated field; the cull log must read a
+    block the same way, or one question answers two ways depending on where it sits."""
+    log = _log_qblock("Q-0012", state="applied", answer="first", answered_by="steward",
+                      answered_at="2026-08-31T06:00Z") + "- answer: second\n"
+    assert fr._culled_questions(log)["Q-0012"]["answer"] == "second"
+
+
+def test_an_unreadable_cull_log_says_DECIDED_is_partial_rather_than_empty(tmp_path):
+    """An empty DECIDED reads as "checked, nothing there". Over an unread log - the place most
+    of a window's answers live - that sentence is false."""
+    log = _culled_fixture(tmp_path)
+    make_registry(tmp_path / "projects" / "alpha" / "status" / "registry.md")
+    real = Path.read_text
+
+    def denied(self, *a, **kw):
+        if Path(self) == log:
+            raise PermissionError(13, "Permission denied", str(log))
+        return real(self, *a, **kw)
+
+    import unittest.mock as _mock
+    with _mock.patch.object(Path, "read_text", denied):
+        report = fr.collect(inputs_for(tmp_path), now=NOW, prior=snapshot_like(), issues=[])
+    assert report.decided.questions.total == 0
+    assert report.decided.partial_note.startswith("window partial:")
+    assert "registry-log.md" in report.decided.partial_note
+    assert "window partial:" in report.changed_since.note
+
+
+def test_with_no_prior_the_cull_log_is_not_read_into_DECIDED(tmp_path):
+    """No window, no filter: the archive's whole history must not land in an unwindowed list."""
+    _culled_fixture(tmp_path)
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=[])
+    assert report.decided.windowed is False
+    assert [d.qid for d in report.decided.questions] == ["Q-0009"]
+
+
+def test_with_no_prior_a_culled_apply_or_raise_is_not_read_into_CHANGED_SINCE(tmp_path):
+    """The first report keeps today's shape: no window, so the cull log adds nothing to it."""
+    _culled_fixture(tmp_path)
+    changed = fr.collect(inputs_for(tmp_path), now=NOW, issues=[]).changed_since
+    assert changed.no_prior is True
+    assert changed.questions_opened == changed.questions_applied == ()
+    assert changed.questions_answered == ()
+
+
+def test_an_answer_from_BEFORE_the_window_applied_and_culled_INSIDE_it_is_APPLIED(tmp_path):
+    """The cull keeps no apply time, so `answered_at` alone cannot date an apply. The prior
+    snapshot can: it recorded the question as answered, and the culled block now says applied,
+    so the apply happened between the two reports."""
+    status = tmp_path / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md")
+    old = _zulu(NOW, days=1)  # before the 06:00 window start
+    _write(status / "registry-log.md", "".join(
+        _log_qblock(qid, state="applied", urgency="waiting", raised_by="jr-dev-1",
+                    question=f"{qid} subject?", answer="yes", answered_by="human",
+                    answered_at=old, raised_at=_zulu(NOW, days=2))
+        for qid in ("Q-0020", "Q-0021", "Q-0022", "Q-0023")
+    ))
+    prior = snapshot_like(questions={
+        "Q-0020": "answered",  # answered -> applied across the cull: counts
+        "Q-0021": "applied",   # already applied last report: not a change
+        "Q-0022": "open",      # never answered in the prior snapshot
+    })                         # Q-0023 absent from the prior snapshot altogether
+    changed = fr.collect(inputs_for(tmp_path), now=NOW, prior=prior, issues=[]).changed_since
+    assert changed.questions_applied == ("Q-0020",)
+    assert changed.questions_answered == ()
+    assert changed.questions_opened == ()
+    assert changed.named("Q-0020").name == "Q-0020 subject"
+
+
+def test_a_question_raised_and_culled_inside_the_window_is_OPENED(tmp_path):
+    """A question raised, closed and culled between two reports is on neither board, so the diff
+    alone never lists it as opened.
+
+    Opened means RAISED in the window, whatever the state is now, on both paths: a culled raise
+    that was applied reads as opened AND applied (Q-0032), and so does a live one that moved the
+    same way (Q-0038, opened AND answered) - it is not opened only while still open. A culled
+    retraction is folded too, so a culled opened question always shows its close."""
+    status = tmp_path / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md", questions=qblock(
+        "Q-0030", state="open", urgency="waiting", raised_by="lead-dev", question="live?",
+        default="no", raised_at=_zulu(NOW, hours=1)) + qblock(
+        "Q-0038", state="answered", urgency="waiting", raised_by="lead-dev", question="live?",
+        answer="yes", answered_by="human", answered_at=_zulu(NOW, hours=1),
+        raised_at=_zulu(NOW, hours=1)))
+
+    def culled(qid, raised_at, state="retracted"):
+        answer = {"answer": "yes", "answered_by": "human", "answered_at": raised_at}
+        return _log_qblock(qid, state=state, urgency="waiting", raised_by="jr-dev-1",
+                           question=f"{qid} subject?", raised_at=raised_at,
+                           **(answer if state == "applied" else {}))
+
+    _write(status / "registry-log.md", (
+        culled("Q-0030", _zulu(NOW, hours=1))           # stale copy of a LIVE id: once only
+        # Culled twice: the OLDER copy is out of the window, so only last-block-wins opens it.
+        + culled("Q-0031", _zulu(NOW, days=2))
+        + culled("Q-0032", _zulu(NOW, hours=3), "applied")
+        + culled("Q-0033", _zulu(NOW, days=2), "applied")  # raised before the window
+        + culled("Q-0034", "2026-08-31T06:00Z")         # the window start's own minute
+        + culled("Q-0035", "2026-08-31T05:59Z")         # one minute before it
+        + culled("Q-0036", "2026-08-31T06:00Z")         # in the prior snapshot already
+        + culled("Q-0031", _zulu(NOW, hours=2))         # raised and retracted in the window
+        # A stale copy of a LIVE answered id: the board wins (answered, not applied), and the
+        # question is opened once although it is no longer open.
+        + culled("Q-0038", _zulu(NOW, hours=1), "applied")
+    ))
+    prior = snapshot_like(generated_at="2026-08-31T06:00:37+00:00",
+                          questions={"Q-0036": "open"})
+    changed = fr.collect(inputs_for(tmp_path), now=NOW, prior=prior, issues=[]).changed_since
+    assert changed.questions_opened == ("Q-0030", "Q-0031", "Q-0032", "Q-0034", "Q-0038")
+    assert changed.questions_applied == ("Q-0032",)
+    assert changed.questions_answered == ("Q-0038",)
+    # Every culled retraction whose raise is opened here closes here; Q-0036 was open in the
+    # prior snapshot, so its culled retraction is exact; Q-0035 was raised and (undated)
+    # retracted before the window.
+    assert changed.questions_retracted == ("Q-0031", "Q-0034", "Q-0036")
+    assert changed.named("Q-0031").name == "Q-0031 subject"
+    assert changed.named("Q-0036").name == "Q-0036 subject"
+
+
+def test_a_question_raised_and_answered_in_one_window_is_OPENED_live_and_after_a_cull(tmp_path):
+    """gh#1124: "questions opened" counted a live question only while it was still open, but a
+    culled raise in whatever state it is in now, so the same question counted differently
+    depending on whether the steward had culled it yet. Opened means raised in the window, on
+    both paths, and a question both paths can see is listed once."""
+    raised = _zulu(NOW, hours=3)
+    answered = _zulu(NOW, hours=1)
+    fields = dict(urgency="waiting", raised_by="jr-dev-1", question="which way?", answer="left",
+                  answered_by="human", answered_at=answered, raised_at=raised)
+    prior = snapshot_like(generated_at="2026-08-31T06:00:37+00:00")
+
+    def opened_and_answered(root, *, live, culled):
+        status = root / "projects" / "alpha" / "status"
+        make_registry(status / "registry.md",
+                      questions=qblock("Q-0050", state="answered", **fields) if live else "")
+        if culled:
+            _write(status / "registry-log.md", _log_qblock("Q-0050", state="answered", **fields))
+        changed = fr.collect(inputs_for(root), now=NOW, prior=prior, issues=[]).changed_since
+        return changed.questions_opened, changed.questions_answered
+
+    expected = (("Q-0050",), ("Q-0050",))
+    assert opened_and_answered(tmp_path / "live", live=True, culled=False) == expected
+    assert opened_and_answered(tmp_path / "culled", live=False, culled=True) == expected
+    # Mid-cull: a stale log copy of a live id. Counted once, because the culled path skips live
+    # ids AND the merge is a set union; this line does not isolate either mechanism.
+    assert opened_and_answered(tmp_path / "both", live=True, culled=True) == expected
+
+    # "Whatever its state is now" includes the terminal states: two more live questions, one
+    # applied and one retracted, both absent from the prior snapshot, are opened too. Without
+    # them a filter that keeps only some non-open states (open + answered) would pass.
+    status = tmp_path / "terminal" / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md", questions=(
+        qblock("Q-0051", state="applied", **fields)
+        + qblock("Q-0052", state=reg_mod.Q_RETRACTED, urgency="waiting", raised_by="jr-dev-1",
+                 question="never mind?", raised_at=raised, retracted_at=answered)))
+    changed = fr.collect(inputs_for(tmp_path / "terminal"), now=NOW, prior=prior,
+                         issues=[]).changed_since
+    assert changed.questions_opened == ("Q-0051", "Q-0052")
+    assert changed.questions_applied == ("Q-0051",)
+    assert changed.questions_retracted == ("Q-0052",)
+
+    # The diff on its own, with no cull log in play: the same rule at the unit level. Absence
+    # from the prior snapshot is not enough (gh#1143): Q-0053 is absent too, but was raised
+    # before the window, so it is not opened.
+    changed = fr.diff_since(
+        snapshot_like(questions={}),
+        snapshot_like(questions={"Q-0050": "answered", "Q-0051": "applied",
+                                 "Q-0052": reg_mod.Q_RETRACTED, "Q-0053": "open"}),
+        prior_path="p.md",
+        raised={"Q-0050": {"raised_at": raised}, "Q-0051": {"raised_at": raised},
+                "Q-0052": {"raised_at": raised},
+                "Q-0053": {"raised_at": _zulu(NOW, days=2)}})
+    assert changed.questions_opened == ("Q-0050", "Q-0051", "Q-0052")
+
+
+def _opened_after_an_empty_prior(root, questions: str, log: str = ""):
+    """CHANGED SINCE from `collect` against a prior snapshot whose `questions` map is EMPTY, as a
+    prior taken while the registry was unreadable stores it. The prior is stamped mid-minute
+    (06:00:37), so the window start floors to 06:00."""
+    status = root / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md", questions=questions)
+    if log:
+        _write(status / "registry-log.md", log)
+    prior = snapshot_like(generated_at="2026-08-31T06:00:37+00:00", questions={})
+    return fr.collect(inputs_for(root), now=NOW, prior=prior, issues=[]).changed_since
+
+
+def _live_q(qid, **fields) -> str:
+    return qblock(qid, state="open", urgency="waiting", raised_by="lead-dev",
+                  question=f"{qid} subject?", default="no", **fields)
+
+
+def test_an_empty_prior_question_map_does_not_open_live_questions_raised_before_the_window(
+        tmp_path):
+    """gh#1143: a prior with `questions: {}` made every live question read as opened, days-old
+    ones included, because opened was decided by absence from the prior snapshot alone."""
+    changed = _opened_after_an_empty_prior(tmp_path, (
+        _live_q("Q-0070", raised_at=_zulu(NOW, days=3))
+        + _live_q("Q-0071", raised_at="2026-08-31T05:59Z")   # one minute before the window
+    ))
+    assert changed.questions_opened == ()
+    assert changed.note == "nothing changed since 2026-08-31T06:00:37+00:00"
+
+
+def test_a_live_question_raised_inside_the_window_is_opened_against_an_empty_prior(tmp_path):
+    changed = _opened_after_an_empty_prior(tmp_path, (
+        _live_q("Q-0072", raised_at=_zulu(NOW, hours=2))
+        + _live_q("Q-0073", raised_at=_zulu(NOW, days=3))
+    ))
+    assert changed.questions_opened == ("Q-0072",)
+
+
+def _answered_q(qid, answered_at, **extra) -> str:
+    return qblock(qid, state="answered", urgency="waiting", raised_by="lead-dev",
+                  question=f"{qid} subject?", default="no", raised_at=_zulu(NOW, days=5),
+                  answer="yes", answered_by="human", answered_at=answered_at, **extra)
+
+
+def _retracted_q(qid, retracted_at, log=False) -> str:
+    make = _log_qblock if log else qblock
+    return make(qid, state=reg_mod.Q_RETRACTED, urgency="waiting", raised_by="jr-dev-1",
+                question=f"{qid} subject?", raised_at=_zulu(NOW, days=5), retracted_at=retracted_at)
+
+
+def test_an_empty_prior_question_map_dates_answered_and_retracted_by_their_own_timestamps(tmp_path):
+    """gh#1148: answered and retracted were decided by a state change from the prior snapshot
+    alone, so a prior with `questions: {}` listed answers and retractions from days ago as new.
+    Each now counts only when its `answered_at` / `retracted_at` is on or after the floored window
+    start (06:00), on the live path and the culled path alike."""
+    before, inside = "2026-08-31T05:59Z", "2026-08-31T06:00Z"
+    live = _opened_after_an_empty_prior(tmp_path / "live", (
+        _answered_q("Q-0090", before) + _answered_q("Q-0091", inside)
+        + _retracted_q("Q-0092", before) + _retracted_q("Q-0093", inside)
+    ))
+    assert live.questions_answered == ("Q-0091",)
+    assert live.questions_retracted == ("Q-0093",)
+    assert live.questions_opened == ()
+
+    culled = _opened_after_an_empty_prior(
+        tmp_path / "culled", "",
+        log=(_log_qblock("Q-0090", state="answered", raised_by="lead-dev", question="a?",
+                         raised_at=_zulu(NOW, days=5), answer="yes", answered_by="human",
+                         answered_at=before)
+             + _log_qblock("Q-0091", state="answered", raised_by="lead-dev", question="b?",
+                           raised_at=_zulu(NOW, days=5), answer="yes", answered_by="human",
+                           answered_at=inside)
+             + _retracted_q("Q-0092", before, log=True) + _retracted_q("Q-0093", inside, log=True)),
+    )
+    assert culled.questions_answered == live.questions_answered
+    assert culled.questions_retracted == live.questions_retracted
+
+
+def test_a_live_answer_with_an_unreadable_answered_at_is_named_partial(tmp_path):
+    changed = _opened_after_an_empty_prior(tmp_path, _answered_q("Q-0094", "someday"))
+    assert changed.questions_answered == ()
+    assert ("window partial: 1 live answer on the board carries no readable answered_at and "
+            "could not be placed: Q-0094") in changed.note
+    assert "Q-0094" in changed.answer_partial_note  # DECIDED's partial sentence reads this
+
+
+def test_an_answer_the_prior_saw_open_counts_on_both_paths_whatever_its_answered_at(tmp_path):
+    """The prior snapshot is taken at the window start, so a question it saw open and that is
+    answered now was answered in the window, even when `answered_at` is unreadable or stamped a
+    minute before the snapshot's own time. Live and culled count it alike (gh#1148 parity)."""
+    status = tmp_path / "live" / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md", questions=(
+        _answered_q("Q-0099", "garbled") + _answered_q("Q-0100", "2026-08-31T05:59Z")))
+    prior = snapshot_like(generated_at="2026-08-31T06:00:37+00:00",
+                          questions={"Q-0099": "open", "Q-0100": "open"})
+    live = fr.collect(inputs_for(tmp_path / "live"), now=NOW, prior=prior,
+                      issues=[]).changed_since
+    assert live.questions_answered == ("Q-0099", "Q-0100")
+
+    status = tmp_path / "culled" / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md", questions="")
+    _write(status / "registry-log.md", "".join(
+        _log_qblock(q, state="answered", raised_by="lead-dev", question=f"{q}?",
+                    raised_at=_zulu(NOW, days=5), answer="yes", answered_by="human",
+                    answered_at=at)
+        for q, at in (("Q-0099", "garbled"), ("Q-0100", "2026-08-31T05:59Z"))))
+    culled = fr.collect(inputs_for(tmp_path / "culled"), now=NOW, prior=prior,
+                        issues=[]).changed_since
+    assert culled.questions_answered == live.questions_answered
+
+
+def test_a_live_retraction_counts_on_prior_state_or_an_in_window_raise_without_a_date():
+    """The two retraction shortcuts, each on its own: the prior saw the question open (its
+    `retracted_at` is before the window), and a raise in the window (`retracted_at` unreadable)."""
+    start = "2026-08-31T06:00:37+00:00"
+    changed = fr.diff_since(
+        snapshot_like(generated_at=start, questions={"Q-0095": "open"}),
+        snapshot_like(questions={"Q-0095": reg_mod.Q_RETRACTED, "Q-0096": reg_mod.Q_RETRACTED}),
+        prior_path="p.md",
+        raised={"Q-0095": {"raised_at": "2026-08-30T06:00Z", "retracted_at": "2026-08-31T05:00Z"},
+                "Q-0096": {"raised_at": "2026-08-31T07:00Z", "retracted_at": "garbled"}})
+    assert changed.questions_retracted == ("Q-0095", "Q-0096")
+
+
+def test_an_unreadable_window_start_still_lists_answers_the_snapshots_prove():
+    """The prior-state test needs no window start: a question the prior saw open and that is
+    answered now was answered in the window, exactly as the applied line already reports."""
+    changed = fr.diff_since(
+        snapshot_like(generated_at="garbage", questions={"Q-0097": "open", "Q-0098": "open"}),
+        snapshot_like(questions={"Q-0097": "answered", "Q-0098": "applied"}),
+        prior_path="p.md",
+        raised={"Q-0097": {"raised_at": "2026-08-30T06:00Z"},
+                "Q-0098": {"raised_at": "2026-08-30T06:00Z"}})
+    assert changed.questions_answered == ("Q-0097",)
+    assert changed.questions_applied == ("Q-0098",)
+
+
+def test_the_window_start_minute_opens_a_live_raise_exactly_as_it_opens_a_culled_one(tmp_path):
+    """Both paths floor the window start (06:00:37) to 06:00 and count a raise ON it, and both
+    leave out the minute before it. Live Q-0074/Q-0075 and culled Q-0076/Q-0077 mirror each
+    other, so a disagreement between the paths fails here."""
+    changed = _opened_after_an_empty_prior(
+        tmp_path,
+        _live_q("Q-0074", raised_at="2026-08-31T06:00Z")
+        + _live_q("Q-0075", raised_at="2026-08-31T05:59Z"),
+        log=(_log_qblock("Q-0076", state="retracted", urgency="waiting", raised_by="jr-dev-1",
+                         question="Q-0076 subject?", raised_at="2026-08-31T06:00Z")
+             + _log_qblock("Q-0077", state="retracted", urgency="waiting", raised_by="jr-dev-1",
+                           question="Q-0077 subject?", raised_at="2026-08-31T05:59Z")),
+    )
+    assert changed.questions_opened == ("Q-0074", "Q-0076")
+
+
+def test_a_live_question_with_no_or_an_unreadable_raised_at_is_handled_as_the_culled_path_does(
+        tmp_path):
+    """No `raised_at` at all predates the field: not opened, and not a partial window either,
+    on both paths. A present but unreadable one is not opened and IS named as partial, unless
+    its answer or retraction is dated before the window, since a raise cannot come after it."""
+    changed = _opened_after_an_empty_prior(tmp_path, (
+        _live_q("Q-0080")                                     # no raised_at at all
+        + _live_q("Q-0081", raised_at="last tuesday")         # unreadable, nothing bounds it
+        + qblock("Q-0082", state="answered", urgency="waiting", raised_by="lead-dev",
+                 question="Q-0082 subject?", raised_at="garbled", answer="yes",
+                 answered_by="human", answered_at=_zulu(NOW, days=2))  # closed before the window
+    ))
+    assert changed.questions_opened == ()
+    # Q-0082 was answered two days before the window, so it is not answered in it either.
+    assert changed.questions_answered == ()
+    assert changed.note == (
+        "nothing changed since 2026-08-31T06:00:37+00:00 in what could be read; window partial: "
+        "1 live question on the board carries no readable raised_at and could not be placed: "
+        "Q-0081"
+    )
+
+    # The culled path treats the same three shapes the same way.
+    culled = _opened_after_an_empty_prior(
+        tmp_path / "culled", "",
+        log=(_log_qblock("Q-0080", state="retracted", raised_by="jr-dev-1", question="a?")
+             + _log_qblock("Q-0081", state="retracted", raised_by="jr-dev-1", question="b?",
+                           raised_at="last tuesday")
+             + _log_qblock("Q-0082", state="answered", raised_by="jr-dev-1", question="c?",
+                           raised_at="garbled", answer="yes", answered_by="human",
+                           answered_at=_zulu(NOW, days=2))),
+    )
+    assert culled.questions_opened == ()
+    assert culled.note.endswith(
+        "window partial: 1 culled question in registry-log.md carries an unreadable raised_at "
+        "and could not be placed: Q-0081"
+    )
+    assert "Q-0080" not in culled.note and "Q-0082" not in culled.note
+
+
+def test_a_new_id_the_raised_map_does_not_cover_is_named_partial_not_dropped_silently():
+    """`raised` is required, and an id missing from it could not be placed: named, never read as
+    undated. An id it covers with no `raised_at` is the legacy undated case, and stays silent."""
+    with pytest.raises(TypeError):
+        fr.diff_since(snapshot_like(), snapshot_like(), prior_path="p.md")  # no `raised`
+    changed = fr.diff_since(
+        snapshot_like(questions={}),
+        snapshot_like(questions={"Q-0090": "open", "Q-0091": "open", "Q-0092": "open"}),
+        prior_path="p.md",
+        raised={"Q-0092": {"state": "open"}},
+    )
+    assert changed.questions_opened == ()
+    assert changed.partial_note == (
+        "window partial: 2 live questions on the board carry no readable raised_at and could "
+        "not be placed: Q-0090, Q-0091"
+    )
+
+
+def test_an_unreadable_window_start_is_said_once_not_once_per_path(tmp_path):
+    status = tmp_path / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md",
+                  questions=_live_q("Q-0093", raised_at=_zulu(NOW, hours=1)))
+    _write(status / "registry-log.md", "")
+    prior = snapshot_like(generated_at="garbage", questions={})
+    changed = fr.collect(inputs_for(tmp_path), now=NOW, prior=prior, issues=[]).changed_since
+    assert changed.questions_opened == ()
+    assert changed.note.count("window partial") == 1
+    assert changed.note.count("'garbage' is unreadable") == 1
+
+
+def test_a_culled_retraction_is_dated_by_retracted_at_when_nothing_else_places_it(tmp_path):
+    status = tmp_path / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md")
+    old = _zulu(NOW, days=2)
+    _write(status / "registry-log.md", (
+        _log_qblock("Q-0060", state="retracted", raised_by="jr-dev-1", question="in?",
+                    raised_at=old, retracted_at=_zulu(NOW, hours=1))
+        + _log_qblock("Q-0061", state="retracted", raised_by="jr-dev-1", question="out?",
+                      raised_at=old, retracted_at=old)
+        # Already retracted in the prior snapshot: the prior report listed it.
+        + _log_qblock("Q-0062", state="retracted", raised_by="jr-dev-1", question="seen?",
+                      raised_at=old, retracted_at=_zulu(NOW, hours=1))
+    ))
+    prior = snapshot_like(questions={"Q-0062": "retracted"})
+    changed = fr.collect(inputs_for(tmp_path), now=NOW, prior=prior, issues=[]).changed_since
+    assert changed.questions_retracted == ("Q-0060",)
+    assert changed.questions_opened == ()
+
+
+def test_a_culled_raise_with_an_unreadable_raised_at_says_CHANGED_SINCE_is_partial(tmp_path):
+    """The note is about the opened line, so it rides on CHANGED SINCE even when that section is
+    not empty, and DECIDED - which lists answers, all of them read - stays unqualified."""
+    status = tmp_path / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md", questions=qblock(
+        "Q-0039", state="open", urgency="waiting", raised_by="lead-dev", question="live?",
+        default="no", raised_at=_zulu(NOW, hours=1)))
+    _write(status / "registry-log.md", _log_qblock(
+        "Q-0037", state="retracted", raised_by="jr-dev-1", question="when?", raised_at="soon"))
+    report = fr.collect(inputs_for(tmp_path), now=NOW, prior=snapshot_like(), issues=[])
+    assert report.changed_since.questions_opened == ("Q-0039",)
+    assert report.changed_since.note.startswith("window partial:")
+    assert "Q-0037" in report.changed_since.note
+    assert "raised_at" in report.changed_since.note
+    assert report.decided.partial_note == ""
+
+
+def test_a_bad_raised_at_on_a_block_closed_BEFORE_the_window_is_not_partial(tmp_path):
+    """A raise cannot come after its answer or retraction, so an old block with a malformed
+    raised_at is placed before the window by them. Flagging it would mark every report partial
+    forever over history the window has nothing to do with."""
+    status = tmp_path / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md")
+    old = _zulu(NOW, days=40)
+    _write(status / "registry-log.md", (
+        _log_qblock("Q-0001", state="applied", raised_by="jr-dev-1", question="old?",
+                    answer="yes", answered_by="human", answered_at=old, raised_at="-")
+        + _log_qblock("Q-0002", state="retracted", raised_by="jr-dev-1", question="old too?",
+                      retracted_at=old, raised_at="-")
+        # Closed INSIDE the window: nothing places the raise, so it is still said.
+        + _log_qblock("Q-0003", state="applied", raised_by="jr-dev-1", question="new?",
+                      answer="yes", answered_by="human", answered_at=_zulu(NOW, hours=1),
+                      raised_at="-")
+    ))
+    report = fr.collect(inputs_for(tmp_path), now=NOW, prior=snapshot_like(), issues=[])
+    note = report.changed_since.note
+    assert "Q-0003" in note
+    assert "Q-0001" not in note and "Q-0002" not in note
+    assert report.decided.partial_note == ""
+
+
+def _count_log_reads(log: Path, *, deny: bool = False):
+    """Count (and optionally refuse) every OPEN of the cull log, at the layer under pathlib.
+
+    ``Path.read_text``/``read_bytes``/``open`` all end in ``io.open``, and a bare ``open()`` is
+    ``builtins.open``: patching both catches a second read whichever API it uses, where patching
+    ``read_text`` alone let a ``read_bytes`` or ``open()`` re-read pass.
+    """
+    import builtins
+    import contextlib
+    import io
+    import unittest.mock as _mock
+
+    real = io.open
+    calls = []
+
+    def counting(file, *a, **kw):
+        if isinstance(file, (str, Path)) and Path(file) == log:
+            calls.append(1)
+            if deny:
+                raise PermissionError(13, "Permission denied", str(log))
+        return real(file, *a, **kw)
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(_mock.patch.object(io, "open", counting))
+    stack.enter_context(_mock.patch.object(builtins, "open", counting))
+    return stack, calls
+
+
+def _both_consumers_fixture(tmp_path) -> Path:
+    path = _production_registry(
+        tmp_path,
+        log="| E-0136 | overflow matcher | jr-dev-1 | jr-dev-1 | done | - |  |\n\n"
+            + _log_qblock("Q-0007", state="applied", urgency="advisory", raised_by="jr-dev-1",
+                          question="ship the culled change?", answer="yes", answered_by="steward",
+                          answered_at=_zulu(NOW, hours=2)),
+    )
+    return path.parent / "registry-log.md"
+
+
+def _collect_both(tmp_path):
+    return fr.collect(
+        inputs_for(tmp_path, tracker_host_ref="owner/repo"), now=NOW, prior=snapshot_like(),
+        issues=[], git_runner=_runner(out=_pr_json((267, "Fix it (E-0136)", "bbbbbbb"))),
+    )
+
+
+def test_the_cull_log_is_read_ONCE_per_collect_and_feeds_both_consumers(tmp_path):
+    """The log passes 1 MB on a mature fleet; reading it once for DECIDED/CHANGED SINCE and again
+    for the production signal parsed the same file twice per report."""
+    log = _both_consumers_fixture(tmp_path)
+    patch, calls = _count_log_reads(log)
+    with patch:
+        report = _collect_both(tmp_path)
+    assert len(calls) == 1
+    by_agent = {lane.agent: lane for lane in report.lanes.lanes}
+    assert by_agent["jr-dev-1"].merged_in_window == 1, "production read the culled E- row"
+    assert [d.qid for d in report.decided.questions] == ["Q-0007"], "DECIDED read the culled Q"
+
+
+def test_an_unreadable_cull_log_is_tried_once_and_both_consumers_still_say_so(tmp_path):
+    log = _both_consumers_fixture(tmp_path)
+    patch, calls = _count_log_reads(log, deny=True)
+    with patch:
+        report = _collect_both(tmp_path)
+    assert len(calls) == 1
+    assert report.lanes.production_available is False
+    for lane in report.lanes.lanes:
+        assert lane.merged_in_window is None
+        assert "registry-log.md unreadable (PermissionError)" in lane.production_basis
+    assert report.decided.partial_note.startswith("window partial: registry-log.md unreadable")
+    assert "culled raises" in report.decided.partial_note
+    assert report.changed_since.note.startswith("window partial: registry-log.md unreadable")
+
+
+def test_CONTROL_a_report_with_no_culled_questions_is_unchanged_by_the_log(tmp_path):
+    """A log holding only culled table rows changes nothing a log-less report says."""
+    status = tmp_path / "projects" / "alpha" / "status"
+    make_registry(status / "registry.md", questions=qblock(
+        "Q-0040", state="open", urgency="waiting", raised_by="lead-dev", question="live?",
+        default="no", raised_at=_zulu(NOW, hours=1)))
+    prior = snapshot_like()
+    without = fr.collect(inputs_for(tmp_path), now=NOW, prior=prior, issues=[])
+    _write(status / "registry-log.md", "| E-0002 | x | lead | lead-dev | done | - |  |\n")
+    with_rows = fr.collect(inputs_for(tmp_path), now=NOW, prior=prior, issues=[])
+    assert without.changed_since == with_rows.changed_since
+    assert without.decided == with_rows.decided
+    assert with_rows.changed_since.questions_opened == ("Q-0040",)
+    assert with_rows.changed_since.questions_applied == ()
+
+
+# --------------------------------------------------------------------------- #
+# An ADVISORY question does not make a lane BLOCKED
+# --------------------------------------------------------------------------- #
+def _advisory_q(raised_by: str, qid: str = "Q-0001") -> str:
+    return qblock(qid, state="open", urgency="advisory", raised_by=raised_by,
+                  question="Use X?", default="X", assumption="proceeding on X")
+
+
+def test_an_open_ADVISORY_question_does_not_make_a_lane_BLOCKED(tmp_path):
+    """Its raiser already proceeded on the assumption, so nothing of the seat's is waiting.
+    BLOCKED over it reports a working seat as stalled on the human."""
+    _states_registry(
+        tmp_path,
+        queue="| E-0001 | work | jr-dev-1 | jr-dev-1 | building | - |  |\n",
+        questions=_advisory_q("jr-dev-1"),
+    )
+    assert _lane_state(tmp_path, "jr-dev-1").state == fr.LANE_LIVE
+
+
+def test_an_ADVISORY_question_on_an_empty_lane_reads_DRY_and_a_WAITING_one_BLOCKED(tmp_path):
+    _states_registry(tmp_path, questions=_advisory_q("jr-dev-1")
+                     + qblock("Q-0002", state="open", urgency="waiting", raised_by="jr-dev-2",
+                              question="x", default="y"))
+    assert _lane_state(tmp_path, "jr-dev-1").state == fr.LANE_DRY
+    blocked = _lane_state(tmp_path, "jr-dev-2")
+    assert blocked.state == fr.LANE_BLOCKED
+    assert "Q-0002" in blocked.why
+
+
+def test_lead_dev_with_an_ADVISORY_question_still_prints_its_selection_why(tmp_path):
+    beat, eta = stamp(NOW, minutes=1), (NOW + timedelta(minutes=30)).isoformat()
+    make_registry(
+        tmp_path / "projects" / "alpha" / "status" / "registry.md",
+        agents=agent_row("lead-dev", "working", heartbeat=beat, eta=eta),
+        questions=_advisory_q("lead-dev"),
+    )
+    _two_claimable(tmp_path)
+    report = fr.collect(inputs_for(tmp_path), now=NOW, issues=[])
+    lead = {lane.agent: lane for lane in report.lanes.lanes}["lead-dev"]
+    assert lead.state == fr.LANE_LIVE
+    assert "2 epics claimable now" in lead.why
+
+
+# --- gh#1123: registry ids and refs are ASCII-digit only, Queue keys use the shared predicate -
+
+
+def _arabic(digits: str) -> str:
+    """`digits` spelled in Arabic-Indic digits: `\\d` matches these and `int()` reads them."""
+    return "".join(chr(0x0660 + int(c)) for c in digits)
+
+
+def _fullwidth(digits: str) -> str:
+    return "".join(chr(0xFF10 + int(c)) for c in digits)
+
+
+@pytest.mark.parametrize("spell", [_arabic, _fullwidth])
+def test_a_registry_id_in_text_spelled_in_NON_ASCII_digits_is_not_named(spell):
+    for text in (f"Q-{spell('0001')}", f"B-{spell('0002')}", f"Q-000{spell('1')}"):
+        assert fr.name_registry_ids_in(text, {}) == text, (
+            f"{text!r} read as a registry id; only ASCII digits spell one"
+        )
+    assert fr.name_registry_ids_in("Q-0001", {}) != "Q-0001", "control: an ASCII id is named"
+
+
+@pytest.mark.parametrize("spell", [_arabic, _fullwidth])
+def test_a_worktree_or_claim_with_NON_ASCII_epic_digits_carries_no_epic_number(spell):
+    assert fr._wt_epic_key(f"e{spell('0768')}-account-limit-keystone") == ""
+    assert fr._wt_epic_key(f"E-076{spell('8')}-run-on") == "", "a run-on must not read as E-076"
+    assert fr._wt_epic_key("e0768-account-limit-keystone") == "768", "control"
+
+
+@pytest.mark.parametrize("spell", [_arabic, _fullwidth])
+def test_PR_title_and_subject_keys_refuse_NON_ASCII_digits(spell):
+    assert fr._PR_EPIC_KEY_RE.findall(f"E-{spell('1234')}-x: fix") == []
+    assert fr._PR_EPIC_KEY_RE.findall(f"E-123{spell('4')}-x: fix") == [], "run-on cut short"
+    assert fr._PR_ISSUE_KEY_RE.findall(f"fix gh#{spell('134')}") == []
+    assert fr._PR_ISSUE_KEY_RE.findall(f"fix gh#13{spell('4')}") == []
+    assert fr._ISSUE_SUBJECT_RE.match(f"BUG gh#{spell('134')} - x") is None
+    assert fr._PR_EPIC_KEY_RE.findall("E-1234-x: fix") == ["E-1234-x"], "control"
+    assert fr._ISSUE_SUBJECT_RE.match("BUG gh#134 - x").group(1) == "134", "control"
+
+
+@pytest.mark.parametrize("spell", [_arabic, _fullwidth])
+def test_a_check_job_id_in_NON_ASCII_digits_is_no_job_id(spell):
+    url = "https://github.com/o/r/actions/runs/1/job/"
+    assert fr._check_age({"detailsUrl": url + spell("123")})[0] is None
+    assert fr._check_age({"detailsUrl": url + "123"})[0] == 123, "control"
+
+
+def _reject_queue_key(monkeypatch, rejected: str) -> None:
+    """Narrow the SHARED Queue predicate so it rejects one id `_E_ID` alone would accept."""
+    rule = reg_mod._ROW_KEY_RULES["Queue"]
+    monkeypatch.setitem(
+        reg_mod._ROW_KEY_RULES, "Queue", (lambda key: key != rejected and rule[0](key), *rule[1:])
+    )
+
+
+def test_the_log_seat_map_rejects_exactly_what_the_shared_Queue_predicate_rejects(monkeypatch):
+    log = (
+        "| E-0768 | toy | lead | lead-dev | done | - | |\n"
+        "| E-0769 | toy | lead | jr-dev-1 | done | - | |\n"
+    )
+    assert "E-0768" in fr._seat_by_epic_id(reg_mod.Registry(), log), "control: predicate accepts"
+    _reject_queue_key(monkeypatch, "E-0768")
+    seats = fr._seat_by_epic_id(reg_mod.Registry(), log)
+    assert "E-0768" not in seats, "a Queue key check bypassed registry._row_key_ok"
+    assert seats.get("E-0769") == "jr-dev-1"
+
+
+def test_the_issue_seat_map_rejects_exactly_what_the_shared_Queue_predicate_rejects(monkeypatch):
+    log = "| E-0768 | BUG gh#134 - fix it | lead | lead-dev | done | - | |\n"
+    assert fr._seat_by_issue_number(reg_mod.Registry(), log).get("134") == "lead-dev", "control"
+    _reject_queue_key(monkeypatch, "E-0768")
+    assert "134" not in fr._seat_by_issue_number(reg_mod.Registry(), log), (
+        "a Queue key check bypassed registry._row_key_ok"
+    )
+
+
+@pytest.mark.parametrize("text", ["\u0665\u0661", "\uff15\uff11", "\xb2"],
+                         ids=["arabic-indic", "fullwidth", "superscript"])
+def test_a_NON_ASCII_digit_string_is_not_named_as_an_issue_number(text):
+    changed = fr.ChangedSince(names=(fr.NamedId("#51", "report omits archived epics"),))
+    assert not changed.named(text).ident.startswith("#"), "str.isdigit read it as an issue"
+    assert str(changed.named("51")) == "#51 (report omits archived epics)", "control"

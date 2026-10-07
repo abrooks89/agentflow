@@ -15,7 +15,7 @@ Assume they are a skilled developer, but know almost nothing about our toolset o
 
 **Context:** If working in an isolated worktree, it should have been created via the `../using-git-worktrees/SKILL.md` skill at execution time.
 
-**Save plans to:** `<data_root>/solution/YYYY-MM-DD-<feature-name>.md`
+**Save plans to:** `<data_root>/projects/<name>/design/plans/YYYY-MM-DD-<feature-name>.md`
 - (User preferences for plan location override this default)
 
 ## Scope Check
@@ -155,9 +155,14 @@ If you find issues, fix them inline. No need to re-review — just fix and move 
 
 ## Execution Handoff
 
-After saving the plan, offer execution choice:
+**When invoked by the `solution` skill** (the normal route: refine hands an approved spec to
+`solution`, which wraps this skill), do NOT offer an execution choice. Report the saved plan path
+and return to `solution`: it adds the DAG frontmatter, and the orchestrator executes the plan.
+Running it here, by subagent or inline, executes a plan that has no frontmatter yet.
 
-**"Plan complete and saved to `<data_root>/solution/<filename>.md`. Two execution options:**
+**Only when invoked standalone** (a single-task plan that needs no DAG), offer execution choice:
+
+**"Plan complete and saved to `<data_root>/projects/<name>/design/plans/<filename>.md`. Two execution options:**
 
 **1. Subagent-Driven (recommended)** - I dispatch a fresh subagent per task, review between tasks, fast iteration
 

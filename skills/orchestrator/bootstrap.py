@@ -241,6 +241,40 @@ def add_hooks(settings: dict) -> tuple[dict, int]:
     return settings, n_added
 
 
+def write_settings(path: Path, settings: dict) -> None:
+    """Write *settings* through the one helper provision's own settings write uses.
+
+    One function owns the spelling (indent 2, ensure_ascii=False, no trailing newline, LF,
+    atomic, symlink target), so the two writers of this one file never flip-flop its bytes.
+    """
+    # The installed agentflow package, as every skill uses it; provision runs this script with
+    # the suite venv's interpreter, which has it. Imported here rather than at the top so the
+    # read-only paths (--dry-run, the report) still run under a bare interpreter.
+    try:
+        from agentflow.atomic_io import write_settings_json
+    except ModuleNotFoundError as e:
+        if e.name not in ('agentflow', 'agentflow.atomic_io'):
+            raise
+        raise SystemExit(
+            f'ERROR: cannot write {path}: the agentflow package is not importable from '
+            f'{sys.executable}. Nothing was written. Run this script with the suite venv '
+            f'interpreter (provision step 8 does), or install the package first.'
+        ) from e
+    except ImportError as e:
+        # The module imported but lacks the helper: an installed package older than this
+        # script. Any other ImportError is not this case and is re-raised as it came.
+        if e.name != 'agentflow.atomic_io':
+            raise
+        raise SystemExit(
+            f'ERROR: cannot write {path}: the agentflow package importable from '
+            f'{sys.executable} has no atomic_io.write_settings_json, so it is older than this '
+            f'script. Nothing was written. Re-run provision from this checkout, which '
+            f're-installs the package, and run this again.'
+        ) from e
+
+    write_settings_json(path, settings)
+
+
 def print_report(settings: dict) -> None:
     pretool = settings.get('hooks', {}).get('PreToolUse', [])
     print('PreToolUse matchers in settings:')
@@ -273,8 +307,13 @@ def main() -> int:
     print(f'{"Would add" if args.dry_run else "Added"} {n_added} new auto-allow hooks.')
 
     if not args.dry_run:
-        path.write_text(json.dumps(settings, indent=2), encoding='utf-8')
-        print(f'Wrote {path}.')
+        if n_added:
+            write_settings(path, settings)
+            print(f'Wrote {path}.')
+        else:
+            # Nothing added means nothing changed: leave the file's bytes and mtime alone
+            # rather than re-serialising an operator's file for no reason.
+            print(f'Left {path} untouched.')
 
     if args.print_report or args.dry_run:
         print_report(settings)

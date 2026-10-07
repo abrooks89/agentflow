@@ -143,6 +143,9 @@ def test_the_charter_exception_for_cross_row_verbs_is_explicit(steward: str) -> 
     charter = steward.split("YOU MAY NOT FIX", 1)[1]
     assert "any registry row you do not own" in charter
     assert "proven dead by probe" in charter
+    exception = " ".join(charter.split("any registry row you do not own", 1)[1].split("proven dead", 1)[0].split())
+    for verb in ("reap", "stand-down", "repair", "cull", "assign-blocker"):
+        assert f"`{verb}`" in exception, f"charter exception omits `{verb}`: {exception!r}"
 
 
 def test_the_inherited_reap_rules_are_stated_where_its_only_caller_reads_them(steward: str) -> None:

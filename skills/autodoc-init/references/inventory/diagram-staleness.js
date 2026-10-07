@@ -1,17 +1,25 @@
 // Deterministic diagram-staleness detector for /autodoc-update.
 // A diagrammed page is STALE when some commit after its diagram_source_sha, up to the manifest's
-// last_sha, touched any of its source_paths. Flag-don't-regenerate: this only REPORTS staleness;
-// it never rewrites a diagram.
+// last_sha, touched any of its source_paths. A flow or data-model page whose diagram field is not
+// true is MISSING. Flag-don't-regenerate: this only REPORTS both; it never draws or rewrites a
+// diagram.
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-// Minimal, dependency-free frontmatter reader for the three fields we need.
+// Page types that are expected to carry a diagram. One of these with no diagram is MISSING
+// (gh#572): reconcile creates flow pages without ever drawing one, and a page that only looked
+// at diagram: true pages could never see them.
+const DIAGRAM_TYPES = new Set(['flow', 'data-model']);
+
+// Minimal, dependency-free frontmatter reader for the four fields we need.
 function parsePageFrontmatter(text) {
   const m = /^---\n([\s\S]*?)\n---/.exec(text);
   const fm = m ? m[1] : '';
-  const out = { diagram: false, diagram_source_sha: '', source_paths: [] };
+  const out = { type: '', diagram: false, diagram_source_sha: '', source_paths: [] };
+  const ty = /^type:\s*"?([^"\n]*?)"?\s*$/m.exec(fm);
+  if (ty) out.type = ty[1].trim();
   const dm = /^diagram:\s*(true|false)\s*$/m.exec(fm);
   if (dm) out.diagram = dm[1] === 'true';
   const sh = /^diagram_source_sha:\s*"?([^"\n]*)"?\s*$/m.exec(fm);
@@ -79,18 +87,24 @@ function computeStaleDiagrams({ pages, headSourceShas = {}, isFresh }) {
   const judge = isFresh || headShaFreshness(headSourceShas);
   const stale = [];
   const fresh = [];
+  const missing = [];
   for (const p of pages) {
-    if (!p.diagram) continue; // only diagrammed pages participate
+    if (p.diagram !== true) {
+      // Undiagrammed pages are judged only on whether their type needs a diagram.
+      if (DIAGRAM_TYPES.has(p.type)) missing.push(p);
+      continue;
+    }
     const v = judge(p);
     const entry = { ...p, reason: v.reason, unproven: Boolean(v.unproven) };
     (v.stale ? stale : fresh).push(entry);
   }
   const budget = {
     staleCount: stale.length,
-    // Rough regen cost estimate for the budget report (one agent pass per diagram).
-    estRegenTokens: stale.length * 8000,
+    missingCount: missing.length,
+    // Rough regen cost estimate for the budget report (one agent pass per diagram, drawn or redrawn).
+    estRegenTokens: (stale.length + missing.length) * 8000,
   };
-  return { stale, fresh, budget };
+  return { stale, fresh, missing, budget };
 }
 
 // Runs git without a shell. A non-zero exit is data here (is-ancestor answers with exit 1), so it
@@ -219,10 +233,12 @@ function main(argv) {
       : manifest.last_sha ? 'last_sha; any diagram not drawn at that exact commit reads stale' : 'nothing (no heads; every page is unproven)';
     modeLine = `Mode: FALLBACK (${mode.why}) - sha comparison against ${against}`;
   }
-  const { stale, fresh, budget } = result;
-  console.log(`Diagram staleness report: ${budget.staleCount} stale of ${pages.filter((p) => p.diagram).length} diagrammed pages`);
+  const { stale, fresh, missing, budget } = result;
+  console.log(`Diagram staleness report: ${budget.staleCount} stale of ${pages.filter((p) => p.diagram === true).length} diagrammed pages; `
+    + `${budget.missingCount} missing (flow/data-model pages with no diagram)`);
   console.log(modeLine);
   for (const p of stale) console.log(`  STALE  ${p.path}  (was ${p.diagram_source_sha}; ${p.reason})`);
+  for (const p of missing) console.log(`  MISSING  ${p.path}  (type ${p.type}; diagram is not true)`);
   for (const p of fresh.filter((f) => f.unproven)) console.log(`  UNPROVEN  ${p.path}  (${p.reason}; counted fresh)`);
   console.log(`Est. regeneration budget: ~${budget.estRegenTokens} tokens (flag-only; regen is an explicit follow-up)`);
   return 0;

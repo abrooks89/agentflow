@@ -23,7 +23,6 @@ Run: python harness/assert_doc_counts.py   (exit 0 clean, 1 with findings)
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
 from itertools import groupby
 from pathlib import Path
@@ -32,6 +31,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "harness"))
 
 import check  # noqa: E402  - path set above
+from agentflow.tracked_paths import tracked_paths  # noqa: E402
 
 
 def expected_count() -> int:
@@ -51,11 +51,19 @@ def expected_ranges() -> str:
 #: A location whose pattern stops matching is a FINDING, not a pass -- prose
 #: gets rewritten, and a gate that silently matches nothing is not a gate.
 KNOWN_COUNT = [
-    ("README.md", r"\*\*(\d+) wired assertions\*\*"),
+    ("README.md", r"\*\*(\d+)\+ wired assertions\*\*"),
     ("harness/README.md", r"acceptance checker \((\d+) wired assertions"),
     ("docs/ARCHITECTURE.md", r"wires \*\*(\d+) deterministic assertions\*\*"),
     ("harness/auditor-scenario/README.md", r"\*\*(\d+)\*\* assertions wired"),
 ]
+
+#: Locations whose number is a FLOOR (`**N+**`), not an exact count (gh#344): README's
+#: Evidence table states every row that way so a test-adding merge stops editing it. A floor
+#: holds while the count is at least N and no more than FLOOR_STALE_RATIO x N -- the same rule
+#: skills/_shared/tests/test_evidence_table.py applies to the row, so the two gates cannot
+#: demand different numbers for one cell.
+FLOOR_LOCATIONS = {"README.md"}
+FLOOR_STALE_RATIO = 1.25
 
 #: Locations that state the per-scenario ID ranges.
 KNOWN_RANGES = [
@@ -63,38 +71,21 @@ KNOWN_RANGES = [
 ]
 
 #: Lines mentioning wired assertions anywhere else in the tracked docs.
-#: Scope is what `git ls-files` reports, NOT a filesystem walk. A walk reaches
-#: into `.claude/worktrees/wf_*`, `.venv` and any other scratch tree a real
-#: checkout accumulates, each holding an OLD copy of these same docs -- so the
-#: gate passed in CI (fresh clone, none of that present) and failed on every
-#: developer machine that had ever run a workflow. Tracked-files scope fixes
-#: that by construction rather than by a skip list that has to guess the next
-#: scratch directory. The fallback walk keeps the gate usable outside a git
-#: checkout, and carries the skip list for exactly that case.
-SCAN_GLOBS = ("*.md",)
-SCAN_SKIP = ("_vendored", "node_modules", ".git", ".claude", ".venv", "records", "toy-repo")
+#: Scope is the git index, NOT a filesystem walk. A walk reaches into
+#: `.claude/worktrees/wf_*`, `.venv` and any other scratch tree a real checkout
+#: accumulates, each holding an OLD copy of these same docs -- so the gate passed
+#: in CI (fresh clone, none of that present) and failed on every developer machine
+#: that had ever run a workflow. Tracked-files scope fixes that by construction
+#: rather than by a skip list that has to guess the next scratch directory.
+#: There is no fallback walk (gh#410): outside a git checkout this raises, because
+#: a silent fall back to the tree reinstates the defect exactly where it is
+#: hardest to see.
+SCAN_SUFFIX = ".md"
 
 
 def scan_candidates():
-    """Tracked *.md paths, or a filtered walk when git is unavailable."""
-    try:
-        out = subprocess.run(["git", "-C", str(REPO), "ls-files", "-z", "*.md"],
-                             capture_output=True, check=True, text=True).stdout
-        rels = [r for r in out.split(chr(0)) if r]
-        if rels:
-            return [(r, REPO / r) for r in rels]
-    except (OSError, subprocess.CalledProcessError):
-        pass
-    found = []
-    for glob in SCAN_GLOBS:
-        for path in REPO.rglob(glob):
-            rel = path.relative_to(REPO).as_posix()
-            if any(part.startswith(".") for part in rel.split("/")):
-                continue
-            if any(skip in rel for skip in SCAN_SKIP):
-                continue
-            found.append((rel, path))
-    return found
+    """(repo-relative POSIX path, absolute path) for every tracked *.md file."""
+    return [(rel, REPO / rel) for rel in sorted(tracked_paths(REPO)) if rel.endswith(SCAN_SUFFIX)]
 
 
 #: Count-stating shapes as they appear in the docs today. Emphasis-agnostic where
@@ -115,7 +106,7 @@ def scan_candidates():
 #: prose.
 SCAN_PATTERN = re.compile(r"(\d+)\s*(?:wired |deterministic )?assertions? wired|"
                           r"\*\*(\d+)\*\* assertions wired|"
-                          r"(\d+) wired assertions|"
+                          r"(\d+)\+? wired assertions|"
                           r"wires \*\*(\d+) deterministic assertions")
 
 
@@ -134,7 +125,11 @@ def main() -> int:
                 "%s: pattern %r matched nothing -- prose changed shape; "
                 "update this gate deliberately rather than deleting it" % (rel, pattern))
         for got in found:
-            if int(got) != count:
+            if rel in FLOOR_LOCATIONS:
+                if not int(got) <= count <= FLOOR_STALE_RATIO * int(got):
+                    findings.append("%s: states a floor of %s+ wired assertions, check.py wires %d"
+                                    " (floor false or stale)" % (rel, got, count))
+            elif int(got) != count:
                 findings.append("%s: states %s wired assertions, check.py wires %d"
                                 % (rel, got, count))
 

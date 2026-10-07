@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+- **Provision no longer sets `$AGENTFLOW_CONFIG` to point its own readers at a config home.**
+  `main()` and the presence check each set the variable for the length of a call and restored
+  it after. The variable is process-global, so two overlapping in-process runs each saved the
+  other's value as the one to restore: the first to finish left the second reading the shell's
+  home, or the other run's. `config_home`, `environment_path`, `load_environment`, `load_project`
+  and `resolve_project_name` (and doctor's `diagnose`) now take an optional `config_home`; left
+  out, they read the variable exactly as before. Provision passes its home to every in-process
+  reader, and gives its child processes (the bootstrap step, the venv handover) a copy of the
+  environment carrying it, as they inherited before. `os.environ` is no longer written.
+
+- **One function writes `settings.local.json`.** The JSON spelling (indent 2, non-ASCII kept as
+  UTF-8, lone surrogates falling back to escapes, LF, no trailing newline, through a symlink to
+  its target, atomic) was copied into provision and the auto-allow bootstrap. Both now call
+  `atomic_io.write_settings_json`, so the two writers of the one file cannot drift apart.
+
+- **Junior lanes find their rows with `read --claimable`, not a grep for `lane: jr-dev-N`.**
+  `## Queue` is a markdown table, so that literal matched nothing and a lane could report itself
+  empty while rows were claimable. The jr-dev skills now name
+  `python -m agentflow.registry read --claimable <lane> --project <name>` and describe `lane` as a
+  column; the cross-lane claim ban is kept. The lead-dev, steward and dev-manager
+  `open_issue_page` passages now confirm the old and new value with `agentflow.config show`. A
+  prose test pins both, and parses the cited command through the registry's own parser.
+
+- **choose-next offers drafted and approved epics, and hands `/project` a file that exists.**
+  One predicate, `is_candidate`, now defines the candidate set for the skill and `blocked_status`.
+  `blocks_count` skips dependents whose run is over. MISSING-DEP names a dep spelled as a file
+  stem, and cards flag unapproved picks. `handoff_path` passes the surveyed spec or plan, never a
+  path outside `data_root` or an ambiguous match, instead of a rebuilt path that missed records.
+
+- **The steward never runs a command a refusal names, and trusts a worktree removal only once the
+  directory is gone.** `worktree remove` deregisters a tree even when a shell inside it makes the
+  delete fail, so the note asks the human to close such shells first and the next pass re-runs
+  the guard on the path. A prose test pins both rules.
+
+- **`provision --deploy-only` makes a skill change live without touching any project's data.**
+  It runs step 7 (deploy skills, commands and the hook script into the Claude config dir) alone:
+  no preflight, venv, hooks, presence checks, closing report, and above all no step 11, which
+  seeds every configured project's `data_root` subtree. A lane deploying a `SKILL.md` change had
+  no way to do it without writing into other projects' subtrees, which SCHEMA §6 forbids; that
+  rule now names `--deploy-only` as the lane's path and keeps the full install's scaffold as the
+  one documented exception. `--deploy-only` refuses `--resume-from`, `--autodoc` and
+  `--wake-watch` (usage error, exit 2), since each asks for a step it does not run; the skip
+  flags and `--force` are accepted. `--dry-run --deploy-only` lists step 7 alone. Run it from
+  the primary checkout after the merge lands: deployed skills point into the checkout that ran
+  the deploy, so `--deploy-only` refuses a suite root that is a linked git worktree (exit 2),
+  which would leave every seat pointing at a directory deleted after merge.
+
+- **The auto-allow bootstrap writes `settings.local.json` the way provision does.**
+  `skills/orchestrator/bootstrap.py` now writes the file atomically through the shared
+  `atomic_io` helper, keeps non-ASCII text as UTF-8 instead of `\uXXXX` escapes, and leaves the
+  file untouched (bytes and mtime) when it has no hook to add. Its spelling matches provision's,
+  so the two writers of the one file no longer flip it between CRLF and LF on Windows. Separately,
+  the error raised when a replace retry runs out (`ReplaceRetryExhausted`) names the errno and
+  each path once instead of twice, and keeps the destination path and any Windows error code.
+
+- **`provision.main()` no longer leaks its argv into the next call.** The argv the venv handover
+  passes to the child was a module global that `main()` set and never reset, so a second
+  in-process caller that handed over spawned its child with the first caller's flags (its paths,
+  its `--resume-from`) spliced in. The argv now travels on the run's own `Options.invoked_argv`,
+  so overlapping in-process calls, including calls on different threads, never swap flags. A
+  one-shot command-line install was never affected.
+
+- **Spec-corpus warnings are named apart from config warnings.** `doctor` reports epic-survey
+  problems (a spec with no `## Files` section, a pathless one, a slug collision, and the rest) as
+  `survey:<kind>` WARN findings. They used to end the run, and every install, with "healthy, but
+  NOT everywhere as configured", a config-clamp verdict over a spec problem. A run whose only
+  warnings are `survey:<kind>` now ends `resolved surface healthy and configured as intended; N
+  spec-corpus warning(s) (survey:*)`; a run with config warnings too keeps the config verdict and
+  adds the spec count. The bare `survey` catch-all (a message no kind recognised) still counts as
+  a config warning. Exit codes are unchanged. The steward's resolved-surface step rolls
+  `survey:<kind>` rows up into one line per kind with a count instead of one finding per row.
+
+- **`provision --autodoc` warns instead of refusing.** An explicit `--autodoc` or `--no-autodoc`,
+  and now `AGENTFLOW_AUTODOC` too, is honoured when the resolved config disagrees, with one
+  `WARNING` line naming what decided (the variable's raw value included, so an unrecognised value
+  that reads as off is visible). Only an answer from the config scan, or no answer, is still
+  corrected. The deciding tier is recorded on the install options (`autodoc_source`).
+
 - **Fixed issues are closed by the auditor, never by the seat that built the fix.**
   `python -m agentflow.issue_intake fix-claims --project <name>` lists the open issues a merged PR
   (its title's `gh#N`, a `Source:` line, or a line-start closing keyword) or a done spec's
@@ -18,7 +96,7 @@
   issue reference; a PR from a fork keeps `Closes #N`. lead-dev's merge preflight and orchestrator
   step 7d treat a red provenance gate as not merge-ready.
 
-## 0.3.0 — 2026-09-30 (first public release)
+## 0.3.0 — 2026-09-30 (not published as a release)
 
 Every pull request merged since 0.2.0, grouped by theme; the (#N) numbers are the pull requests each
 line covers, in the maintainers' private working repository (not `agentflow-dev`), which is never
@@ -280,8 +358,10 @@ merged follow, unchanged, under *Entries as recorded*.
   the floor.
 
   **The merged-PR signal was dropped rather than kept for symmetry.** It cost a `gh pr list`
-  round-trip per lane per wake and could say nothing the refs signal does not — a merge moves
-  master, and master is a ref read locally with no fetch. Removing it also removed a whole class
+  round-trip per lane per wake and could say nothing the refs signal does not once that ref is
+  fetched — a merge moves master, and the refs signal reads master's remote-tracking ref locally,
+  as of the checkout's last fetch (a merge nobody has fetched yet reads as no movement until the
+  next fetch). Removing it also removed a whole class
   of inert fleet: with PRs as one of three signals, a fleet with no tracker configured had an
   unreadable signal on every observation and could never reach STILL at all.
 

@@ -126,6 +126,18 @@ class SqliteGraphAdapter(GraphAdapter):
         self._con = con
         self._corpus_id = corpus_id
         self._apply_migrations()
+        if not create:
+            # A read on a mistyped corpus used to insert the row and then report it
+            # empty, sending the reader to rebuild a store that is intact (gh#778).
+            known = [r[0] for r in con.execute("SELECT id FROM corpus ORDER BY id")]
+            if corpus_id not in known:
+                self.close()
+                listed = ", ".join(repr(k) for k in known) or "none"
+                raise AdapterError(
+                    f"no corpus {corpus_id!r} in {self.db_path}; corpora in this store: "
+                    f"{listed}. Check --corpus (only `graph build` creates a corpus)"
+                )
+            return
         con.execute("INSERT OR IGNORE INTO corpus (id) VALUES (?)", (corpus_id,))
         con.commit()
 

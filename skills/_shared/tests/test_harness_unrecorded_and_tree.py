@@ -259,6 +259,47 @@ def test_a_foreign_plan_parser_warns_naming_both(check, ctx, tmp_path, monkeypat
     assert "pip install -e skills/_shared" in warns[0]
 
 
+
+# --- gh#944: C13 under the default skills_root ---------------------------------
+
+
+def _default_root_ctx(check, tmp_path, monkeypatch):
+    """A Context with no skills_root in config or env, so it takes the documented default
+    (~/.claude/skills) - here under a temp home that, like a real install, has no _shared."""
+    import json
+
+    cfg = json.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    del cfg["skills_root"]
+    path = tmp_path / "harness.config.json"
+    path.write_text(json.dumps(cfg), encoding="utf-8")
+    home = tmp_path / "home"
+    monkeypatch.delenv("AGENTFLOW_SKILLS_ROOT", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ctx = check.Context(path)
+    assert ctx.skills_root() == home / ".claude" / "skills", ctx.skills_root()
+    return ctx
+
+
+def test_c13_executes_against_the_clone_under_the_default_skills_root(check, tmp_path, monkeypatch) -> None:
+    """It used to SKIP here blaming a 'pre-port layout', with no unrecorded marker, so the
+    run exited 0 with the precedence check never executed."""
+    ctx = _default_root_ctx(check, tmp_path, monkeypatch)
+    res = check.c13_slash_argument_beats_injected_default(ctx)
+    assert res.status in (check.PASS, check.FAIL), f"C13 did not execute: {res.status} {res.detail}"
+    assert "pre-port" not in res.detail, res.detail
+    assert check.ABSENCE_PASS_EVIDENCE["C13"](ctx), "C13's absence probe still keys on skills_root alone"
+
+
+def test_c13_with_no_package_anywhere_fails_naming_the_cause(check, tmp_path, monkeypatch) -> None:
+    ctx = _default_root_ctx(check, tmp_path, monkeypatch)
+    monkeypatch.setattr(check, "SCRIPT_DIR", tmp_path / "not-a-clone" / "harness")
+    res = check.c13_slash_argument_beats_injected_default(ctx)
+    assert res.status == check.FAIL, f"no package anywhere must not pass clean: {res.status} {res.detail}"
+    assert "skills_root" in res.detail and "_shared" in res.detail, res.detail
+    assert str(ctx.skills_root() / "_shared") in res.detail, res.detail
+    assert "pre-port" not in res.detail, res.detail
+
 # --- the self-test grades the records-absent case -----------------------------
 
 
@@ -440,6 +481,86 @@ def test_malformed_config_json_exits_2_with_a_message(check, tmp_path, capsys) -
     rc, cap = _main(check, [str(bad)], capsys)
     assert rc == 2, (rc, cap)
     assert "harness.config.json" in cap.err and "Traceback" not in cap.err
+
+
+@pytest.mark.parametrize("key", ["orchestrator_skill", "builder_entry"])
+def test_a_config_missing_a_required_key_exits_2_naming_it(check, tmp_path, capsys, key) -> None:
+    """gh#943: a missing key used to crash C6 with KeyError and exit 1 - a config typo
+    reading as a behavioral regression."""
+    import json
+
+    cfg = json.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    del cfg[key]
+    cfg["skills_root"] = str(REPO_ROOT / "skills")
+    bad = tmp_path / "harness.config.json"
+    bad.write_text(json.dumps(cfg), encoding="utf-8")
+    rc, cap = _main(check, [str(bad), "--only", "C,F,G"], capsys)
+    assert rc == 2, (rc, cap)
+    assert key in cap.err and "missing required key" in cap.err, cap.err
+    assert "Traceback" not in cap.err
+
+
+@pytest.mark.parametrize("body, kind", [("[]", "list"), ('"x"', "str")])
+def test_a_non_object_config_exits_2_naming_its_type(check, tmp_path, capsys, body, kind) -> None:
+    bad = tmp_path / "harness.config.json"
+    bad.write_text(body, encoding="utf-8")
+    rc, cap = _main(check, [str(bad)], capsys)
+    assert rc == 2, (rc, cap)
+    assert "must be a JSON object" in cap.err and kind in cap.err, cap.err
+    assert "Traceback" not in cap.err
+
+
+def test_the_example_config_passes_the_shape_check(check) -> None:
+    """Control: the refusal keys on shape, not on every config."""
+    check._check_config_shape(EXAMPLE_CONFIG)
+
+
+@pytest.mark.parametrize(
+    "key, value, expected",
+    [
+        ("status_roots", 5, "list of strings"),
+        # A str is iterable: it used to pass C3 by iterating characters.
+        ("status_roots", "/path/a", "list of strings"),
+        ("status_roots", ["/path/a", 5], "list of strings"),
+        ("builder_entry", ["/lead-dev"], "string"),
+        ("orchestrator_skill", 1, "string"),
+    ],
+)
+def test_a_wrong_typed_required_key_exits_2_naming_key_and_type(check, tmp_path, capsys, key, value, expected) -> None:
+    """gh#989: `"status_roots": 5` crashed C3 with TypeError and exit 1 - a config typo
+    reading as a behavioral regression, the gh#943 shape for a wrong type."""
+    import json
+
+    cfg = json.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    cfg[key] = value
+    cfg["skills_root"] = str(REPO_ROOT / "skills")
+    bad = tmp_path / "harness.config.json"
+    bad.write_text(json.dumps(cfg), encoding="utf-8")
+    rc, cap = _main(check, [str(bad), "--only", "C,F,G"], capsys)
+    assert rc == 2, (rc, cap)
+    assert key in cap.err and expected in cap.err and "wrong type" in cap.err, cap.err
+    assert "Traceback" not in cap.err
+
+
+def test_self_test_fails_a_wrong_typed_required_key(check, monkeypatch, tmp_path) -> None:
+    """The self-test's config step uses the same type check as `check.py <config>`."""
+    import json
+
+    cfg = json.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    cfg["status_roots"] = 5
+    cfg["skills_root"] = str(REPO_ROOT / "skills")
+    bad = tmp_path / "harness.config.json"
+    bad.write_text(json.dumps(cfg), encoding="utf-8")
+    monkeypatch.setattr(check, "run_auditor_scenario", lambda: 0)
+    _no_ambient_records(check, monkeypatch, tmp_path)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = check.run_self_test(bad)
+    out = buf.getvalue()
+    lines = [ln for ln in out.splitlines() if "self-test.config" in ln]
+    assert lines and lines[0].startswith("FAIL") and "status_roots" in lines[0], out
+    assert "list of strings" in lines[0], out
+    assert rc == 1, out
 
 
 def _seed_parseable_b_status(records: Path) -> None:

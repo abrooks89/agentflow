@@ -66,9 +66,10 @@ the process running it.
   command; invoking it on a cadence is the suite's one permitted daemon (the single-daemon rule,
   2026-09-22) and lives in an OS scheduler entry, not in here. This drill registers none and
   reads none. A watcher that is never invoked is silent, and no limb here can see that.
-- **No packet leaves the machine, so delivery is unproven.** `notify()` returns None whether it
-  POSTed, was switched off by `notify.kind: none`, or found no destination in the environment,
-  so no caller anywhere can prove delivery today.
+- **No packet leaves the machine, so delivery is unproven.** `notify()` returns `True` only
+  when the sender returned without raising, and `False` when it was switched off by
+  `notify.kind: none` or found no destination in the environment; even `True` means ntfy
+  accepted the POST, not that a human read it, and the injected sender here posts nothing.
 - **"Outside a loop" is proven to a process boundary and no further.** Whether the machine had
   an agentflow session open while the drill ran is a property of the desktop, not of this code.
 - **The watcher never relaunches a lane, and this drill does not test that it could.** That is

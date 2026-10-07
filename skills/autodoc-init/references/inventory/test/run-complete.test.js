@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -14,6 +14,8 @@ const SHORT = SHA.slice(0, 8);
 function scaffold() {
   const dir = mkdtempSync(join(tmpdir(), 'rc-'));
   mkdirSync(join(dir, 'services'));
+  // The clone the manifest's source_path names: /autodoc-update fetches from it next run.
+  mkdirSync(join(dir, '.source', 'sample-repo', '.git'), { recursive: true });
   writeFileSync(join(dir, 'services', 'Alpha.md'),
     '---\ntype: service\ntitle: "Alpha"\nsource_repo: "example-org/sample-repo"\nsource_paths:\n  - "src/a.py"\n---\n\n# Alpha\n');
   writeFileSync(join(dir, '.manifest.json'), JSON.stringify({
@@ -153,5 +155,50 @@ test('manifest generated_at not YYYY-MM-DD -> non-zero naming generated_at', () 
     m.generated_at = '.*';
     writeFileSync(join(dir, '.manifest.json'), JSON.stringify(m, null, 2));
     expectFail(dir, 'yyyy-mm-dd');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('manifest with no source_path -> non-zero naming source_path', () => {
+  const dir = scaffold();
+  try {
+    const m = JSON.parse(readFileSync(join(dir, '.manifest.json'), 'utf8'));
+    delete m.source_path;
+    writeFileSync(join(dir, '.manifest.json'), JSON.stringify(m, null, 2));
+    expectFail(dir, 'source_path');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('source_path with no .git (the clone did not travel) -> non-zero naming .git', () => {
+  const dir = scaffold();
+  try {
+    rmSync(join(dir, '.source', 'sample-repo', '.git'), { recursive: true, force: true });
+    expectFail(dir, '.git');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('source_path that escapes the autodoc dir -> non-zero naming the escape', () => {
+  const dir = scaffold();
+  // The escaped target HAS a .git, so only the escape guard can reject it, not the .git check.
+  const elsewhere = `${dir}-elsewhere`;
+  try {
+    mkdirSync(join(elsewhere, '.git'), { recursive: true });
+    const m = JSON.parse(readFileSync(join(dir, '.manifest.json'), 'utf8'));
+    m.source_path = `../${basename(elsewhere)}`;
+    writeFileSync(join(dir, '.manifest.json'), JSON.stringify(m, null, 2));
+    expectFail(dir, 'escapes');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(elsewhere, { recursive: true, force: true });
+  }
+});
+
+test('source_path whose stem merely contains .. stays inside -> PASS', () => {
+  const dir = scaffold();
+  try {
+    mkdirSync(join(dir, '.source', 'a..b', '.git'), { recursive: true });
+    const m = JSON.parse(readFileSync(join(dir, '.manifest.json'), 'utf8'));
+    m.source_path = '.source/a..b';
+    writeFileSync(join(dir, '.manifest.json'), JSON.stringify(m, null, 2));
+    assert.match(run(dir), /PASS/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

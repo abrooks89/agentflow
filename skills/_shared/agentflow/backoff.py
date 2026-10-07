@@ -34,16 +34,35 @@ direction: waking too often on a broken probe costs turns, while sleeping five h
 nobody can see costs the epic that was ready the whole time.
 
 WHY THERE IS NO PR SIGNAL, AND WHY NOBODY SHOULD ADD ONE BACK FOR SYMMETRY. An earlier shape of
-this module read merged pull requests as a third signal. It was removed on 2026-09-22 and the
+this module read merged pull requests as a signal of their own. It was removed on 2026-09-22 and the
 reasoning is structural rather than a preference. A merged PR necessarily moves master, and the
 ``refs`` signal reads every remote-tracking ref, master's included, from a local read - so the
 PR leg could only ever confirm something the cheaper signal reports once that ref is fetched. What it cost was a
 ``gh pr list`` network round-trip per lane per wake: six network calls an hour, added to the exact
 per-wake spend this epic exists to reduce. It also had a second failure mode of its own - an
 unreachable tracker made ``prs`` unreadable on EVERY observation, so ``compare`` returned UNKNOWN
-forever and the backoff never engaged at all on a fleet with no tracker configured. Both
-remaining signals are local reads. Keep it that way: a signal is worth its cost only when it can
-say something the others cannot.
+forever and the backoff never engaged at all on a fleet with no tracker configured. All three
+signals are local reads. Keep it that way: a signal is worth its cost only when it can say
+something the others cannot.
+
+WHY ``queue`` IS THE SELECTABLE SET AND NOT THE DISPATCHABLE ONE. ``queue`` fingerprints
+``epic_survey.selectable`` over the archive-inclusive survey - the same call, on the same corpus,
+lead-dev selects from. The dispatchable set is the wrong thing to watch because it is blind to the
+one event that most often hands lead-dev new work: a prerequisite finishing. ``dispatchable``
+drops every record that is not approved or not fleet-buildable, so a prerequisite built by hand
+(an ``on-server-ops`` epic, say) is never in it, and its going to ``done`` leaves the dispatchable
+rows byte-identical while the dependent it unblocks becomes claimable. ``selectable`` is
+dependency-ready by construction, so that dependent ENTERS the set and the fingerprint moves.
+
+WHY ``lanes`` IS ITS OWN SIGNAL. ``queue`` fingerprints the spec-level selectable backlog, which
+is what lead-dev selects from. A junior lane selects from something else: the rows lead-dev
+publishes into the registry's ``## Queue``. Publishing, claiming or releasing such a row leaves
+every spec where it is, so a marker without ``lanes`` reads STILL while a junior's lane holds a
+ready row, and that junior stands down for hours on work it could take now. ``lanes`` reads the
+registry file locally - no network, no lock, no write - and fingerprints each Queue row's id,
+lane, state and claimed_by. It is a separate signal rather than more rows in the ``queue`` digest
+so each probe stays separately guarded and a blind one is named on its own in the ``blind=``
+line.
 
 THE GAP THAT TRADE LEAVES, stated because the local read hides it. ``refs`` reads the checkout's
 remote-tracking refs, which are only as fresh as its last ``git fetch``, and no builder or auditor
@@ -101,6 +120,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
@@ -108,8 +128,8 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 from . import refs
-from .config import WAKE_DELAY_MAX_S, WAKE_DELAY_MIN_S
-from .registry import ETA_HORIZON_HOURS
+from .config import WAKE_DELAY_MAX_S, WAKE_DELAY_MIN_S, ConfigError
+from .registry import ETA_HORIZON_HOURS, RegistryError, parse_registry
 
 # --------------------------------------------------------------------------- #
 # Verdict vocabulary
@@ -125,9 +145,11 @@ UNKNOWN = "unknown"
 
 VERDICTS = (MOVED, STILL, UNKNOWN)
 
-#: The signals a marker carries, in the order a rendered note lists them. BOTH ARE LOCAL READS
+#: The signals a marker carries, in the order a rendered note lists them. ALL ARE LOCAL READS
 #: and that is a requirement, not an accident - see the module docstring on the dropped PR leg.
-SIGNALS = ("refs", "queue")
+#: ``queue`` is the spec backlog lead-dev selects from; ``lanes`` is the registry Queue rows the
+#: junior lanes select from.
+SIGNALS = ("refs", "queue", "lanes")
 
 
 # --------------------------------------------------------------------------- #
@@ -287,7 +309,7 @@ def refs_signal(repo, *, reader=refs.local_tracking_refs) -> Optional[str]:
 
 
 def queue_signal(fingerprints: Optional[Sequence[str]]) -> Optional[str]:
-    """Fingerprint of the dispatchable queue, or None when the survey did not answer.
+    """Fingerprint of the selectable queue, or None when the survey did not answer.
 
     ``None`` and ``()`` are different answers and the difference is the whole point. ``()`` is
     "there are zero claimable rows" - a real measurement, the one the steward took 62 times in
@@ -299,6 +321,33 @@ def queue_signal(fingerprints: Optional[Sequence[str]]) -> Optional[str]:
     return _digest("queue", tuple(fingerprints))
 
 
+def lane_row_fingerprints(rows: Iterable) -> tuple[str, ...]:
+    """One line per registry Queue row: id, lane, state, claimed_by.
+
+    Exactly the four fields a junior's selection turns on, so a publish, claim, release, done or
+    relane moves the fingerprint and nothing else does. The row's notes cell, its work-item text
+    and the board's Notes block are left out: a lane that annotates a row has not changed what
+    any lane can take, and counting it would reset the fleet's streak on every note.
+
+    Reads the attributes BY NAME and lets an ``AttributeError`` escape, for the same reason as
+    ``epic_row_fingerprints``. Sorted, because the board's row order is a presentation choice.
+    """
+    return tuple(sorted(
+        f"{r.id}{_FS}{r.lane}{_FS}{r.state}{_FS}{r.claimed_by}" for r in rows
+    ))
+
+
+def lanes_signal(fingerprints: Optional[Sequence[str]]) -> Optional[str]:
+    """Fingerprint of the registry's Queue rows, or None when the registry could not be read.
+
+    The same ``None``/``()`` split as ``queue_signal``: an empty Queue table is a real, known
+    zero and can drive backoff; an unreadable registry cannot.
+    """
+    if fingerprints is None:
+        return None
+    return _digest("lanes", tuple(fingerprints))
+
+
 # --------------------------------------------------------------------------- #
 # Marker
 # --------------------------------------------------------------------------- #
@@ -308,6 +357,7 @@ class Marker:
 
     refs: Optional[str] = None
     queue: Optional[str] = None
+    lanes: Optional[str] = None
 
     @property
     def unreadable(self) -> tuple[str, ...]:
@@ -323,6 +373,11 @@ class Marker:
 
         A key this shape no longer knows - ``prs``, written by the pre-2026-09-22 module - is
         ignored rather than rejected, so a log spanning the change reads back cleanly.
+
+        A row written before ``lanes`` existed reads back with ``lanes=None``. That makes the
+        next ``compare`` UNKNOWN with ``lanes`` in ``blind_previous`` - one wake, never more,
+        because that wake records a marker that carries ``lanes`` and every later wake compares
+        against it. ``last_marker`` reads the newest row, so the old row is never consulted again.
         """
         return cls(**{name: data.get(name) for name in SIGNALS})
 
@@ -331,6 +386,7 @@ def take_marker(
     *,
     repo=None,
     queue_fingerprints: Optional[Sequence[str]] = None,
+    lane_fingerprints: Optional[Sequence[str]] = None,
     refs_reader=refs.local_tracking_refs,
 ) -> Marker:
     """Assemble a marker from whatever the caller could gather.
@@ -341,6 +397,7 @@ def take_marker(
     return Marker(
         refs=None if repo is None else refs_signal(repo, reader=refs_reader),
         queue=queue_signal(queue_fingerprints),
+        lanes=lanes_signal(lane_fingerprints),
     )
 
 
@@ -874,16 +931,17 @@ GatherNote = str
 def gather_marker(project: str) -> tuple[Marker, list[GatherNote]]:
     """Take a live fleet-wide marker for *project*, plus a note per signal that failed.
 
-    BOTH PROBES ARE LOCAL READS AND NEITHER TOUCHES THE NETWORK. That is a budget, not a
+    ALL THREE PROBES ARE LOCAL READS AND NONE TOUCHES THE NETWORK. That is a budget, not a
     coincidence: this function runs on every idle wake of every lane, so anything it does is
     multiplied by six lanes an hour and charged against the exact spend this epic exists to
     reduce. A ``gh pr list`` leg was here and was removed for precisely that arithmetic - see
     the module docstring - and anything proposed to replace it has to clear the same bar.
 
     EACH SIGNAL IS GUARDED SEPARATELY, and that is the shape of this function. The probes fail
-    independently - a detached checkout, a survey that raises on a malformed spec - and one
-    `try` around both would turn either failure into two unreadable signals, which reads
-    identically to a fleet with no coordinates at all.
+    independently - a detached checkout, a survey that raises on a malformed spec, a registry
+    file that is missing or damaged - and one `try` around all of them would turn any one
+    failure into three unreadable signals, which reads identically to a fleet with no
+    coordinates at all.
 
     The failure is converted into this module's explicit UNKNOWN value rather than swallowed: an
     unreadable signal ends the streak, so the lane returns to base cadence, and the reason rides
@@ -915,21 +973,54 @@ def gather_marker(project: str) -> tuple[Marker, list[GatherNote]]:
         if refs_fp is None and inputs.repo_path is not None:
             notes.append("refs: no remote-tracking refs readable (git failed, or none exist)")
 
-    # 2. queue - the dispatchable rows, exactly as a builder's selection would see them.
+    # 2. queue - exactly lead-dev's selection: `selectable` over the archive-inclusive survey.
+    # `include_archived=True` for selectable's own reason - an archived prerequisite the survey
+    # deleted is one `ready_set` cannot see finished - and `selectable` rather than
+    # `dispatchable` so a prerequisite outside the dispatchable set finishing still moves the
+    # fingerprint (module docstring). Junior lanes select from registry Queue rows instead,
+    # which is the `lanes` signal below.
     queue_fp = None
     try:
-        from .epic_survey import dispatchable, survey_epics
+        from .epic_survey import selectable, survey_epics
 
         records = survey_epics(
-            inputs.data_root, inputs.mtime_cutoff_iso, project=inputs.project
+            inputs.data_root, inputs.mtime_cutoff_iso,
+            include_archived=True, project=inputs.project,
         )
         queue_fp = epic_row_fingerprints(
-            dispatchable(records, inputs.excluded_domains, project=inputs.project)
+            selectable(records, inputs.excluded_domains, project=inputs.project)
         )
     except (OSError, ValueError, AttributeError, KeyError) as exc:
         notes.append(f"queue: {type(exc).__name__}: {exc}")
 
-    return Marker(refs=refs_fp, queue=queue_signal(queue_fp)), notes
+    # 3. lanes - the registry's Queue rows, which the junior lanes select from. A plain file
+    # read and the registry's own parser: no network, no edit lock (reads are lock-free), no
+    # write. `RegistryError` is a damaged board (a missing section), which is unreadable, not
+    # an empty Queue.
+    # `$AGENTFLOW_REGISTRY` naming another board is the conflict the registry CLI itself refuses
+    # (`registry_board_conflict`) when `--project` is also given: the board this probe derives is
+    # then not the one anybody is told to write, so it is unreadable rather than frozen.
+    lanes_fp = None
+    env_board = os.environ.get("AGENTFLOW_REGISTRY")
+    if inputs.registry_path is None:
+        notes.append("lanes: no registry path for this project")
+    elif env_board and Path(env_board).resolve() != Path(inputs.registry_path).resolve():
+        notes.append(
+            f"lanes: registry_board_conflict: $AGENTFLOW_REGISTRY={env_board} but the project "
+            f"names {inputs.registry_path}"
+        )
+    else:
+        try:
+            text = Path(inputs.registry_path).read_text(encoding="utf-8")
+            lanes_fp = lane_row_fingerprints(parse_registry(text).queue.values())
+        except (OSError, ValueError, AttributeError, RegistryError) as exc:
+            # One line: a multi-line message would print continuation lines with no `note:` prefix.
+            notes.append(f"lanes: {type(exc).__name__}: {' '.join(str(exc).split())}")
+
+    return (
+        Marker(refs=refs_fp, queue=queue_signal(queue_fp), lanes=lanes_signal(lanes_fp)),
+        notes,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -974,7 +1065,7 @@ def blind_line(movement: "Movement") -> str:
 
     This probe only, not the previous marker: a blind previous marker is gone by the next wake,
     while a probe that is blind now can be blind on every wake, and that is the state the row has
-    to show. Short by design (17 bytes at worst), so it leaves the rest of the phase cap to the
+    to show. Short by design (22 bytes at worst), so it leaves the rest of the phase cap to the
     lane.
     """
     return "blind=" + (",".join(movement.blind_now) or "-")
@@ -1016,8 +1107,11 @@ def render(movement: "Movement", plan: WakePlan, notes: Sequence[GatherNote]) ->
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """`python -m agentflow.backoff --actor <lane> --project <name>`.
 
-    Exit 0 with a report, or exit 2 when the fleet could not be resolved at all. Two codes and
-    not one: a lane that cannot resolve its own project must not treat a missing report as "no
+    Exit 0 with a report, or exit 2 when the fleet could not be resolved at all or the
+    observation could not be completed (an unreadable config, or an ``OSError`` resolving,
+    writing or reading back the log - the read-back follows the append, so the row may already
+    be recorded). Two codes and not one: a lane that cannot resolve its own project, or
+    whose observation never reached the shared log, must not treat a missing report as "no
     movement" and sleep on it. The refusal still carries an answer line - `action=uncertain`
     with the base cadence - so the lane has the same shape of instruction it would have had on
     success, on stderr where nobody can mistake it for an observation.
@@ -1044,26 +1138,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         marker, notes = gather_marker(args.project)
     except Exception as exc:  # noqa: BLE001 - re-raised as an exit code with its own text
-        sys.stderr.write(
-            f"could not resolve project {args.project!r}: {type(exc).__name__}: {exc}{_NL}"
-            f"fall back to the base idle cadence ({BASE_WAKE_S}s) and say so in your row.{_NL}"
-            # Nothing was gathered, so every signal is blind; the lane reads this line on every
-            # path, so it has to be here too.
-            f"blind={','.join(SIGNALS)}{_NL}"
-            f"{answer_line(uncertain_plan())}{_NL}"
-        )
-        return 2
+        return _refuse(f"could not resolve project {args.project!r}: {type(exc).__name__}: {exc}")
 
-    if args.data_root is not None:
-        root = Path(args.data_root)
-    else:
-        from .fleet_report import inputs_from_config
+    # The log root and the append are guarded too, and narrowly. An unwritable data root, a
+    # sharing violation, or a FILE where `status/` should be (an `OSError` from `record`'s mkdir:
+    # `FileExistsError` on Windows, `NotADirectoryError` on POSIX) is an observation that could
+    # not be completed; a traceback there leaves the lane with
+    # no answer line at all, which is the one outcome the exit-2 contract exists to rule out.
+    # `ConfigError` is what re-resolving the root raises if the config changed under us; every
+    # other exception is a bug here and keeps its traceback.
+    try:
+        if args.data_root is not None:
+            root = Path(args.data_root)
+        else:
+            from .fleet_report import inputs_from_config
 
-        root = Path(inputs_from_config(args.project).data_root)
-
-    movement, plan = observe(log_path(root, args.project), marker, args.actor)
+            root = Path(inputs_from_config(args.project).data_root)
+        movement, plan = observe(log_path(root, args.project), marker, args.actor)
+    except (OSError, ConfigError) as exc:
+        return _refuse(f"could not complete the observation: {type(exc).__name__}: {exc}")
     sys.stdout.write(render(movement, plan, notes))
     return 0
+
+
+def _refuse(reason: str) -> int:
+    """Write the exit-2 block to stderr and return 2: the reason, the fallback, the answer line."""
+    sys.stderr.write(
+        f"{reason}{_NL}"
+        f"fall back to the base idle cadence ({BASE_WAKE_S}s) and say so in your row.{_NL}"
+        # No observation was taken or recorded, so every signal is blind; the lane reads this
+        # line on every path, so it has to be here too.
+        f"blind={','.join(SIGNALS)}{_NL}"
+        f"{answer_line(uncertain_plan())}{_NL}"
+    )
+    return 2
 
 
 if __name__ == "__main__":  # pragma: no cover - thin CLI shim

@@ -398,7 +398,11 @@ def test_a_BLIND_row_counts_as_a_finding(env, captured, capsys):
 
 
 def test_an_all_clear_over_a_board_where_NOTHING_WAS_JUDGED_says_so(env, captured, capsys):
-    """Stand every lane down and the watcher must not report full health.
+    """Stand every lane down that `stand-down` accepts and the watcher must not report full health.
+
+    The steward cannot stand down its own row (`stand_down_self`) nor an ETA-horizon-exempt
+    seat (`stand_down_exempt_seat`); neither declares an eta on the fixture board, so neither is
+    judged and the run still checks nothing.
 
     This is the false green the in-sweep report already guards and this one did not. Every row
     is excluded, so `missed` and `blind` are both empty and the old wording read
@@ -406,7 +410,8 @@ def test_an_all_clear_over_a_board_where_NOTHING_WAS_JUDGED_says_so(env, capture
     judged NOTHING. A false green from the outside watcher is worse than one from the sweep,
     because nothing else is looking.
     """
-    lanes = list(registry.parse_registry(env.text()).agents)
+    lanes = [lane for lane in registry.parse_registry(env.text()).agents
+             if lane != "steward" and lane not in registry.ETA_HORIZON_EXEMPT]
     for lane in lanes:
         assert env.run("stand-down", "--actor", "steward", "--agent", lane,
                        "--reason", "quiet window for a migration") == 0

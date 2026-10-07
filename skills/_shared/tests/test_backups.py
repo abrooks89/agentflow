@@ -752,6 +752,22 @@ def test_a_project_that_is_not_a_single_segment_is_refused(tmp_path, monkeypatch
     capsys.readouterr()
 
 
+@pytest.mark.parametrize("keep", ["0", "-1", "abc"])
+def test_a_keep_below_one_is_a_bad_invocation_not_an_unbounded_tree(
+    tmp_path, monkeypatch, capsys, keep
+):
+    """`--keep 0` escaped `plan_reap`'s ValueError as a traceback on exit 1, the code the
+    steward routes as "not bounded". A bad flag must exit 2 with a message, before any plan."""
+    _group(tmp_path / "projects" / "alpha" / "status", "registry.md", 4)
+    _fake_data_root(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        bk.main(["reap", "--keep", keep])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--keep" in err
+    assert "Traceback" not in err
+
+
 def test_the_CLI_new_subcommand_claims_the_path_it_prints(tmp_path, capsys):
     """`new` is the writer-side entry point named by both SKILL.md files. It prints a path
     AND creates it, because a printed-but-unclaimed path is the race `next_backup_path`

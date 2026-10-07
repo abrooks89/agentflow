@@ -340,6 +340,41 @@ def test_cli_refuses_both_modes_at_once(tree):
     assert _digest(tree) == before
 
 
+@pytest.mark.parametrize("mode", ["--dry-run", "--apply"])
+def test_cli_refuses_a_project_with_no_directory_in_either_mode(tree, capsys, mode):
+    """A typo must not read as a migrated corpus: `scanned=0 to_rewrite=0`, exit 0, is
+    exactly what a finished migration prints, while the real corpus stays unmigrated."""
+    before = _digest(tree)
+    rc = mq.main(["--project", "alhpa", mode, "--data-root", str(tree)])
+    assert rc == 2
+    assert _digest(tree) == before
+    captured = capsys.readouterr()
+    assert "scanned=" not in captured.out, "a refused run still printed a report"
+    assert "'alhpa'" in captured.err
+    assert str(tree / "projects" / "alhpa") in captured.err
+
+
+@pytest.mark.parametrize("name", ["..", "", "../alpha", "alpha/design"])
+def test_cli_refuses_a_path_shaped_project_name_without_a_traceback(tree, capsys, name):
+    """`..` and "" resolve to directories that exist (the data root, projects/ itself), so
+    only a shape check stops them before the survey raises."""
+    before = _digest(tree)
+    rc = mq.main(["--project", name, "--dry-run", "--data-root", str(tree)])
+    assert rc == 2
+    assert _digest(tree) == before
+    captured = capsys.readouterr()
+    assert "scanned=" not in captured.out
+    assert "Refusing to run" in captured.err
+
+
+def test_cli_an_existing_project_with_nothing_to_migrate_still_succeeds(tree, capsys):
+    """Control: the refusal keys on the directory, not on finding work."""
+    (tree / "projects" / "gamma").mkdir(parents=True)
+    rc = mq.main(["--project", "gamma", "--dry-run", "--data-root", str(tree)])
+    assert rc == 0
+    assert "scanned=0" in capsys.readouterr().out
+
+
 # --------------------------------------------------------------------------- #
 # The invariant vocabulary.py deliberately guards by test rather than by import
 # --------------------------------------------------------------------------- #

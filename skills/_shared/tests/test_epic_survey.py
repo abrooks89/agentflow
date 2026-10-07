@@ -790,8 +790,7 @@ def _bom_spec(root: Path, slug: str, state: str = "done") -> Path:
     """A perfectly ordinary spec, saved by a tool that writes a UTF-8 BOM.
 
     Not exotic on this fleet: PowerShell's `Out-File` and `Set-Content -Encoding utf8` both
-    write one by default, and the byte is invisible in every editor. The frontmatter regex is
-    anchored at `^---`, so the BOM makes a well-formed spec parse as "no frontmatter at all".
+    write one by default, and the byte is invisible in every editor.
     """
     p = root / "projects" / "proj" / "design" / "specs" / f"{slug}.md"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -816,7 +815,6 @@ def _unterminated_spec(root: Path, slug: str) -> Path:
 @pytest.mark.parametrize(
     "make_broken, label",
     [
-        (_bom_spec, "bom-before-frontmatter"),
         (_non_mapping_spec, "non-mapping-frontmatter"),
         (_unterminated_spec, "unterminated-block"),
     ],
@@ -830,7 +828,7 @@ def test_a_spec_that_OPENS_a_frontmatter_block_is_broken_not_frontmatterless(
     that OPENS a block the parser then refused is broken - and reading it as "no frontmatter"
     hands back `current_state=None`, which is not terminal, so the plan sidecar promotes and
     issue #42 reopens through a file whose `current_state: done` any human can read. The BOM
-    case is the live one on a Windows fleet: the byte is invisible and `Out-File` writes it.
+    is not one of these: it is decoded away and the spec reads normally (test below).
 
     Asserted STALE and FRESH together because that asymmetry is the trap: the same file, the
     same corruption, and a disposition decided purely by mtime is not a safety property.
@@ -847,6 +845,55 @@ def test_a_spec_that_OPENS_a_frontmatter_block_is_broken_not_frontmatterless(
         recs = survey_epics(root, PAST_CUTOFF, include_archived=True)
         assert "opaque" not in _by_slug(recs), (label, stale)
         assert {r.slug for r in selectable(recs)} == {"healthy"}, (label, stale)
+
+
+def test_a_BOM_spec_is_READ_not_broken_and_its_done_state_holds(tmp_path: Path):
+    """A UTF-8 BOM is an encoding detail, not damage: the spec reads exactly as without it.
+
+    The BOM'd `current_state: done` must come back as done and keep its approved plan from
+    promoting, stale and fresh alike - the stale pass re-reads the block a second time, so a
+    reader there that kept the BOM would fail closed on a file the parser just accepted.
+    """
+    for stale in (True, False):
+        root = tmp_path / ("stale" if stale else "fresh")
+        spec = _bom_spec(root, "shipped")
+        if stale:
+            _age(spec)
+        make_plan(root, "proj", "shipped", frontmatter="current_state: approved-for-autonomous\n")
+        make_spec(root, "proj", "healthy", frontmatter="current_state: drafted\n")
+        make_plan(root, "proj", "healthy", frontmatter="current_state: approved-for-autonomous\n")
+
+        recs = survey_epics(root, PAST_CUTOFF, include_archived=True)
+        assert _by_slug(recs)["shipped"].current_state == "done", stale
+        assert {r.slug for r in selectable(recs)} == {"healthy"}, stale
+
+
+def test_the_sidecar_reads_a_BOM_spec_the_same_as_its_BOMLESS_bytes(tmp_path: Path):
+    body = (
+        b"---\nslug: s\npriority: 3\ndomain: infra\nproject: proj\n"
+        b"queue_class: feature\nbuild_approved_by: a human\n---\n\nbody\n"
+    )
+    plain = tmp_path / "plain.md"
+    plain.write_bytes(body)
+    bom = tmp_path / "bom.md"
+    bom.write_bytes(codecs.BOM_UTF8 + body)
+
+    expected = (3.0, "infra", "proj", "feature", "a human")
+    assert _survey._read_sidecar(plain) == expected
+    assert _survey._read_sidecar(bom) == expected
+
+
+def test_a_BOM_does_not_hide_a_Files_heading_on_the_first_line(tmp_path: Path):
+    # Frontmatter-less, so the heading is the first line and the BOM sits directly ahead of it,
+    # where the line-anchored heading match cannot see past it.
+    body = b"## Files\n\n- `src/widget.py`\n"
+    plain = tmp_path / "plain.md"
+    plain.write_bytes(body)
+    bom = tmp_path / "bom.md"
+    bom.write_bytes(codecs.BOM_UTF8 + body)
+
+    assert _survey._spec_declares_files(plain) is True
+    assert _survey._spec_declares_files(bom) is True
 
 
 def test_a_FRESH_spec_pass_1_REJECTED_cannot_be_promoted_by_its_plan(tmp_path: Path, caplog):
@@ -1014,7 +1061,7 @@ def test_an_undecodable_neighbour_does_not_cost_a_GOOD_spec_its_sidecar_fields(t
     "payload, parses, label",
     [
         (b"---\nslug: p\npriority: 3\n---\n\nbody\n", True, "clean-utf8"),
-        (codecs.BOM_UTF8 + b"---\nslug: p\npriority: 3\n---\n\nbody\n", False, "utf8-bom"),
+        (codecs.BOM_UTF8 + b"---\nslug: p\npriority: 3\n---\n\nbody\n", True, "utf8-bom"),
         (b"\xff\xfe---\x00\x81\x8f\xfe\xff title: bad\n", False, "utf16-bom"),
         (b"---\nslug: p\npriority: 3\n---\n\nbody \x9a here\n", False, "bad-byte-in-body"),
     ],
@@ -1899,6 +1946,74 @@ def test_selectable_still_blocks_an_unmet_dependency():
     kid = EpicRecord(slug="kid", title="k", lifecycle_state="approved-for-autonomous",
                      current_state=APPROVED_CURRENT_STATE, depends_on=["dep"])
     assert selectable([dep, kid]) == []
+
+
+# --------------------------------------------------------------------------- #
+# APPROVAL IS NOT COMPLETION: selectable() drops a run that has ENDED.
+#
+# A spec left at `approved-for-autonomous` after its status board finished (or was abandoned,
+# failed, or parked for a human merge) used to re-enter builder selection, with only a prose
+# cross-check between it and a second build. The drop is on the OUTPUT, so the done-set the
+# dependency math reads is untouched.
+# --------------------------------------------------------------------------- #
+ENDED_BOARD_STATUSES = ("done", "done_on_hold", "abandoned", "failed")
+
+
+def _approved_at(slug: str, lifecycle_state: str, **kw) -> EpicRecord:
+    return EpicRecord(slug=slug, title=slug, lifecycle_state=lifecycle_state,
+                      current_state=APPROVED_CURRENT_STATE, **kw)
+
+
+@pytest.mark.parametrize("ended", ["done", "done_on_hold"])
+def test_an_approved_spec_whose_board_ended_is_not_selectable_and_is_named(
+    tmp_path: Path, caplog, ended: str
+):
+    """Through the real survey: approved frontmatter, ended board -> dropped, and named."""
+    make_spec(tmp_path, "proj", "stale", frontmatter=APPROVED)
+    make_status(tmp_path, "proj", "stale", status=ended, done=2, total=2)
+    make_spec(tmp_path, "proj", "live", frontmatter=APPROVED)
+
+    recs = survey_epics(tmp_path, PAST_CUTOFF)
+    assert _by_slug(recs)["stale"].lifecycle_state == ended
+    with caplog.at_level("WARNING"):
+        picked = [r.slug for r in selectable(recs)]
+    assert picked == ["live"]
+    named = [m for m in (r.getMessage() for r in caplog.records)
+             if "run ended" in m and "'stale'" in m]
+    assert len(named) == 1, [r.getMessage() for r in caplog.records]
+    assert ended in named[0]
+
+
+@pytest.mark.parametrize("ended", tuple(sorted(set(ENDED_BOARD_STATUSES) | set(FINISHED_STATES))))
+def test_every_ended_lifecycle_state_is_dropped(ended: str):
+    assert selectable([_approved_at("stale", ended)]) == []
+
+
+@pytest.mark.parametrize("ended", ENDED_BOARD_STATUSES)
+def test_dropping_an_ended_board_leaves_the_dependency_math_whole(ended: str):
+    """A dependant reads the dropped record exactly as ready_set does without the drop.
+
+    `done` satisfies the edge (it is in the done-set), so the child is selectable.
+    `done_on_hold` / `abandoned` / `failed` never satisfied an edge, and still do not.
+    """
+    parent = _approved_at("parent", ended)
+    kid = _approved_at("kid", "approved-for-autonomous", depends_on=["parent"])
+    expected = ["kid"] if ended in TERMINAL_CURRENT_STATES else []
+    assert [r.slug for r in ready_set([parent, kid]) if r.slug == "kid"] == expected
+    assert [r.slug for r in selectable([parent, kid])] == expected
+
+
+@pytest.mark.parametrize("board", ["running", "blocked", None])
+def test_an_approved_spec_with_a_live_or_absent_board_is_unchanged(
+    tmp_path: Path, caplog, board
+):
+    make_spec(tmp_path, "proj", "e", frontmatter=APPROVED)
+    if board is not None:
+        make_status(tmp_path, "proj", "e", status=board)
+    recs = survey_epics(tmp_path, PAST_CUTOFF)
+    with caplog.at_level("WARNING"):
+        assert [r.slug for r in selectable(recs)] == ["e"]
+    assert not any("run ended" in r.getMessage() for r in caplog.records)
 
 
 def test_selectable_orders_by_priority_lowest_first():
@@ -3317,6 +3432,23 @@ def test_reaching_into_done_does_not_make_location_a_substitute_for_approval(tmp
     assert [r.slug for r in selectable(recs, project="alpha")] == []  # ...claimable by nobody
 
 
+def test_moving_an_approved_spec_into_archived_does_not_withdraw_its_approval(tmp_path):
+    """The mirror of the test above (gh#233). Location neither grants approval NOR revokes
+    it: frontmatter is the source, so an `approved-for-autonomous` spec sitting in
+    `archived/` stays dispatchable, and `reconcile` plans its move back to the bucket root.
+    Withdrawing approval is an edit to `current_state`, never a file move."""
+    from agentflow.reconcile import plan_reconcile
+
+    relocate(make_spec(tmp_path, "alpha", "misplaced", frontmatter=APPROVED), "archived")
+
+    recs = survey_epics(tmp_path, PAST_CUTOFF)  # the default filter, not include_archived
+    assert [r.slug for r in selectable(recs, project="alpha")] == ["misplaced"]
+
+    plan = plan_reconcile(tmp_path, "alpha")
+    assert [(m.source, m.dest) for m in plan.moves] == [("archived", "")]
+    assert plan.moves[0].target.parent.name == "specs"
+
+
 # --------------------------------------------------------------------------- #
 # The `## Files` promotion precondition, reported by the survey (gh#294)
 #
@@ -4515,22 +4647,30 @@ def test_no_suppression_stands_between_the_declaration_and_the_assignment():
 
 
 def test_a_state_the_precedence_table_does_not_name_keeps_the_prior_value():
-    """The gap gh#326 says the closed-vocabulary decision would settle, pinned as behaviour.
+    """The unranked rule decided on gh#377 (open passthrough, no closed vocabulary), pinned.
 
-    `_LIFECYCLE_PRECEDENCE` names five values; thirteen observed ones are absent, so for two
-    unnamed states the comparison is `-999 > -999` and `_promote` keeps `prior`. That is the
-    documented consequence, not an accident — `_merge_spec_record` guards the case that matters
-    with an explicit terminal check precisely because this default cannot rank them.
+    `_LIFECYCLE_PRECEDENCE` names five values; every other observed value ranks
+    `_UNRANKED_PRECEDENCE`, below all five. So an unranked value never outranks a ranked one, and
+    between two unranked values `_promote` keeps `prior`. `_merge_spec_record` guards the case that
+    matters (a terminal state) with an explicit terminal check, because this rank cannot order
+    terminal values.
 
-    Pinned so that a future closed-vocabulary mapping, which WOULD change this, has to change a
-    test that says why rather than silently altering merge outcomes.
+    Pinned so that a future change to the rule has to change a test that says why rather than
+    silently altering merge outcomes.
     """
     assert set(_survey._LIFECYCLE_PRECEDENCE) == {
         "speccing", "planning", "running", "done", "archived",
     }
+    assert _survey._UNRANKED_PRECEDENCE < min(_survey._LIFECYCLE_PRECEDENCE.values())
+    # Two unranked values: the prior wins, in both orders.
     assert _survey._promote("drafted", "pinned") == "drafted"
     assert _survey._promote("pinned", "drafted") == "pinned"
-    # ...while a named value still outranks an unnamed one in the direction the table defines.
+    # Ranked vs unranked, in both orders: the ranked value wins.
+    assert _survey._promote("running", "drafted") == "running"
+    assert _survey._promote("drafted", "running") == "running"
+    # `archived` ranks -1, still above every unranked value.
+    assert _survey._promote("drafted", "archived") == "archived"
+    # Two ranked values follow the table.
     assert _survey._promote("speccing", "done") == "done"
 
 
@@ -5376,3 +5516,262 @@ def test_a_BOM_prefixed_done_spec_is_still_judged(tmp_path: Path):
     spec.write_bytes(b"\xef\xbb\xbf" + spec.read_bytes())
     found = _survey.warn_unresolved_done_spec_paths(tmp_path)
     assert [(u.slug, u.kind) for u in found] == [("shipped", _survey.POINTER_DEPTH_SHIFT)]
+
+
+# --------------------------------------------------------------------------- #
+# gh#1072 (A): a board's `status:` goes through `_norm_state`, the normaliser spec
+# frontmatter uses, so a hand-edited `Done` / `Abandoned` / quoted ` done ` reads as the
+# value it plainly is. A value outside the board vocabulary is NOT guessed at: it surveys as
+# `UNRECOGNISED_BOARD_STATUS`, is named once by the survey, satisfies no dependency, and
+# `selectable` refuses it. Before this it read as `running` - silently selectable.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "written, expected",
+    [
+        ("Done", "done"),
+        ("DONE", "done"),
+        ("'  done  '", "done"),
+        ("Abandoned", "abandoned"),
+        ("Failed", "failed"),
+        ("Done_On_Hold", "done_on_hold"),
+    ],
+)
+def test_a_hand_edited_board_status_is_normalised_and_its_ended_run_is_not_selectable(
+    tmp_path: Path, caplog, written: str, expected: str
+):
+    make_spec(tmp_path, "proj", "stale", frontmatter=APPROVED)
+    make_status(tmp_path, "proj", "stale", status=written, done=2, total=2)
+    recs = survey_epics(tmp_path, PAST_CUTOFF)
+    assert _by_slug(recs)["stale"].lifecycle_state == expected
+    with caplog.at_level("WARNING"):
+        assert selectable(recs) == []
+    assert any("run ended" in r.getMessage() and "'stale'" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_a_normalised_done_board_satisfies_its_dependants(tmp_path: Path):
+    make_spec(tmp_path, "proj", "parent", frontmatter=APPROVED)
+    make_status(tmp_path, "proj", "parent", status="Done", done=1, total=1)
+    make_spec(tmp_path, "proj", "kid", frontmatter=APPROVED + "depends_on: [parent]\n")
+    recs = survey_epics(tmp_path, PAST_CUTOFF)
+    assert [r.slug for r in selectable(recs)] == ["kid"]
+
+
+@pytest.mark.parametrize("written", ["completed", "merged", "Completed", "yes", "null"])
+def test_an_out_of_vocabulary_board_status_is_not_guessed_and_fails_closed(
+    tmp_path: Path, caplog, written: str
+):
+    """`completed` / `merged` are not board vocabulary. Not `done`, not `running`: unrecognised.
+
+    `yes` is a YAML bool and `null` is None - neither is a status string at all.
+    """
+    make_spec(tmp_path, "proj", "odd", frontmatter=APPROVED)
+    board = make_status(tmp_path, "proj", "odd", status=written, done=2, total=2)
+    make_spec(tmp_path, "proj", "kid", frontmatter=APPROVED + "depends_on: [odd]\n")
+    with caplog.at_level("WARNING"):
+        recs = survey_epics(tmp_path, PAST_CUTOFF)
+    odd = _by_slug(recs)["odd"]
+    assert odd.lifecycle_state == _survey.UNRECOGNISED_BOARD_STATUS
+    named = [r.getMessage() for r in caplog.records
+             if "unrecognised board status" in r.getMessage()]
+    assert len(named) == 1, [r.getMessage() for r in caplog.records]
+    assert str(board) in named[0]
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        picked = [r.slug for r in selectable(recs)]
+    # Neither the board's own epic (fail closed) nor its dependant (not satisfied) is offered.
+    assert picked == []
+    dropped = [r.getMessage() for r in caplog.records
+               if "not selectable" in r.getMessage() and "'odd'" in r.getMessage()]
+    assert len(dropped) == 1, [r.getMessage() for r in caplog.records]
+
+
+def test_a_known_live_board_status_is_still_running_and_silent(tmp_path: Path, caplog):
+    make_spec(tmp_path, "proj", "e", frontmatter=APPROVED)
+    make_status(tmp_path, "proj", "e", status="Escalation")
+    with caplog.at_level("WARNING"):
+        recs = survey_epics(tmp_path, PAST_CUTOFF)
+    assert _by_slug(recs)["e"].lifecycle_state == "running"
+    assert not any("unrecognised board status" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# gh#1072 (B): more than one board for one slug is REFUSED, not resolved. No mtime winner and
+# no path-sort winner: the record reads `DUPLICATE_STATUS_BOARDS`, is neither selectable nor
+# done, a dependant buckets MISSING-DEP, and the survey names every board. Boards in different
+# projects are not called stale, because they may be different epics sharing a slug.
+# --------------------------------------------------------------------------- #
+def _backdate(path: Path, seconds_ago: int) -> None:
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns - seconds_ago * 1_000_000_000))
+
+
+@pytest.mark.parametrize("old_dir_named", [False, True])
+@pytest.mark.parametrize("statuses", [("done", "running"), ("done", "done"), ("running", "done")])
+def test_duplicate_boards_are_refused_neither_selectable_nor_done(
+    tmp_path: Path, caplog, old_dir_named: bool, statuses: tuple[str, str]
+):
+    old_status, new_status = statuses
+    make_spec(tmp_path, "proj", "twice", frontmatter=APPROVED)
+    old = make_status(tmp_path, "proj", "twice", status=old_status, done=2, total=2,
+                      dir_named=old_dir_named)
+    new = make_status(tmp_path, "proj", "twice", status=new_status, done=2, total=2,
+                      dir_named=not old_dir_named)
+    _backdate(old, 3600)
+    make_spec(tmp_path, "proj", "kid", frontmatter=APPROVED + "depends_on: [twice]\n")
+
+    with caplog.at_level("WARNING"):
+        recs = survey_epics(tmp_path, PAST_CUTOFF)
+    rec = _by_slug(recs)["twice"]
+    assert rec.lifecycle_state == _survey.DUPLICATE_STATUS_BOARDS
+    assert rec.source_path not in (str(old), str(new)), "no board may be presented as the one read"
+    dup = [r.getMessage() for r in caplog.records if "duplicate status boards" in r.getMessage()]
+    assert len(dup) == 1, [r.getMessage() for r in caplog.records]
+    assert str(old) in dup[0] and str(new) in dup[0]
+    assert "delete or move the stale one" in dup[0]
+
+    # Not done: the dependant is not released, and buckets MISSING-DEP.
+    assert "twice" not in _survey._done_slugs(recs)
+    assert blocked_status(_by_slug(recs)["kid"], recs) == "MISSING-DEP"
+    # Not selectable, and the refusal is named.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert selectable(recs) == []
+    assert any("duplicate status boards, not selectable" in r.getMessage()
+               and "'twice'" in r.getMessage() for r in caplog.records)
+
+
+def test_duplicate_boards_across_projects_are_named_without_delete_advice(
+    tmp_path: Path, caplog
+):
+    a = make_status(tmp_path, "alpha", "shared", status="running")
+    b = make_status(tmp_path, "beta", "shared", status="running")
+    with caplog.at_level("WARNING"):
+        recs = survey_epics(tmp_path, PAST_CUTOFF)
+    assert _by_slug(recs)["shared"].lifecycle_state == _survey.DUPLICATE_STATUS_BOARDS
+    dup = [r.getMessage() for r in caplog.records if "duplicate status boards" in r.getMessage()]
+    assert len(dup) == 1, [r.getMessage() for r in caplog.records]
+    assert str(a) in dup[0] and str(b) in dup[0]
+    assert "different projects (alpha, beta)" in dup[0]
+    assert "delete or move" not in dup[0]
+
+
+def test_a_single_board_emits_no_duplicate_warning(tmp_path: Path, caplog):
+    make_status(tmp_path, "proj", "solo", status="running")
+    with caplog.at_level("WARNING"):
+        recs = survey_epics(tmp_path, PAST_CUTOFF)
+    assert _by_slug(recs)["solo"].lifecycle_state == "running"
+    assert not any("duplicate status boards" in r.getMessage() for r in caplog.records)
+
+
+def test_a_board_that_vanished_before_stat_does_not_make_a_duplicate(
+    tmp_path: Path, caplog, monkeypatch
+):
+    real = make_status(tmp_path, "proj", "e", status="done", done=1, total=1)
+    ghost = real.parent / "e" / "status.md"   # listed by the walk, gone by the stat
+    listed = _survey._status_boards_under
+
+    def with_ghost(status_root: Path) -> dict:
+        boards = listed(status_root)
+        boards.setdefault("e", set()).add(ghost)
+        return boards
+
+    monkeypatch.setattr(_survey, "_status_boards_under", with_ghost)
+    with caplog.at_level("WARNING"):
+        recs = survey_epics(tmp_path, PAST_CUTOFF)
+    rec = _by_slug(recs)["e"]
+    assert rec.lifecycle_state == "done"
+    assert rec.source_path == str(real)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("vanished before stat" in m and str(ghost) in m for m in msgs), msgs
+    assert not any("duplicate status boards" in m for m in msgs), msgs
+
+
+def test_a_dependant_of_an_unrecognised_board_is_missing_dep(tmp_path: Path):
+    make_spec(tmp_path, "proj", "odd", frontmatter=APPROVED)
+    make_status(tmp_path, "proj", "odd", status="completed", done=2, total=2)
+    make_spec(tmp_path, "proj", "kid", frontmatter=APPROVED + "depends_on: [odd]\n")
+    recs = survey_epics(tmp_path, PAST_CUTOFF)
+    assert _by_slug(recs)["odd"].lifecycle_state == _survey.UNRECOGNISED_BOARD_STATUS
+    assert blocked_status(_by_slug(recs)["kid"], recs) == "MISSING-DEP"
+
+
+def test_a_non_string_board_status_logs_only_the_board_line(tmp_path: Path, caplog):
+    """`status: yes` is a YAML bool. The line that names it is the board's, not current_state's."""
+    make_status(tmp_path, "proj", "odd", status="yes")
+    with caplog.at_level("WARNING"):
+        survey_epics(tmp_path, PAST_CUTOFF)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("unrecognised board status True" in m for m in msgs), msgs
+    assert not any("current_state" in m for m in msgs), msgs
+
+
+def test_a_terminal_spec_with_duplicate_boards_is_not_called_permanently_stranded(
+    tmp_path: Path, caplog
+):
+    """A `done` spec with two `done` boards: the fix is deleting a board, not reconciling.
+
+    Pass 3 names the boards and `blocked_status` buckets the dependant MISSING-DEP, so the
+    stranded channel stays silent rather than prescribe the wrong remedy.
+    """
+    make_spec(tmp_path, "proj", "parent", frontmatter="current_state: done\n")
+    make_status(tmp_path, "proj", "parent", status="done", done=1, total=1)
+    make_status(tmp_path, "proj", "parent", status="done", done=1, total=1, dir_named=True)
+    make_spec(tmp_path, "proj", "kid", frontmatter=APPROVED + "depends_on: [parent]\n")
+    with caplog.at_level("WARNING"):
+        recs = survey_epics(tmp_path, PAST_CUTOFF)
+        selectable(recs)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert _by_slug(recs)["parent"].lifecycle_state == _survey.DUPLICATE_STATUS_BOARDS
+    assert any("duplicate status boards for 'parent'" in m for m in msgs), msgs
+    assert not any("blocked permanently" in m for m in msgs), msgs
+    assert blocked_status(_by_slug(recs)["kid"], recs) == "MISSING-DEP"
+
+
+def test_the_unselectable_set_is_the_ended_set_plus_the_unreadable_boards():
+    assert _survey.UNSELECTABLE_LIFECYCLE_STATES == (
+        _survey.ENDED_LIFECYCLE_STATES
+        | {_survey.UNRECOGNISED_BOARD_STATUS, _survey.DUPLICATE_STATUS_BOARDS}
+    )
+
+
+# --------------------------------------------------------------------------- #
+# gh#1059: a standalone writing-plans plan carries no frontmatter at all. It is not an epic
+# plan, so the plan pass skips it the way pass 3 skips a status.md without the `epic:`
+# signature - with no WARNING, because every survey WARNING becomes a doctor finding and this
+# file fires on every run. A plan that OPENS a `---` block the parser rejects is still broken.
+# --------------------------------------------------------------------------- #
+def test_a_frontmatter_less_plan_is_skipped_without_a_warning_on_every_run(
+    tmp_path: Path, caplog
+):
+    make_spec(tmp_path, "proj", "e", frontmatter=APPROVED)
+    plan = _write(tmp_path / "projects" / "proj" / "design" / "plans" / "e-writing-plan.md",
+                  "# e implementation plan\n\n## Task 1\n\nDo the thing.\n")
+    for _ in range(2):
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            recs = survey_epics(tmp_path, PAST_CUTOFF)
+        assert [r.getMessage() for r in caplog.records if str(plan) in r.getMessage()] == []
+        assert sorted(r.slug for r in recs) == ["e"]
+        assert _by_slug(recs)["e"].lifecycle_state == "approved-for-autonomous"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "---\nslug: [unclosed\n---\n\nbody\n",            # YAML error
+        "---\nepic: x\nslug: x\nphases: [p]\ntasks:\n  1:\n    phase: p\n    deps: [9]\n---\n",  # DAG
+        "---\n- not\n- a mapping\n---\n\nbody\n",          # non-mapping block
+        "﻿---\nslug: [unclosed\n---\n\nbody\n",       # BOM ahead of a broken block
+    ],
+)
+def test_a_plan_whose_frontmatter_is_present_but_broken_is_still_malformed(
+    tmp_path: Path, caplog, body: str
+):
+    plan = _write(tmp_path / "projects" / "proj" / "design" / "plans" / "x.md", body)
+    with caplog.at_level("WARNING"):
+        survey_epics(tmp_path, PAST_CUTOFF)
+    skips = [r.getMessage() for r in caplog.records if "malformed plan" in r.getMessage()]
+    assert len(skips) == 1, [r.getMessage() for r in caplog.records]
+    assert str(plan) in skips[0]

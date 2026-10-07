@@ -27,7 +27,7 @@ You receive three paths (resolved by the caller):
 
 Use `Read` to load the first two. Both are required; if either is missing, return a single escalation describing the missing file and `deadlock: true`.
 
-`worktree_path` is resolved by the caller in this order and no other: **the plan's frontmatter `worktree:` field when it declares one; otherwise the documented layout `<worktree_root>/<project>/<epic-slug>`.** The declared field wins because an epic resumed from a differently-named worktree — or one a human created by hand — sits somewhere the computed layout would never guess, and computing over a stated path is exactly the ambient-beats-stated failure every `-C` below exists to remove.
+`worktree_path` is resolved by the caller in this order and no other: **the plan's frontmatter `worktree:` field when it declares one; otherwise the hand-run layout `<worktree_root>/<project>/<epic-slug>`.** A fleet plan always declares the field: its tree is named after the claim branch, which the computed layout cannot know. The declared field wins because an epic resumed from a differently-named worktree — or one a human created by hand — sits somewhere the computed layout would never guess, and computing over a stated path is exactly the ambient-beats-stated failure every `-C` below exists to remove.
 
 If `worktree_path` is absent, emit a single escalation (`asked: "worktree_unresolved"`, `question` naming `plan_path` and stating that its frontmatter must declare `worktree:`), set `ready_tasks: []`, and set `deadlock: true`. **Never fall back to the working directory.** You run from the machine's launch directory, which is no repository at all — a bare `git` there resolves against a tree nobody chose, so every check below would report confidently on the wrong repo. An unresolvable worktree is a stop, not a default.
 
@@ -96,6 +96,8 @@ For each `task_id` in `ready` that is NOT currently `in_flight`, populate a `Rea
 - `wave_deadline_minutes` — the task's `wave_deadline_minutes` if set, else 30
 
 (The wave-contract prompt for each task — `prompts/implementer-with-verifier-loop.md`, or `prompts/implementer-with-tdd-loop.md` for `type: tdd` tasks — is selected by `agentflow.wave_dispatch.build_wave_args` at dispatch time, not returned by you.)
+
+**Board-only tasks come before the deadlock rule.** A task in `state.tasks` but not in `plan.tasks` whose state is not `done` is reported in `escalations`, one entry per task: `id: "orphan_task_<id>"`, `task: <id>`, `asked: "plan_board_mismatch"`, and `question` exactly `task <id> is on the board but no longer in the plan: remove it from status.md or restore it to the plan`. It is never described as an unsatisfied dependency edge and never counted toward the deadlock rule below; when one exists, return `ready_tasks: []` and `deadlock: false`. A board-only task that is `done` is left alone and reported nowhere. The orchestrator reconciles the board before dispatching you, so a plan-only task already has a board entry; the return keeps its five keys.
 
 If `ready` is empty AND no task is `in_flight` AND not all tasks are `done` → set `deadlock: true` and emit a single escalation with `asked: "deadlock"` and `question` describing the unsatisfied dependency edges and naming every `blocked` task. The question must say that answering the escalation does not reset a `blocked` task, and name the reset step: set `state.tasks[<tid>].state` to `ready` in the status.md frontmatter for each task the operator wants run again. Otherwise `deadlock: false`.
 

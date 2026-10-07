@@ -48,7 +48,7 @@ def test_no_first_party_skill_or_command_routes_to_vendored_brainstorming():
 def test_step_6_leaves_one_record_per_epic():
     text = _skill_text("dev-manager")
     assert "Leave one record per epic" in text
-    assert "do not follow its writing-plans handoff" in text
+    assert "do not follow its `solution` handoff" in text
 
 
 def test_refine_writes_where_the_survey_reads():

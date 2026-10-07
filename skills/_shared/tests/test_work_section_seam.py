@@ -1,6 +1,6 @@
 """WORK says how much of itself a free lane could actually start (gh#121).
 
-The disjointness rule is right and nothing here touches it: three builders in one seam produce
+The disjointness rule is right and nothing here touches it: builders sharing one seam produce
 merge conflicts even with worktrees. What was missing is a CHANNEL. On 2026-09-02 every lane
 behaved correctly while the lead lane could claim nothing — one healthy `building` row, three
 selectable bugs, non-zero WORK — and the only way to see it was to cross-reference a 33-file

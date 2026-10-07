@@ -324,3 +324,21 @@ test('--dump exposes template + schema + contextSpec per id', () => {
     assert.ok(Object.keys(dump[id].contextSpec).length > 0);
   }
 });
+
+// gh#465: the per-file citation check. A non-zero exit with no PROBLEM line is an
+// infrastructure fault the agent cannot fix, so the prompt must stop the retry
+// loop there instead of re-running until it exits 0.
+const CHECK_CMD = 'python -m autodoc_graph check-records --db /s/graph.db --corpus toy';
+for (const id of ['map', 'refresh']) {
+  test(`${id} prompt: the check-records step, and its stop on a fault with no PROBLEM line`, () => {
+    const ctx = FIXTURE_CONTEXTS[id];
+    const text = PROMPTS[id].render({ ...ctx, checkRecordsCmd: CHECK_CMD });
+    assert.ok(text.includes(`${CHECK_CMD} --records "${ctx.recordsPath}"`), 'command not rendered');
+    assert.match(text, /re-run until it exits 0/);
+    assert.match(text, /non-zero exit that prints NO PROBLEM line/);
+    assert.match(text, /do NOT re-run it/);
+    assert.match(text, /CHECK-RECORDS FAILED: <its error output,\s+verbatim>/);
+    const without = PROMPTS[id].render({ ...ctx, checkRecordsCmd: '' });
+    assert.ok(!/check-records|NO PROBLEM line/.test(without), 'step rendered without a command');
+  });
+}

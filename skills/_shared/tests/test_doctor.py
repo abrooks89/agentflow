@@ -18,6 +18,7 @@ import pytest
 
 from agentflow import doctor
 from agentflow.doctor import FAIL, INFO, OK, WARN, Finding, diagnose, main, render
+from agentflow.vocabulary import QUEUE_CLASS_REWRITES, RETIRED_QUEUE_CLASS
 
 NL = chr(10)
 
@@ -39,7 +40,10 @@ def _healthy(tmp_path: Path, monkeypatch) -> Path:
     (data_root / "projects" / "demo" / "design" / "plans").mkdir(parents=True)
     (data_root / "projects" / "demo" / "status").mkdir(parents=True)
     (data_root / "projects" / "demo" / "design" / "specs" / "a.md").write_text("x", encoding="utf-8")
-    (data_root / "projects" / "demo" / "design" / "plans" / "a.md").write_text("x", encoding="utf-8")
+    # A document-shaped plan, not a bare "x": the survey skips a plan with no frontmatter with
+    # a warning, and that warning now reaches the report, so "x" made the fixture unhealthy.
+    (data_root / "projects" / "demo" / "design" / "plans" / "a.md").write_text(
+        f"---{NL}title: a{NL}---{NL}", encoding="utf-8")
     (data_root / "projects" / "demo" / "status" / "registry.md").write_text(
         NL.join(("## Agents", "## Queue", "## Questions", "## Blockers", "## Directives")),
         encoding="utf-8",
@@ -427,15 +431,15 @@ def _spec(home_parent: Path, slug: str, queue_class: str) -> None:
 def test_a_corpus_wide_unknown_queue_class_FAILS_and_names_the_migration(tmp_path, monkeypatch):
     home = _healthy(tmp_path, monkeypatch)
     for i in range(4):
-        _spec(tmp_path, f"old-{i}", "autoloop-buildable")
+        _spec(tmp_path, f"old-{i}", RETIRED_QUEUE_CLASS)
 
     f = _by_check(diagnose("demo"))["vocabulary"]
 
     assert f.status == FAIL
-    assert "autoloop-buildable" in f.detail
+    assert RETIRED_QUEUE_CLASS in f.detail
     assert "4 of 4" in f.detail
     assert "migrate_queue_class" in f.remediation, "the remediation names the act, not the state"
-    assert "MIGRATION, not a typo" in f.remediation
+    assert "VOCABULARY CHANGE, not a typo" in f.remediation
     assert home.exists()
 
 
@@ -465,15 +469,109 @@ def test_a_corpus_entirely_in_vocabulary_is_OK(tmp_path, monkeypatch):
 
 
 def test_two_bad_specs_do_not_trip_the_floor(tmp_path, monkeypatch):
-    """Half of two is not a migration - the floor exists so a tiny corpus cannot claim one."""
+    """Half of two is not a migration - the floor exists so a tiny corpus cannot claim one.
+
+    The value is one the migration does not hold: a retired value is sent to the migration at
+    any count, so only an unknown one tests that the floor withholds the command."""
     _healthy(tmp_path, monkeypatch)
-    _spec(tmp_path, "x", "autoloop-buildable")
-    _spec(tmp_path, "y", "autoloop-buildable")
+    _spec(tmp_path, "x", "feature")
+    _spec(tmp_path, "y", "feature")
 
     f = _by_check(diagnose("demo"))["vocabulary"]
 
     assert f.status == WARN
     assert "migrate_queue_class" not in f.remediation
+    assert "fix the specs" in f.remediation
+
+
+# The remedy is chosen by membership in QUEUE_CLASS_REWRITES, not by the ratio: the migration
+# rewrites only that map's keys, so it is the right command for a retired value at any count
+# and a no-op for every other value at any count.
+_A_RETIRED_VALUE = next(iter(QUEUE_CLASS_REWRITES))
+
+
+def _clause(remediation: str, needle: str) -> str:
+    """The one remedy clause that carries *needle* (clauses are joined with '; ')."""
+    hits = [c for c in remediation.split("; ") if needle in c]
+    assert len(hits) == 1, (needle, remediation)
+    return hits[0]
+
+
+def test_a_few_retired_values_are_sent_to_the_migration(tmp_path, monkeypatch):
+    _healthy(tmp_path, monkeypatch)
+    _spec(tmp_path, "old", _A_RETIRED_VALUE)
+    for i in range(5):
+        _spec(tmp_path, f"fine-{i}", "fleet-buildable")
+
+    f = _by_check(diagnose("demo"))["vocabulary"]
+
+    assert f.status == WARN, "one spec is below the mass threshold - severity is still the ratio's"
+    assert "python -m agentflow.migrate_queue_class --project demo --dry-run" in f.remediation
+    assert "--apply" in f.remediation
+    assert repr(_A_RETIRED_VALUE) in _clause(f.remediation, "migrate_queue_class")
+    assert "fix the specs" not in f.remediation
+
+
+def test_many_specs_on_an_unknown_value_mean_update_the_checkout(tmp_path, monkeypatch):
+    """The migration rewrites nothing here, so naming it is a run that leaves doctor red."""
+    _healthy(tmp_path, monkeypatch)
+    for i in range(4):
+        _spec(tmp_path, f"new-{i}", "feature")
+
+    f = _by_check(diagnose("demo"))["vocabulary"]
+
+    assert f.status == FAIL
+    assert "4 of 4" in f.detail and "'feature'" in f.detail
+    assert "migrate_queue_class" not in f.remediation
+    assert "update the checkout" in f.remediation
+
+
+def test_a_few_specs_on_an_unknown_value_mean_fix_the_specs(tmp_path, monkeypatch):
+    _healthy(tmp_path, monkeypatch)
+    _spec(tmp_path, "odd", "feature")
+    for i in range(5):
+        _spec(tmp_path, f"fine-{i}", "fleet-buildable")
+
+    f = _by_check(diagnose("demo"))["vocabulary"]
+
+    assert f.status == WARN
+    assert "migrate_queue_class" not in f.remediation
+    assert "update the checkout" not in f.remediation
+    assert "'feature'" in _clause(f.remediation, "fix the specs")
+
+
+def test_a_mixed_corpus_sends_only_the_retired_value_to_the_migration(tmp_path, monkeypatch):
+    _healthy(tmp_path, monkeypatch)
+    for i in range(4):
+        _spec(tmp_path, f"new-{i}", "feature")
+    _spec(tmp_path, "old", _A_RETIRED_VALUE)
+    _spec(tmp_path, "typo", "fleet-buildabel")
+
+    f = _by_check(diagnose("demo"))["vocabulary"]
+
+    assert f.status == FAIL
+    for value in ("feature", _A_RETIRED_VALUE, "fleet-buildabel"):
+        assert repr(value) in f.detail, f.detail
+    migrate = _clause(f.remediation, "migrate_queue_class")
+    assert repr(_A_RETIRED_VALUE) in migrate
+    assert "'feature'" not in migrate and "'fleet-buildabel'" not in migrate
+    assert "'feature'" in _clause(f.remediation, "update the checkout")
+    assert "'fleet-buildabel'" in _clause(f.remediation, "fix the specs")
+
+
+def test_a_few_retired_beside_a_stray_value_get_their_own_remedies(tmp_path, monkeypatch):
+    _healthy(tmp_path, monkeypatch)
+    _spec(tmp_path, "old", _A_RETIRED_VALUE)
+    _spec(tmp_path, "typo", "fleet-buildabel")
+    for i in range(5):
+        _spec(tmp_path, f"fine-{i}", "fleet-buildable")
+
+    f = _by_check(diagnose("demo"))["vocabulary"]
+
+    assert f.status == WARN
+    assert repr(_A_RETIRED_VALUE) in _clause(f.remediation, "migrate_queue_class")
+    assert "'fleet-buildabel'" not in _clause(f.remediation, "migrate_queue_class")
+    assert "'fleet-buildabel'" in _clause(f.remediation, "fix the specs")
 
 
 def test_render_restates_the_warnings_at_the_end():
@@ -981,9 +1079,31 @@ def _base_branch(home: Path, branch: str) -> None:
     """)
 
 
-def test_an_existing_local_base_branch_is_OK(tmp_path, monkeypatch):
+def test_an_existing_local_base_branch_is_OK_in_a_local_only_repo(tmp_path, monkeypatch):
+    _healthy(tmp_path, monkeypatch)
+    _real_checkout(tmp_path, None)
+    base = _by_check(diagnose("demo"))["base_branch"]
+    assert base.status == OK, base
+    assert "refs/heads/main" in base.detail
+
+
+def test_a_local_only_base_branch_WARNs_when_origin_exists(tmp_path, monkeypatch):
+    """Seats that read origin/<base_branch> find nothing, though a local build works."""
     _healthy(tmp_path, monkeypatch)
     _real_checkout(tmp_path, "https://github.com/owner/repo.git")
+    base = _by_check(diagnose("demo"))["base_branch"]
+    assert base.status == WARN, base
+    assert "refs/heads/main" in base.detail and "refs/remotes/origin/main" in base.detail
+    assert "push main to origin" in base.remediation
+    assert main(["--project", "demo"]) == 0, "a WARN never fails the exit code"
+
+
+def test_a_base_branch_both_local_and_on_origin_is_OK(tmp_path, monkeypatch):
+    """Control: the tracking ref present clears the warning."""
+    _healthy(tmp_path, monkeypatch)
+    checkout = _real_checkout(tmp_path, "https://github.com/owner/repo.git")
+    subprocess.run(["git", "-C", str(checkout), "update-ref", "refs/remotes/origin/main",
+                    "refs/heads/main"], check=True)
     base = _by_check(diagnose("demo"))["base_branch"]
     assert base.status == OK, base
     assert "refs/heads/main" in base.detail
@@ -1122,3 +1242,280 @@ def test_an_unreadable_project_subtree_is_a_finding_not_a_raise(tmp_path, monkey
     glob = _by_check(diagnose("demo"))["glob"]   # must not raise
     assert glob.failed
     assert "PermissionError" in glob.detail
+
+
+# --------------------------------------------------------------------------- #
+# gh#365 - `warn_unresolved_done_spec_paths` had no caller, so a done spec whose relative
+# pointers broke when it moved into done/ was never reported anywhere. doctor is that caller:
+# the steward runs it every wake and a terminal user runs it on demand.
+# --------------------------------------------------------------------------- #
+
+
+def _done_spec(tmp_path: Path, slug: str, *, evidence: str = "", files: str = "") -> None:
+    """A `current_state: done` spec under demo/design/specs/done/, one level below specs/."""
+    done = tmp_path / "data" / "projects" / "demo" / "design" / "specs" / "done"
+    done.mkdir(parents=True, exist_ok=True)
+    prov = f"provenance:{NL}  evidence: {evidence}{NL}" if evidence else ""
+    body = f"---{NL}slug: {slug}{NL}current_state: done{NL}{prov}---{NL}{NL}# {slug}{NL}"
+    if files:
+        body += f"{NL}## Files{NL}{NL}{files}{NL}"
+    (done / f"{slug}.md").write_text(body, encoding="utf-8")
+
+
+def _audit(tmp_path: Path) -> None:
+    audits = tmp_path / "data" / "projects" / "demo" / "status" / "audits"
+    audits.mkdir(parents=True, exist_ok=True)
+    (audits / "x.md").write_text("x", encoding="utf-8")
+
+
+def test_a_done_spec_with_a_broken_pointer_is_a_WARN_naming_it(tmp_path, monkeypatch, capsys):
+    """Written from specs/, the pointer resolved; one directory down in done/ it does not."""
+    _healthy(tmp_path, monkeypatch)
+    _audit(tmp_path)
+    _done_spec(tmp_path, "moved", evidence="../../status/audits/x.md")
+
+    findings = diagnose("demo")
+    f = _by_check(findings)["done-spec-pointers"]
+
+    assert f.status == WARN, render(findings)
+    assert "moved" in f.detail and "../../status/audits/x.md" in f.detail
+    assert "1 depth-shift" in f.detail
+    assert "`../`" in f.remediation
+    # It reaches the report a steward or a redirect reads, without turning the exit code red.
+    assert main(["--project", "demo"]) == 0
+    out = capsys.readouterr().out
+    assert "done-spec-pointers" in out and "moved" in out
+    assert "resolved surface healthy" + NL not in out
+
+
+def test_a_done_spec_whose_pointers_resolve_is_OK(tmp_path, monkeypatch):
+    """The negative control: the corrected pointer must not be reported."""
+    _healthy(tmp_path, monkeypatch)
+    _audit(tmp_path)
+    _done_spec(tmp_path, "fixed", evidence="../../../status/audits/x.md")
+
+    f = _by_check(diagnose("demo"))["done-spec-pointers"]
+
+    assert f.status == OK, f.detail
+    assert "fixed" not in f.detail
+
+
+def test_a_done_specs_Files_entry_is_judged_against_the_checkout(tmp_path, monkeypatch):
+    """`## Files` is repo-relative: a missing entry is named, an existing one is not."""
+    _healthy(tmp_path, monkeypatch)
+    real = tmp_path / "repo" / "skills" / "real.py"
+    real.parent.mkdir(parents=True)
+    real.write_text("x", encoding="utf-8")
+    _done_spec(tmp_path, "shipped", files=f"- `skills/real.py` - kept{NL}- `skills/gone.py` - lost")
+
+    f = _by_check(diagnose("demo"))["done-spec-pointers"]
+
+    assert f.status == WARN
+    assert "skills/gone.py" in f.detail
+    assert "skills/real.py" not in f.detail
+    assert "1 unresolved" in f.detail
+
+
+def test_an_unreadable_done_spec_is_a_WARN_naming_it_not_a_false_OK(tmp_path, monkeypatch):
+    """The resolver names an unreadable spec on stderr only; the report must carry it too."""
+    _healthy(tmp_path, monkeypatch)
+    _done_spec(tmp_path, "clean")
+    done = tmp_path / "data" / "projects" / "demo" / "design" / "specs" / "done"
+    (done / "garbled.md").write_bytes(
+        b"---\nslug: garbled\ncurrent_state: done\n---\n\xff\xfe\x80\n"
+    )
+
+    f = _by_check(diagnose("demo"))["done-spec-pointers"]
+
+    assert f.status == WARN, f.detail
+    assert "garbled.md" in f.detail
+    assert "NOT checked" in f.detail
+    assert "every done-spec pointer resolves" not in f.detail
+    assert "clean" not in f.detail
+
+
+def test_a_NOT_done_spec_is_not_reported_by_doctor(tmp_path, monkeypatch):
+    """The false-positive class gh#365 scoped out: an unfinished spec may name a file to CREATE."""
+    _healthy(tmp_path, monkeypatch)
+    specs = tmp_path / "data" / "projects" / "demo" / "design" / "specs"
+    (specs / "wip.md").write_text(
+        NL.join(("---", "slug: wip", "current_state: drafted", "---", "", "# wip", "",
+                 "## Files", "", "- `skills/new.py` (new)", "")),
+        encoding="utf-8",
+    )
+
+    assert _by_check(diagnose("demo"))["done-spec-pointers"].status == OK
+
+
+# --------------------------------------------------------------------------- #
+# The survey `_check_vocabulary` runs warns on the `agentflow.epic_survey` logger - a drafted spec
+# with no `## Files` section, among others - and those reached stderr only, so a report redirected
+# to a file ended "healthy, but NOT everywhere as configured" over warnings it never listed.
+# --------------------------------------------------------------------------- #
+
+
+def _drafted_without_files(tmp_path: Path, slug: str) -> None:
+    specs = tmp_path / "data" / "projects" / "demo" / "design" / "specs"
+    (specs / f"{slug}.md").write_text(
+        NL.join(("---", f"slug: {slug}", "current_state: drafted", "---", "", f"# {slug}",
+                 "", "## Goal", "", "something", "")),
+        encoding="utf-8",
+    )
+
+
+def test_a_survey_warning_is_a_WARN_finding_in_the_report(tmp_path, monkeypatch, capsys):
+    _healthy(tmp_path, monkeypatch)
+    _drafted_without_files(tmp_path, "no-seam")
+
+    findings = diagnose("demo")
+    survey = [f for f in findings if f.check.startswith("survey")]
+
+    assert [f.check for f in survey] == ["survey:files-missing"], render(findings)
+    assert survey[0].status == WARN
+    assert "no-seam" in survey[0].detail and "## Files" in survey[0].detail
+    assert main(["--project", "demo"]) == 0, "a survey WARN must not fail the exit code"
+    out = capsys.readouterr().out
+    assert "survey:files-missing" in out and "no-seam" in out
+    assert "1 WARNING:" in out, out
+
+
+def test_a_spec_WITH_a_Files_section_raises_no_survey_finding(tmp_path, monkeypatch):
+    """The negative control: a healthy corpus must not grow a survey line."""
+    _healthy(tmp_path, monkeypatch)
+    specs = tmp_path / "data" / "projects" / "demo" / "design" / "specs"
+    (specs / "seamed.md").write_text(
+        NL.join(("---", "slug: seamed", "current_state: drafted", "---", "", "# seamed", "",
+                 "## Files", "", "- `skills/x.py`", "")),
+        encoding="utf-8",
+    )
+
+    assert not [f for f in diagnose("demo") if f.check.startswith("survey")]
+
+
+def test_an_unrecognised_survey_warning_still_reports_as_plain_survey():
+    import logging
+
+    collector = doctor._SurveyWarnings()
+    for _ in range(2):
+        collector.emit(logging.LogRecord(
+            "agentflow.epic_survey", logging.WARNING, __file__, 0, "a shape nobody named", None,
+            None))
+
+    assert collector.findings() == [Finding("survey", WARN, "a shape nobody named")]
+
+
+def test_a_survey_warning_another_check_names_is_reported_ONCE(tmp_path, monkeypatch):
+    """The done-spec check and the vocabulary check already carry their survey warnings."""
+    _healthy(tmp_path, monkeypatch)
+    _audit(tmp_path)
+    _done_spec(tmp_path, "moved", evidence="../../status/audits/x.md")
+    done = tmp_path / "data" / "projects" / "demo" / "design" / "specs" / "done"
+    (done / "garbled.md").write_bytes(b"---\nslug: garbled\ncurrent_state: done\n---\n\xff\xfe\x80\n")
+    _spec(tmp_path, "typo", "fleet-buildabel")
+
+    findings = diagnose("demo")
+    text = render(findings)
+
+    assert _by_check(findings)["done-spec-pointers"].status == WARN
+    assert _by_check(findings)["vocabulary"].status == WARN
+    for needle in ("could not read", "../../status/audits/x.md", "fleet-buildabel"):
+        assert sum(needle in f.detail for f in findings) == 1, (needle, text)
+    # The survey's own skip of that file is a different fact (out of the queue, not just
+    # unchecked) and is still reported, under its own name.
+    assert any(f.check == "survey:skipped" and "garbled.md" in f.detail for f in findings), text
+
+
+def test_an_owned_warning_is_kept_when_its_owner_does_not_name_it():
+    """Ownership is decided by the owner's detail, not by the message shape alone."""
+    import logging
+
+    msg = "unknown queue_class, not dispatchable: 'other' (e.g. a.md)"
+    collector = doctor._SurveyWarnings()
+    collector.emit(logging.LogRecord(
+        "agentflow.epic_survey", logging.WARNING, __file__, 0, msg, None, None))
+
+    named = [Finding("vocabulary", FAIL, "4 of 4 epic(s) declaring a queue_class carry 'main'")]
+    assert [f.detail for f in collector.findings(named)] == [msg]
+
+
+def test_the_survey_collector_does_not_outlive_the_diagnosis(tmp_path, monkeypatch):
+    import logging
+
+    logger = logging.getLogger("agentflow.epic_survey")
+    before = list(logger.handlers)
+    _healthy(tmp_path, monkeypatch)
+    _drafted_without_files(tmp_path, "no-seam")
+    diagnose("demo")
+    assert list(logger.handlers) == before
+
+
+def test_a_survey_warning_reaches_the_report_when_the_host_silences_warnings(tmp_path, monkeypatch):
+    """A host that sets the root logger above WARNING must not put "healthy" back."""
+    import logging
+
+    survey_logger = logging.getLogger("agentflow.epic_survey")
+    monkeypatch.setattr(survey_logger, "level", logging.NOTSET)
+    monkeypatch.setattr(logging.getLogger(), "level", logging.ERROR)
+    _healthy(tmp_path, monkeypatch)
+    _drafted_without_files(tmp_path, "no-seam")
+
+    findings = diagnose("demo")
+
+    assert any(f.check == "survey:files-missing" and "no-seam" in f.detail for f in findings)
+    assert survey_logger.level == logging.NOTSET
+
+
+def _board(path: Path, slug: str, status: str) -> Path:
+    """A signature-checked status board, so the survey's pass 3 reads it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        NL.join(("---", f"epic: {slug} epic", f"plan: /plans/{slug}.md",
+                 "started: 2026-01-01T00:00:00+00:00", f"status: {status}",
+                 "current_phase: phase-1", "paused: false", "tasks:", "  1:", "    state: done",
+                 "---", "", "board", "")),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_duplicate_status_boards_report_under_their_own_kind(tmp_path, monkeypatch):
+    """Two boards for one slug: the survey refuses the epic and names both. That is a corpus
+    defect a lane must act on, so it gets a kind of its own rather than the bare `survey` row."""
+    _healthy(tmp_path, monkeypatch)
+    status = tmp_path / "data" / "projects" / "demo" / "status"
+    one = _board(status / "twice.status.md", "twice", "running")
+    two = _board(status / "twice" / "status.md", "twice", "done")
+
+    dup = [f for f in diagnose("demo") if "duplicate status boards" in f.detail]
+
+    assert [f.check for f in dup] == ["survey:duplicate-status-boards"], render(dup)
+    assert dup[0].status == WARN
+    # Full paths: the second board's directory name is the slug, which the warning names anyway.
+    assert str(one) in dup[0].detail and str(two) in dup[0].detail, dup[0].detail
+
+
+def test_an_unrecognised_board_status_reports_under_its_own_kind(tmp_path, monkeypatch):
+    """A board whose `status:` is outside the vocabulary: the survey refuses to guess a run out of it."""
+    _healthy(tmp_path, monkeypatch)
+    board = _board(tmp_path / "data" / "projects" / "demo" / "status" / "odd.status.md", "odd",
+                   "shipped")
+
+    odd = [f for f in diagnose("demo") if "unrecognised board status" in f.detail]
+
+    assert [f.check for f in odd] == ["survey:unrecognised-board-status"], render(odd)
+    assert odd[0].status == WARN
+    assert board.name in odd[0].detail and "shipped" in odd[0].detail
+
+
+def test_steward_step_H_rolls_survey_warnings_up_per_kind():
+    """Step H reported every warn row on every wake, so N unpromotable specs were N findings
+    per pass. Pinned inside step H itself: the rollup line parked elsewhere is no instruction."""
+    skill = Path(__file__).resolve().parents[3] / "skills" / "steward" / "SKILL.md"
+    text = skill.read_text(encoding="utf-8")
+    start = text.index("**H. Resolved-surface health")
+    step_h = text[start:text.index(NL * 2 + "**", start + 1)]
+
+    assert "`survey:<kind>` warn rows" in step_h, step_h
+    assert "bare `survey` row" in step_h and "individually" in step_h, step_h
+    assert "ONE line per survey kind" in step_h and "count" in step_h, step_h
+    assert "domain A" in step_h, step_h

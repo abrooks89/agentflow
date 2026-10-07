@@ -76,6 +76,17 @@ Ordered steps (the whole install sequence, so `--dry-run` shows the full plan):
 touching a venv, running a subprocess, or writing a file — nothing is mutated. A
 real run executes each applicable step in order and fails loudly on the first error.
 
+`--deploy-only` runs step 7 ALONE: the way a lane makes a skill change live. Step 7 reads
+only the suite checkout and writes only the Claude config dir, so it needs no earlier step
+(no preflight, config, venv or editable install) and nothing after it. Above all it never
+runs step 11, which seeds EVERY configured project's data subtree - a skill deploy has no
+reason to write another project's data (SCHEMA §6, CONFIG WRITE SCOPE). A full install is
+still the only path that scaffolds. Flags that ask for a step deploy-only will not run
+(`--autodoc`, `--wake-watch`, `--resume-from`) are refused rather than silently dropped.
+Run it from the PRIMARY checkout after the merge lands, never from a per-epic worktree: live
+entries point into suite_root, so a worktree deploy re-points every seat at a directory that
+is deleted after merge. Deploy-only refuses a suite_root that is a linked worktree.
+
 Runtime declaration lives in `install/manifest.md` (human-readable); the structured
 step list below is hand-kept in agreement with it. Deps for THIS script: stdlib only.
 """
@@ -92,11 +103,16 @@ import re
 import shutil
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
 SESSIONSTART_HOOK_REL = "hooks/sessionstart-inject-config.py"
+# The command shape step 9 writes: two double-quoted paths, interpreter then hook script.
+_SESSIONSTART_CMD = re.compile(r'^"([^"]+)" "([^"]+)"$')
+# The tails `_venv_python` gives the interpreter, below the checkout root.
+_VENV_PYTHON_TAILS = ([".venv", "Scripts", "python.exe"], [".venv", "bin", "python"])
 BOOTSTRAP_REL = "skills/orchestrator/bootstrap.py"
 SHARED_PKG_REL = "skills/_shared"
 # Deployment manifest under claude_root: source -> target + content hash per
@@ -209,11 +225,11 @@ class Options:
     settings_file: Path
     autodoc: bool
     autodoc_reason: str
-    # True when autodoc came from `--autodoc` / `--no-autodoc` rather than the heuristic.
-    # An explicit flag is never overruled by the resolved-config re-check (gh#690): it
-    # either stands or the install refuses. Defaulted so existing Options(...) keep the
-    # heuristic behaviour.
-    autodoc_explicit: bool = False
+    # Which `_resolve_autodoc` tier decided: "flag", "env", "scan" or "none". The
+    # resolved-config re-check corrects only a "scan" or "none" answer; a "flag" or "env"
+    # answer is the operator's and stands, with a warning. Defaulted to "scan" so existing
+    # Options(...) keep the heuristic behaviour.
+    autodoc_source: str = "scan"
     # Deployment target root for skills/commands. Overridable so every test runs
     # against a tmp dir — the real ~/.claude is only exercised in a live install.
     claude_root: Path = field(default_factory=lambda: Path.home() / ".claude")
@@ -224,6 +240,16 @@ class Options:
     # Step 12 (the missed-wake watchdog). OFF unless the operator opts in with `--wake-watch`
     # (gh#544, 2026-09-24): a fresh provision registers no scheduled task.
     wake_watch: bool = False
+    # `--deploy-only`: step 7 alone (see the module docstring and `select_steps`).
+    deploy_only: bool = False
+    # The argv `main()` actually parsed, replayed by `_reexec_into_venv` into the venv child.
+    #
+    # NOT `sys.argv[1:]`. `main(argv=None)` accepts an explicit argv and the install tests use
+    # that programmatic entry, so the two genuinely differ -- and when they do, the child is
+    # spawned with the WRONG options: no `--config-home` / `--claude-root` / `--settings-file`,
+    # so those resolve to the operator's real `~/.agentflow/config` and `~/.claude`. Per run, so
+    # concurrent in-process `main()` calls never share flags.
+    invoked_argv: tuple[str, ...] = ()
 
 
 def _suite_root(explicit: Optional[str]) -> Path:
@@ -260,6 +286,27 @@ def _config_home_env(config_home: Path) -> Optional[str]:
     if home == _default_config_home().resolve():
         return None
     return str(home)
+
+
+def _resolved_home(opts: "Options") -> Path:
+    """This run's config home as every in-process reader and child process is handed it.
+
+    Passed explicitly, never pinned in $AGENTFLOW_CONFIG: the variable is process-global, so
+    two overlapping in-process runs that each set and restore it leave one of them reading
+    the other's home.
+    """
+    return opts.config_home.expanduser().resolve()
+
+
+def _child_env(opts: "Options", **extra: str) -> dict:
+    """A copy of os.environ for a child process, with AGENTFLOW_CONFIG naming this run's home.
+
+    A child that resolves config does so through agentflow.config, which reads only that
+    variable (the venv handover's steps 5+ all do); the copy carries the home across the
+    process boundary without touching os.environ. Bootstrap reads no config today; it gets the
+    same env so the home it inherited while main() pinned the variable does not vanish.
+    """
+    return {**os.environ, "AGENTFLOW_CONFIG": str(_resolved_home(opts)), **extra}
 
 
 def _check_config_env(settings_path: Path, settings: dict, config_home: Path) -> None:
@@ -300,6 +347,40 @@ def _check_config_env(settings_path: Path, settings: dict, config_home: Path) ->
     )
 
 
+def _check_project_env(settings_path: Path, settings: dict, opts: "Options", *,
+                       warn: bool) -> None:
+    """Refuse a settings `env.AGENTFLOW_PROJECT` naming an unconfigured project (gh#985).
+
+    The SessionStart hook resolves its project from that variable, and the settings env
+    overrides the session's shell, so such a value makes the hook step 9 installs exit 1 at
+    every session open - certain failure, hence a refusal. The installing shell's own
+    $AGENTFLOW_PROJECT is only a likelihood (a lane may be launched from another shell), so
+    with `warn` it is printed as a WARNING and the run goes on. A settings value that names a
+    configured project shadows the shell's, so the shell's is then not checked at all.
+    """
+    configured = _configured_projects(opts)
+    shown = ", ".join(configured) if configured else "(none)"
+    where = opts.config_home / "projects"
+    env = settings.get("env")
+    held = env.get("AGENTFLOW_PROJECT") if isinstance(env, dict) else None
+    if held:
+        if held in configured:
+            return
+        raise RuntimeError(
+            f"settings file sets env.AGENTFLOW_PROJECT={held!r}: {settings_path}\n"
+            f"No such project is configured (configured: {shown}, from {where}/*.md).\n"
+            "The SessionStart hook resolves its project from that variable, so it would exit 1\n"
+            "at every session open. Set it to a configured project, or remove it from the\n"
+            "file's \"env\" and pass --project <name> on the slash command instead."
+        )
+    shell = os.environ.get("AGENTFLOW_PROJECT")
+    if warn and shell and shell not in configured:
+        print(f"     WARNING: $AGENTFLOW_PROJECT={shell!r} in this shell's environment names no "
+              f"configured project (configured: {shown}, from {where}).")
+        print("     A session launched from this shell fails the SessionStart hook; unset it, or "
+              "pass --project <name> on the slash command.")
+
+
 def _settings_file(explicit: Optional[str]) -> Path:
     if explicit:
         return Path(explicit).expanduser()
@@ -318,8 +399,11 @@ def _claude_root(explicit: Optional[str]) -> Path:
     return Path.home() / ".claude"
 
 
-def _resolve_autodoc(flag: Optional[bool], config_home: Path) -> tuple[bool, str]:
-    """(enabled, reason). Explicit flag > AGENTFLOW_AUTODOC env > light config scan > off.
+def _resolve_autodoc(flag: Optional[bool], config_home: Path) -> tuple[bool, str, str]:
+    """(enabled, reason, source). Explicit flag > AGENTFLOW_AUTODOC env > light config scan > off.
+
+    `source` names the tier that decided ("flag", "env", "scan" or "none"), so the
+    post-install re-check can tell an operator's answer from the heuristic's.
 
     The config scan is a text heuristic so `--dry-run` needs neither PyYAML nor an
     importable agentflow - neither exists yet at the point this runs.
@@ -332,13 +416,13 @@ def _resolve_autodoc(flag: Optional[bool], config_home: Path) -> tuple[bool, str
     editable install, and says so out loud when the two disagree.
     """
     if flag is True:
-        return True, "forced by --autodoc"
+        return True, "forced by --autodoc", "flag"
     if flag is False:
-        return False, "forced by --no-autodoc"
+        return False, "forced by --no-autodoc", "flag"
     env_val = os.environ.get("AGENTFLOW_AUTODOC")
     if env_val is not None:
         on = env_val.strip().lower() in {"1", "true", "yes", "on"}
-        return on, f"AGENTFLOW_AUTODOC={env_val!r}"
+        return on, f"AGENTFLOW_AUTODOC={env_val!r}", "env"
     # `autodoc_root` is per-PROJECT as well as machine-level (SCHEMA §2). Scanning only
     # environment.md would report autodoc off for a machine whose default is null while a
     # project sets its own - which is the exact configuration the per-project field was
@@ -348,18 +432,18 @@ def _resolve_autodoc(flag: Optional[bool], config_home: Path) -> tuple[bool, str
     if env_md.exists():
         scanned.append(env_md)
         if _AUTODOC_ROOT_SET.search(env_md.read_text(encoding="utf-8")):
-            return True, f"autodoc_root set in {env_md}"
+            return True, f"autodoc_root set in {env_md}", "scan"
 
     projects_dir = config_home / "projects"
     if projects_dir.is_dir():
         for md in sorted(projects_dir.glob("*.md")):
             scanned.append(md)
             if _AUTODOC_ROOT_SET.search(md.read_text(encoding="utf-8")):
-                return True, f"autodoc_root set in {md}"
+                return True, f"autodoc_root set in {md}", "scan"
 
     if scanned:
-        return False, f"autodoc_root unset/null in {len(scanned)} config file(s)"
-    return False, "no config present (autodoc_root undetermined)"
+        return False, f"autodoc_root unset/null in {len(scanned)} config file(s)", "scan"
+    return False, "no config present (autodoc_root undetermined)", "none"
 
 
 def _confirm_autodoc_against_config(opts: "Options") -> None:
@@ -371,11 +455,15 @@ def _confirm_autodoc_against_config(opts: "Options") -> None:
     default, then the derived per-project path), and the derived case is invisible to a
     regex by construction: there is nothing written down to match.
 
-    So this re-checks, and MUTATES `opts.autodoc` when it disagrees with the heuristic. An
-    EXPLICIT flag is never overruled: `--no-autodoc` stays off and the disagreement is printed as
-    a warning, and `--autodoc` with no resolvable root refuses (RuntimeError). It runs at the end
-    of step 5 because that is the first moment the resolver can be imported and the last
-    moment before step 6 acts on the answer.
+    So this re-checks, and MUTATES `opts.autodoc` when it disagrees with an answer the text
+    scan produced (`autodoc_source` "scan" or "none") - that is the answer it exists to
+    correct. An operator's answer (`--autodoc`, `--no-autodoc` or `AGENTFLOW_AUTODOC`) is
+    never overruled: it is kept and the disagreement is printed as one WARNING line. Warn,
+    not refuse: `--autodoc` against a disabled config only installs deps nothing uses, and
+    `--no-autodoc` against an enabled config is caught later by the autodoc runtime guard,
+    which stops and names `provision.py --autodoc`. It runs at the end of step 5 because
+    that is the first moment the resolver can be imported and the last moment before
+    step 6 acts on the answer.
 
     A DISAGREEMENT IS PRINTED, never applied quietly. A gate that silently corrects a
     display value is how the two drift apart again: the next reader sees the heuristic's
@@ -387,22 +475,16 @@ def _confirm_autodoc_against_config(opts: "Options") -> None:
     installer that shrugged at that would scaffold the empty one and let `/autodoc-init`
     regenerate hundreds of pages from scratch.
     """
-    sys.path.insert(0, str(opts.suite_root / SHARED_PKG_REL))
-    from agentflow.config import (  # noqa: E402  (post editable install)
-        load_environment,
-        load_project,
-        resolve_autodoc_root,
-    )
+    # A broken environment.md or profile ends as the hard-fail RuntimeError, not a raw
+    # ConfigError traceback (gh#985).
+    env, projects = _load_config_or_fail(opts, before_deploy=True)
+    from agentflow.config import resolve_autodoc_root  # noqa: E402  (post editable install)
 
-    env = load_environment()
     resolved: list[str] = []
-
-    projects_dir = opts.config_home / "projects"
-    if projects_dir.is_dir():
-        for md in sorted(projects_dir.glob("*.md")):
-            root = resolve_autodoc_root(env, load_project(md.stem))
-            if root:
-                resolved.append(f"{md.stem} -> {root}")
+    for name, project in projects.items():
+        root = resolve_autodoc_root(env, project)
+        if root:
+            resolved.append(f"{name} -> {root}")
     if not resolved:
         root = resolve_autodoc_root(env, None)
         if root:
@@ -416,20 +498,19 @@ def _confirm_autodoc_against_config(opts: "Options") -> None:
     if truth == opts.autodoc:
         return
 
-    if opts.autodoc_explicit:
-        # An explicit flag is the operator's decision; the config may inform it, never
-        # silently replace it (gh#690).
-        if opts.autodoc:
-            raise RuntimeError(
-                "autodoc REFUSED: --autodoc was passed but the resolved config has no "
-                "autodoc root (autodoc_root is unset/null in environment.md and every "
-                "projects/*.md, and none derives), so autodoc cannot work. Set "
-                "autodoc_root in the config, or drop --autodoc."
-            )
-        # --no-autodoc stands: autodoc stays OFF, and the disagreement is named.
+    if opts.autodoc_source in ("flag", "env"):
+        # The operator's answer: the config may inform it, never silently replace it.
+        if opts.autodoc_source == "env":
+            # The raw value, not just the variable's name: an unrecognised value such as
+            # `enable` reads as off, and the warning is the one line that can say why.
+            decider = (opts.autodoc_reason
+                       if opts.autodoc_reason.startswith("AGENTFLOW_AUTODOC=")
+                       else "AGENTFLOW_AUTODOC")
+        else:
+            decider = "--autodoc" if opts.autodoc else "--no-autodoc"
         print(
-            "  autodoc     : WARNING --no-autodoc keeps autodoc disabled, but the "
-            f"resolved config enables it: {resolved_reason}"
+            f"  autodoc     : WARNING {decider} keeps autodoc "
+            f"{'enabled' if opts.autodoc else 'disabled'}, but {resolved_reason}"
         )
         return
 
@@ -739,6 +820,9 @@ def _do_preflight(opts: Options) -> None:
     # Step 9 refuses a conflicting env.AGENTFLOW_CONFIG too; checked here as well so the
     # refusal lands before steps 2-8 have written anything (gh#689).
     _check_config_env(opts.settings_file, settings, opts.config_home)
+    # Likewise an env.AGENTFLOW_PROJECT the installed hook would fail on (gh#985); the
+    # shell-only WARNING is left to step 9 so it prints once.
+    _check_project_env(opts.settings_file, settings, opts, warn=False)
 
 
 def _first_yaml_block(env_md: Path) -> str:
@@ -822,11 +906,53 @@ def _ensure_required_dirs(opts: Options) -> None:
                 reason += "; %VAR% is never expanded - write the expanded absolute path"
             print(
                 f"provision: not pre-creating {key} ({reason}); "
-                "leaving the loud failure to the step-10 resolver",
+                "leaving the loud failure to the resolver",
                 file=sys.stderr,
             )
             continue
         target.mkdir(parents=True, exist_ok=True)
+
+
+def _load_config_or_fail(opts: Options, *, before_deploy: bool = False):
+    """(environment, {name: project}) through the real resolver, or the hard-fail RuntimeError.
+
+    A ConfigError subclasses Exception, not RuntimeError, so any step that let one escape
+    reached the user as a raw traceback with no "agentflow provision FAILED" header (gh#985):
+    step 5's autodoc re-check did exactly that on a broken profile. Every step that loads
+    config goes through here, so the wrapping cannot be forgotten at one of them. The
+    ConfigError's own text (file, field, reason, remediation) is carried whole.
+
+    This run's config home is passed to the resolver explicitly, so a step run on its own can
+    never validate some other home - the real ~/.agentflow/config above all - and report this
+    one healthy, and an overlapping run in the same process cannot redirect it.
+
+    *before_deploy* (steps 2 and 5, gh#1047): a delegated skill path under
+    <claude_root>/skills/<name>/ that step 7 has not deployed yet passes when this suite
+    ships <name> and holds the same file. Step 10 runs after the deploy and passes False,
+    so the strict check still has the last word.
+    """
+    pkg = str(opts.suite_root / SHARED_PKG_REL)
+    if pkg not in sys.path:
+        sys.path.insert(0, pkg)
+    from agentflow.config import (  # noqa: E402  (post editable install)
+        ConfigError,
+        PendingSkillDeploy,
+        load_environment,
+        load_project,
+    )
+    home = _resolved_home(opts)
+    pending = None
+    if before_deploy:
+        shipped = frozenset(key.split("/", 1)[1] for key, _src in _deploy_sources(opts.suite_root)
+                            if key.startswith("skills/"))
+        pending = PendingSkillDeploy(opts.claude_root, opts.suite_root, shipped)
+    try:
+        env = load_environment(config_home=home, pending_deploy=pending)
+        projects = {name: load_project(name, config_home=home, pending_deploy=pending)
+                    for name in _configured_projects(opts)}
+    except ConfigError as e:
+        raise RuntimeError(f"config presence-check FAILED (hard-fail):\n{e}") from e
+    return env, projects
 
 
 def _do_config_presence(opts: Options) -> None:
@@ -837,6 +963,16 @@ def _do_config_presence(opts: Options) -> None:
             "Run the install/SKILL.md interview first — it writes environment.md."
         )
     _ensure_required_dirs(opts)
+    # "exists + resolves": the resolver runs here, before the venv is built, whenever this
+    # interpreter can import it. Without PyYAML it cannot, and step 5 is the first place
+    # that can - which then reports a broken config the same way. Said, not skipped quietly.
+    if not _parent_can_import_deps():
+        print("     resolution deferred to step 5: PyYAML is not importable here yet")
+        return
+    # Step 3's secrets check first: the resolver also presence-checks the notify env-var
+    # NAMES, but its ConfigError omits where to persist them, which step 3's message says.
+    _do_secrets(opts)
+    _load_config_or_fail(opts, before_deploy=True)
 
 
 def _notify_env_var_names(yaml_text: str) -> list[str]:
@@ -914,16 +1050,6 @@ def _do_python_venv(opts: Options) -> None:
 #: braces rather than the mechanism; a loop here would be an install that never terminates.
 _REEXEC_MARKER = "AGENTFLOW_PROVISION_REEXEC"
 
-#: The argv `main()` actually parsed, captured there and read by the handover.
-#:
-#: NOT `sys.argv[1:]`. `main(argv=None)` accepts an explicit argv and the install tests use that
-#: programmatic entry, so the two genuinely differ -- and when they do, the child is spawned with
-#: the WRONG options. A caller whose process argv is empty hands off to a child that sees no
-#: `--config-home` / `--claude-root` / `--settings-file` at all, so those resolve to their
-#: defaults: the operator's real `~/.agentflow/config` and `~/.claude`. A sandboxed run would
-#: re-target itself at the live machine, silently, at the moment it changed process.
-_INVOKED_ARGV: list = []
-
 
 def _parent_can_import_deps() -> bool:
     """Can the interpreter running THIS script import what the later steps need?
@@ -971,7 +1097,8 @@ def _reexec_into_venv(opts: Options, resume_from: int) -> None:
             f"cannot hand off to the suite venv: {py} does not exist after the venv step. "
             "Re-run provision, or create the venv by hand and re-run."
         )
-    argv = [str(py), os.path.abspath(__file__), *_INVOKED_ARGV, "--resume-from", str(resume_from)]
+    argv = [str(py), os.path.abspath(__file__), *opts.invoked_argv,
+            "--resume-from", str(resume_from)]
     print(f"  -- handing off to the suite venv ({py}) for steps {resume_from}+")
     # THE CHILD INHERITS THIS FILE DESCRIPTOR. Python block-buffers stdout when it is a pipe or
     # a file rather than a TTY, so without this flush the parent's banner, steps 1-4 and the
@@ -981,7 +1108,7 @@ def _reexec_into_venv(opts: Options, resume_from: int) -> None:
     # backwards. Only a TTY is line-buffered, which is exactly where this was not noticed.
     sys.stdout.flush()
     sys.stderr.flush()
-    env = dict(os.environ, **{_REEXEC_MARKER: "1"})
+    env = _child_env(opts, **{_REEXEC_MARKER: "1"})
     raise _HandOff(subprocess.call(argv, env=env))
 
 
@@ -1055,8 +1182,33 @@ def _autodoc_pkg_dir(opts: Options) -> Path:
 def _do_bootstrap(opts: Options) -> None:
     py = str(_venv_python(opts))
     script = opts.suite_root / BOOTSTRAP_REL
-    env = {**os.environ, "CLAUDE_SETTINGS_FILE": str(opts.settings_file)}
+    env = _child_env(opts, CLAUDE_SETTINGS_FILE=str(opts.settings_file))
     _run_cmd([py, str(script)], env=env)
+
+
+def _is_agentflow_sessionstart(command: object) -> bool:
+    """Is *command* the SessionStart hook command step 9 writes, from any checkout?
+
+    Exactly that shape - `"<checkout>/.venv/<bin>/python" "<checkout>/hooks/sessionstart-
+    inject-config.py"`, interpreter and script under ONE checkout root - so an entry is
+    judged agentflow's by the command provision itself produces, never by a looser guess
+    that could claim an operator's own hook (a wrapper that runs our script, say).
+    """
+    if not isinstance(command, str):
+        return False
+    m = _SESSIONSTART_CMD.match(command)
+    if not m:
+        return False
+    fold = str.casefold if os.name == "nt" else str
+
+    def parts(path: str) -> list:
+        return [fold(p) for p in re.split(r"[\\/]", path)]
+
+    py, script = parts(m.group(1)), parts(m.group(2))
+    if script[-2:] != parts(SESSIONSTART_HOOK_REL):
+        return False
+    return any(py[-3:] == parts("/".join(tail)) and py[:-3] == script[:-2]
+               for tail in _VENV_PYTHON_TAILS)
 
 
 def _do_sessionstart_hook(opts: Options) -> None:
@@ -1067,19 +1219,43 @@ def _do_sessionstart_hook(opts: Options) -> None:
         raise RuntimeError(_missing_settings_message(settings_path))
     settings = _read_settings(settings_path)
     _check_config_env(settings_path, settings, opts.config_home)
+    _check_project_env(settings_path, settings, opts, warn=True)
     # Suite venv interpreter (bare `python` lacks the agentflow package on a fresh
     # machine); both paths quoted so spaces survive the hook shell.
     hook_cmd = f'"{_venv_python(opts)}" "{opts.suite_root / SESSIONSTART_HOOK_REL}"'
     hooks = settings.setdefault("hooks", {})
     sessionstart = hooks.setdefault("SessionStart", [])
-    already = any(
-        h.get("command") == hook_cmd
-        for block in sessionstart
-        for h in block.get("hooks", [])
-    )
-    changed = not already
-    if not already:
+    # REPLACE, never append beside, an earlier agentflow entry (gh#985). Deduping on the
+    # exact command string left a re-provision from a new checkout with two entries, the
+    # old one exiting 127 every session once that checkout was deleted. The first agentflow
+    # entry is re-pointed in place; any further ones are dropped, along with a block they
+    # leave empty. Anything that is not provision's own command shape is left alone.
+    changed = False
+    found = False
+    kept_blocks = []
+    for block in sessionstart:
+        inner = block.get("hooks", [])
+        kept = []
+        for h in inner:
+            if not _is_agentflow_sessionstart(h.get("command")):
+                kept.append(h)
+            elif not found:
+                found = True
+                if h["command"] != hook_cmd:
+                    h["command"] = hook_cmd
+                    changed = True
+                kept.append(h)
+            else:
+                changed = True
+        if inner and not kept:
+            continue  # held only a duplicate agentflow entry
+        # Re-pointed in place, so the block keeps the operator's matcher by design.
+        block_copy = block if len(kept) == len(inner) else {**block, "hooks": kept}
+        kept_blocks.append(block_copy)
+    sessionstart[:] = kept_blocks
+    if not found:
         sessionstart.append({"hooks": [{"type": "command", "command": hook_cmd}]})
+        changed = True
     # Beside the hook, in the same file, so the hook reads the config home this run
     # provisioned (gh#689). An existing equal value is left exactly as written; a null one
     # is treated as absent. _check_config_env above has already refused a non-object "env".
@@ -1090,24 +1266,22 @@ def _do_sessionstart_hook(opts: Options) -> None:
             env["AGENTFLOW_CONFIG"] = config_env
             changed = True
     if changed:
-        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        # Atomic (temp in the same dir + replace) because this one file carries EVERY session's
+        # env block and hooks: a kill mid-write must not leave it truncated (gh#1046).
+        # The spelling is the one shared helper bootstrap writes the same file with, so the
+        # two writers never flip-flop its bytes. atomic_io is stdlib-only; the path insert
+        # matches the other lazy imports so a parent interpreter that never re-exec'd still
+        # finds it.
+        pkg = str(opts.suite_root / SHARED_PKG_REL)
+        if pkg not in sys.path:
+            sys.path.insert(0, pkg)
+        from agentflow.atomic_io import write_settings_json  # noqa: E402  (post editable install)
+
+        write_settings_json(settings_path, settings)
 
 
 def _do_presence_checks(opts: Options) -> None:
-    sys.path.insert(0, str(opts.suite_root / SHARED_PKG_REL))
-    from agentflow.config import (  # noqa: E402  (post editable install)
-        ConfigError,
-        load_environment,
-        load_project,
-    )
-    try:
-        load_environment()
-        projects_dir = opts.config_home / "projects"
-        if projects_dir.is_dir():
-            for md in sorted(projects_dir.glob("*.md")):
-                load_project(md.stem)
-    except ConfigError as e:
-        raise RuntimeError(f"config presence-check FAILED (hard-fail):\n{e}")
+    _load_config_or_fail(opts)
 
 
 def _verification_readiness(opts: Options) -> list:
@@ -1130,7 +1304,7 @@ def _verification_readiness(opts: Options) -> list:
 
     report = []
     for md in sorted(projects_dir.glob("*.md")):
-        project = load_project(md.stem)
+        project = load_project(md.stem, config_home=_resolved_home(opts))
         strategy = project.verification.strategy
         url = project.staging.url if project.staging else None
         recipe = project.staging.deploy_recipe if project.staging else None
@@ -1294,7 +1468,7 @@ def _do_scaffold_data_root(opts: Options) -> None:
     sys.path.insert(0, str(opts.suite_root / SHARED_PKG_REL))
     from agentflow.config import load_environment  # noqa: E402  (post editable install)
 
-    env = load_environment()
+    env = load_environment(config_home=_resolved_home(opts))
     projects_root = Path(env.data_root).expanduser() / "projects"
     projects_root.mkdir(parents=True, exist_ok=True)
 
@@ -1380,7 +1554,7 @@ def _mode_blurb(mode: str) -> str:
     return {
         "symlink": "Unix symlinks, live",
         "junction": "Windows junctions for directories, live; files copied",
-        "copy": "copies, STALE after any merge until re-provision",
+        "copy": "copies, STALE after any merge until `provision.py --deploy-only` re-runs",
     }.get(mode, mode)
 
 
@@ -1583,6 +1757,48 @@ def _matches_a_repo_version(suite_root: Path, source: Path, target: Path) -> boo
     )
 
 
+def _links_into(target: Path, suite_root: Path) -> bool:
+    """True when the link or junction at *target* resolves inside *suite_root*."""
+    return target.resolve().is_relative_to(suite_root.resolve())
+
+
+def _owned_link_elsewhere(target: Path, key: str, manifest_entries: dict,
+                          suite_root: Path, source: Path) -> bool:
+    """A link we deployed from ANOTHER checkout, which re-provision re-points (gh#985).
+
+    Two conditions, both required. The manifest holds this key (the ownership rule
+    `_is_agentflow_owned` already applies), AND the link lands on this entry's slot in
+    SOME checkout: it resolves to the source the manifest recorded, or its resolved path
+    ends in the same suite-relative parts as this checkout's source (`skills/alpha`,
+    `skills/_shared/scripts/plan-lint.sh`).
+
+    WHY NOT THE RECORDED SOURCE ALONE. The pre-fix code had already rewritten the manifest
+    to the new checkout while the links still pointed into the old one, so on exactly the
+    hosts this rule exists for the record no longer equals the link target - and deleting
+    the old checkout then dangled every seat (the gh#985 auditor repro).
+
+    WHY NOT THE MANIFEST KEY ALONE. The key says agentflow once deployed this slot, not
+    that the link there now is the one it made. An operator who re-pointed a seat at their
+    own tree (`theirs/alpha`) keeps it: that path does not end in `skills/alpha`.
+    """
+    if not _is_link(target) or not target.exists() or _links_into(target, suite_root):
+        return False
+    if key not in manifest_entries:
+        return False
+    resolved = target.resolve()
+    recorded = manifest_entries[key].get("source")
+    if recorded and Path(recorded).resolve() == resolved:
+        return True
+    try:
+        tail = source.resolve().relative_to(suite_root.resolve()).parts
+    except ValueError:
+        return False
+    # normcase per part: the same checkout path differs only in case on Windows.
+    have = [os.path.normcase(p) for p in resolved.parts]
+    want = [os.path.normcase(p) for p in tail]
+    return len(have) > len(want) and have[-len(want):] == want
+
+
 def _is_agentflow_owned(target: Path, key: str, manifest_entries: dict,
                         suite_root: Path, source: Path) -> bool:
     """Ownership = manifest record, symlink into the suite, in-dir marker, or a
@@ -1593,7 +1809,7 @@ def _is_agentflow_owned(target: Path, key: str, manifest_entries: dict,
         # Was `is_symlink()`, so a junction fell through to the marker check below and was
         # judged FOREIGN - because junction mode deliberately writes no marker. With an
         # empty or reset manifest that refuses every deployed skill as someone else's.
-        return target.resolve().is_relative_to(suite_root.resolve())
+        return _links_into(target, suite_root)
     if target.is_dir():
         return (target / DEPLOY_MARKER_NAME).exists()
     return target.is_file() and target.read_bytes() == source.read_bytes()
@@ -1645,6 +1861,12 @@ def _refuse_undeployable(
         )
     if _is_link(target) and not target.exists():
         return  # broken agentflow link or junction (suite moved): re-pointed, never refused
+    if _owned_link_elsewhere(target, key, recorded_entries, opts.suite_root, source):
+        # An owned link into ANOTHER checkout (re-provision from a new clone): re-pointed,
+        # never refused. A link holds no local work - edits made through it live in the
+        # other checkout, which re-pointing leaves untouched - so the drift refusal below,
+        # written to protect hand edits in a COPY, has nothing to protect here.
+        return
     current_hash = _content_hash(target)
     if current_hash != source_hash:
         recorded = recorded_entries.get(key, {}).get("sha256")
@@ -1727,7 +1949,10 @@ def _do_deploy_skills(opts: Options) -> None:
     clobbered, not even with --force). Present + agentflow-owned: identical to
     source -> untouched no-op; drifted from source but matching the manifest's
     recorded hash (a suite update) -> refresh; drifted from the RECORDED hash
-    (someone hand-edited the deployed copy) -> refuse unless --force. Finishes
+    (someone hand-edited the deployed copy) -> refuse unless --force. An owned link
+    (key in the manifest) whose target lies outside this checkout but lands on this
+    entry's suite-relative path in some checkout -> re-pointed at this one, whatever
+    its hash. Finishes
     by rewriting the manifest (source, target, sha256 per entry).
     """
     claude_root = opts.claude_root
@@ -1744,7 +1969,7 @@ def _do_deploy_skills(opts: Options) -> None:
             )
             print(
                 "  Deployed skills will be STALE after every merge until you re-run "
-                "provision - gh#296.",
+                "`provision.py --deploy-only` from the primary checkout - gh#296.",
                 file=sys.stderr,
             )
             mode = "copy"
@@ -1780,6 +2005,21 @@ def _do_deploy_skills(opts: Options) -> None:
             _deploy_entry(source, target, mode)
         elif _is_link(target) and not target.exists():
             _remove_target(target)  # broken agentflow link (suite moved): re-point
+            _deploy_entry(source, target, mode)
+        elif _owned_link_elsewhere(target, key, recorded_entries, opts.suite_root, source):
+            # Re-provision from another checkout (gh#985). An identical clone hashes EQUAL,
+            # so the hash branch below kept the link pointing at the old checkout while the
+            # manifest recorded the new one - and deleting the old checkout then dangled
+            # every seat. Ownership is the manifest key plus a link that lands on this
+            # entry's slot in some checkout; see `_owned_link_elsewhere`.
+            old = target.resolve()
+            recorded = recorded_entries.get(key, {}).get("source")
+            if not recorded or Path(recorded).resolve() != old:
+                # Re-pointed on the slot-tail match, not the manifest's record: say so, so
+                # an operator whose own fork link was re-pointed can see it happen.
+                print(f"  provision: re-pointed {target} from {old} to {source}",
+                      file=sys.stderr)
+            _remove_target(target)
             _deploy_entry(source, target, mode)
         elif _mode_mismatch(target, source, mode):
             # MIGRATION, AND IT HAS TO BE ITS OWN BRANCH. Changing the mode alone converts
@@ -2080,7 +2320,9 @@ def build_steps(opts: Options) -> list[Step]:
             2, "Config presence: environment.md exists + resolves",
             [f"{opts.config_home / 'environment.md'}",
              "written by the install/SKILL.md interview; broken config = loud hard-fail",
-             "pre-creates data_root (parents ok) so the step-10 resolver finds it"],
+             "pre-creates data_root (parents ok) so the resolver finds it",
+             "then runs the resolver over environment.md + every projects/<name>.md "
+             "(at step 5 instead when this interpreter has no PyYAML yet)"],
             run=_do_config_presence,
         ),
         Step(
@@ -2192,19 +2434,62 @@ def build_steps(opts: Options) -> list[Step]:
     ]
 
 
+DEPLOY_STEP = 7
+DEPLOY_ONLY_NOTE = (
+    "deploy-only: step 7 alone - no other step runs and no project's data subtree is written"
+)
+# Flags that ask for a step `--deploy-only` will not run. Dropping one silently would let the
+# operator believe it took effect; `--no-autodoc` / `--no-auto-allow` / `--no-wake-watch`
+# only skip steps, so they agree with deploy-only and are accepted.
+# The venv handover re-execs with `--resume-from 5` appended to the invoked argv. Today it
+# fires only at the end of step 4, which deploy-only never runs; if it ever moves into a step
+# deploy-only does run, the `--resume-from` refusal below would kill the child.
+_DEPLOY_ONLY_CONFLICTS = (
+    ("resume_from", "--resume-from", lambda v: v is not None),
+    ("autodoc", "--autodoc", lambda v: v is True),
+    ("wake_watch", "--wake-watch", lambda v: v is True),
+)
+
+
+def _is_linked_worktree(suite_root: Path) -> bool:
+    """True when *suite_root* is a linked git worktree: its `.git` is a `gitdir:` FILE.
+
+    Under link deployment every seat's skill entry points INTO suite_root, so deploying from a
+    per-epic worktree re-points the whole fleet at a directory that is deleted after merge.
+    """
+    dot_git = suite_root / ".git"
+    if not dot_git.is_file():
+        return False
+    try:
+        head = dot_git.read_text(encoding="utf-8", errors="replace")[:256]
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {dot_git} to tell whether it is a worktree: {exc}") from exc
+    return head.lstrip().startswith("gitdir:")
+
+
+def select_steps(opts: Options, steps: list[Step]) -> list[Step]:
+    """The steps this run executes: all of them, or step 7 alone under `--deploy-only`."""
+    if opts.deploy_only:
+        return [s for s in steps if s.n == DEPLOY_STEP]
+    return steps
+
+
 # --------------------------------------------------------------------------- #
 # Rendering + execution
 # --------------------------------------------------------------------------- #
 def print_plan(opts: Options, steps: list[Step]) -> None:
     print("agentflow provision - DRY RUN (no changes will be made)")
+    if opts.deploy_only:
+        print(f"  mode        : {DEPLOY_ONLY_NOTE}")
     print(f"  suite_root  : {opts.suite_root}")
     print(f"  config_home : {opts.config_home}")
     print(f"  settings    : {opts.settings_file}")
     print(f"  autodoc     : {'enabled' if opts.autodoc else 'disabled'} ({opts.autodoc_reason})")
-    if opts.autodoc_explicit and opts.autodoc:
-        # A dry run never imports the resolver, so it cannot confirm the flag itself.
-        print("                --autodoc is confirmed against the resolved config at step 5, "
-              "and refused there if no autodoc_root resolves")
+    if opts.autodoc_source in ("flag", "env") and opts.autodoc:
+        # A dry run never imports the resolver, so it cannot confirm the answer itself.
+        decider = "--autodoc" if opts.autodoc_source == "flag" else "AGENTFLOW_AUTODOC"
+        print(f"                {decider} is checked against the resolved config at step 5, "
+              "with a WARNING there if no autodoc_root resolves")
     print(f"  auto-allow  : {'enabled' if opts.auto_allow else 'disabled (--no-auto-allow)'}")
     print()
     print("Ordered install steps:")
@@ -2220,11 +2505,13 @@ def print_plan(opts: Options, steps: list[Step]) -> None:
 
 def execute(opts: Options, steps: list[Step]) -> None:
     print("agentflow provision - applying")
-    print(f"  suite_root  : {opts.suite_root}")
-    print(f"  config_home : {opts.config_home}")
-    print(f"  settings    : {opts.settings_file}")
-    print(f"  autodoc     : {'enabled' if opts.autodoc else 'disabled'} ({opts.autodoc_reason})")
-    print(f"  auto-allow  : {'enabled' if opts.auto_allow else 'disabled (--no-auto-allow)'}")
+    if opts.deploy_only:
+        # Only what step 7 reads and writes; the rest would describe steps that do not run.
+        print(f"  mode        : {DEPLOY_ONLY_NOTE}")
+        print(f"  suite_root  : {opts.suite_root}")
+        print(f"  claude_root : {opts.claude_root}")
+    else:
+        _print_full_apply_header(opts)
     for s in steps:
         if not s.is_applicable(opts):
             print(f"  {s.n}. {s.title} - SKIPPED ({s.skip_reason(opts)})")
@@ -2233,6 +2520,14 @@ def execute(opts: Options, steps: list[Step]) -> None:
         if s.run is not None:
             s.run(opts)  # fail loudly — no try/except swallow
         print(f"  {s.n}. done.")
+
+
+def _print_full_apply_header(opts: Options) -> None:
+    print(f"  suite_root  : {opts.suite_root}")
+    print(f"  config_home : {opts.config_home}")
+    print(f"  settings    : {opts.settings_file}")
+    print(f"  autodoc     : {'enabled' if opts.autodoc else 'disabled'} ({opts.autodoc_reason})")
+    print(f"  auto-allow  : {'enabled' if opts.auto_allow else 'disabled (--no-auto-allow)'}")
 
 
 def _launch_dir(settings_file: Path) -> Optional[Path]:
@@ -2332,15 +2627,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--force", action="store_true",
                         help="refresh agentflow-owned deployed skills/commands even if "
                              "locally modified (foreign entries are still never overwritten)")
+    parser.add_argument("--deploy-only", dest="deploy_only", action="store_true",
+                        help="run step 7 alone: deploy skills/commands/hook scripts and "
+                             "nothing else - no venv, no hooks, no data_root scaffold (the "
+                             "way a lane makes a skill change live)")
     args = parser.parse_args(argv)
+    if args.deploy_only:
+        clashing = [flag for attr, flag, clashes in _DEPLOY_ONLY_CONFLICTS
+                    if clashes(getattr(args, attr))]
+        if clashing:
+            # parser.error, like argparse's own mutually-exclusive refusals: usage + exit 2.
+            parser.error(f"--deploy-only runs step {DEPLOY_STEP} alone and cannot be combined "
+                         f"with {', '.join(clashing)}, which asks for a step it does not run")
     # What the child must inherit. Captured from the SAME value argparse consumed, so a
     # programmatic caller's flags reach the child exactly as an operator's do.
-    global _INVOKED_ARGV
-    _INVOKED_ARGV = list(argv) if argv is not None else list(sys.argv[1:])
+    invoked_argv = tuple(argv) if argv is not None else tuple(sys.argv[1:])
 
     suite_root = _suite_root(args.suite_root)
+    if args.deploy_only and _is_linked_worktree(suite_root):
+        parser.error(
+            f"--deploy-only refuses to deploy from {suite_root}: it is a linked git worktree, "
+            "and every seat's deployed skills would point into a directory that is deleted "
+            "after merge. Run it from the primary checkout after the merge lands, or pass "
+            "--suite-root <primary checkout>")
     config_home = _config_home(args.config_home)
-    autodoc, reason = _resolve_autodoc(args.autodoc, config_home)
+    autodoc, reason, autodoc_source = _resolve_autodoc(args.autodoc, config_home)
     opts = Options(
         dry_run=args.dry_run,
         suite_root=suite_root,
@@ -2348,35 +2659,47 @@ def main(argv: Optional[list[str]] = None) -> int:
         settings_file=_settings_file(args.settings_file),
         autodoc=autodoc,
         autodoc_reason=reason,
-        autodoc_explicit=args.autodoc is not None,
+        autodoc_source=autodoc_source,
         claude_root=_claude_root(args.claude_root),
         force=args.force,
         auto_allow=args.auto_allow,
         wake_watch=args.wake_watch,
+        deploy_only=args.deploy_only,
+        invoked_argv=invoked_argv,
     )
 
-    steps = build_steps(opts)
+    steps = select_steps(opts, build_steps(opts))
 
     if opts.dry_run:
         print_plan(opts, steps)
         return 0
 
-    if args.resume_from is not None:
+    # Steps that resolve config through agentflow.config (the presence checks, the data-root
+    # scaffold, the closing doctor) are handed this run's home explicitly, and the child
+    # processes (bootstrap, the venv handover) get it in their own env. os.environ is
+    # never touched: pinning a process-global variable per call let two overlapping
+    # in-process runs each restore the other's value.
+    return _apply(opts, steps, args.resume_from)
+
+
+def _apply(opts: Options, steps: list[Step], resume_from: Optional[int]) -> int:
+    """The applying half of main()."""
+    if resume_from is not None:
         valid = {s.n for s in steps}
-        if args.resume_from not in valid:
+        if resume_from not in valid:
             # An out-of-range resume ran ZERO steps and exited 0 under the full success
             # banner - an install that did nothing and said it succeeded. The flag is
             # internal, so this is a guard against a future caller rather than an operator.
             sys.stderr.write(
                 "\nagentflow provision FAILED:\n"
-                f"--resume-from {args.resume_from} names no step; "
+                f"--resume-from {resume_from} names no step; "
                 f"this run has {sorted(valid)}\n"
             )
             return 1
         # The venv handover. Steps below the resume point already ran in the parent; they are
         # idempotent, but re-running them would reprint lines the reader has already seen, and
         # an installer whose output does not match its own step numbering is unfollowable.
-        steps = [s for s in steps if s.n >= args.resume_from]
+        steps = [s for s in steps if s.n >= resume_from]
 
     try:
         execute(opts, steps)
@@ -2404,6 +2727,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             "something to work around.\n"
         )
         return 1
+    if opts.deploy_only:
+        # The closing readiness report, venv advice and doctor all describe a whole install
+        # and read every project's config; a skill deploy changed none of what they report.
+        print(f"\n{DEPLOY_ONLY_NOTE}. Run provision without --deploy-only for a full install.")
+        return 0
     _print_verification_readiness(_verification_readiness(opts))
     # The fleet skills call bare `python -m agentflow.registry` (and other agentflow.* modules)
     # with the SESSION'S python; the suite venv lives at <suite_root>/.venv. Make that venv the
@@ -2439,19 +2767,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     # and failing the installer on that would make `doctor` the thing people skip.
     print("")
     print("Resolved-surface check (python -m agentflow.doctor):")
+    # Two catches, not one (gh#1114). Only a doctor that cannot be IMPORTED is "unavailable";
+    # the import sits alone in its try so an ImportError raised from inside render() cannot
+    # borrow that softer wording. Anything the doctor raises once imported is a defect in
+    # doctor or provision, and the old blanket catch printed it as if the environment lacked
+    # a module. Both stay advisory: the return code is 0 either way.
     try:
         from agentflow._stdio import utf8_stdio
         from agentflow.doctor import diagnose, examined_a_project, render, unexamined_verdict
-
+    except ImportError as exc:
+        print(f"  (doctor unavailable: {type(exc).__name__}: {exc})")
+        return 0
+    except Exception as exc:  # noqa: BLE001 - a broken doctor module is a defect, still advisory
+        # Importing runs the doctor's module code: a SyntaxError or module-level NameError
+        # there is the defect class this check names, and must not escape main().
+        _report_doctor_defect(exc)
+        return 0
+    try:
         # Same forcing as `python -m agentflow.doctor` (gh#416): on a cp1252 console one
-        # character outside the code page raised here, the except below swallowed it, and
+        # character outside the code page raised here, a blanket except swallowed it, and
         # the install ended with no report at all (gh#524). One shared helper since
         # gh#574; a stream without reconfigure (a test capture) is left alone.
         utf8_stdio()
         _print_doctor_report(opts, diagnose, render, examined_a_project, unexamined_verdict)
     except Exception as exc:  # noqa: BLE001 - never fail an install on the diagnostic
-        print(f"  (doctor unavailable: {type(exc).__name__}: {exc})")
+        _report_doctor_defect(exc)
     return 0
+
+
+def _report_doctor_defect(exc: Exception) -> None:
+    """Name a raising closing doctor as a defect; the traceback goes to stderr."""
+    print(f"FAIL closing doctor raised {type(exc).__name__}: {exc} "
+          "(a defect, not your environment)")
+    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
 
 
 def _print_doctor_report(opts: Options, diagnose, render, examined_a_project,
@@ -2465,19 +2813,20 @@ def _print_doctor_report(opts: Options, diagnose, render, examined_a_project,
     across projects, and each `render()` block is headed with the project it covers.
     """
     projects = _configured_projects(opts)
+    home = _resolved_home(opts)
     if not projects:
-        findings = diagnose()
+        findings = diagnose(config_home=home)
         report = render(findings)
         if not examined_a_project(findings):
             report = unexamined_verdict(report, opts.config_home / "projects")
         print(report)
         return
 
-    failing, warned = [], []
+    failing, warned, spec_warned = [], [], {}
     for name in projects:
         print(f"-- project {name} --")
         try:
-            findings = diagnose(name)
+            findings = diagnose(name, config_home=home)
         except Exception as exc:  # noqa: BLE001 - one project's crash must not hide the rest
             # `diagnose` is documented never to raise; if it does, that project is
             # reported as failing with the error, and the remaining projects still run.
@@ -2488,15 +2837,29 @@ def _print_doctor_report(opts: Options, diagnose, render, examined_a_project,
         print(render(findings))
         if any(f.failed for f in findings):
             failing.append(name)
-        elif any(f.warned for f in findings):
+            continue
+        # A survey:* warning is a spec-corpus problem, not a config clamp: counted apart so
+        # the verdict does not send the reader to a config home with nothing in it to fix.
+        if any(f.warned and not f.spec_corpus for f in findings):
             warned.append(name)
+        spec_count = sum(1 for f in findings if f.spec_corpus)
+        if spec_count:
+            spec_warned[name] = spec_count
     checked = f"checked: {', '.join(projects)}"
+    from agentflow.doctor import spec_note as spec_note_for   # one wording, shared with render()
+
+    spec_note = f"{spec_note_for(sum(spec_warned.values()))} for {', '.join(spec_warned)}"
     if failing:
         print(f"resolved surface NOT healthy: {len(failing)} of {len(projects)} configured "
               f"project(s) failing: {', '.join(failing)} ({checked})")
     elif warned:
+        also = f"; also {spec_note}" if spec_warned else ""
         print(f"resolved surface healthy for all {len(projects)} configured project(s), but NOT "
-              f"everywhere as configured - see the warning(s) for {', '.join(warned)} ({checked})")
+              f"everywhere as configured - see the warning(s) for {', '.join(warned)}{also} "
+              f"({checked})")
+    elif spec_warned:
+        print(f"resolved surface healthy for all {len(projects)} configured project(s) and "
+              f"configured as intended; {spec_note} - see above ({checked})")
     else:
         print(f"resolved surface healthy for all {len(projects)} configured project(s) ({checked})")
 

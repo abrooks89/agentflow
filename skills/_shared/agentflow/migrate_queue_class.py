@@ -276,6 +276,29 @@ def main(argv=None) -> int:
 
         data_root = Path(load_environment().data_root)
 
+    # A project with no directory is a usage error, not an empty corpus. The survey glob only
+    # checks the name's shape, so a typo would scan nothing and print `scanned=0
+    # to_rewrite=0` with exit 0 - the same shape as a fully migrated corpus, while the real
+    # one stays unmigrated. That is the non-run reading as a finished run that the explicit
+    # mode flags above exist to prevent.
+    # Shape first, with the survey's own rule: `..` or an empty name would otherwise resolve
+    # to an existing directory (the data root, or projects/ itself), pass the check below and
+    # crash later with a traceback.
+    try:
+        DEFAULT_SURVEY_PATTERNS.for_project(args.project)
+    except ValueError as err:
+        print(f"Refusing to run: {err}. Nothing was scanned or written.", file=sys.stderr)
+        return 2
+    project_dir = data_root / "projects" / args.project
+    if not project_dir.is_dir():
+        print(
+            f"Refusing to run: project {args.project!r} has no directory at {project_dir}. "
+            "Check the --project spelling (and --data-root, if given); nothing was scanned "
+            "or written.",
+            file=sys.stderr,
+        )
+        return 2
+
     plan = plan_migration(data_root, args.project)
     print(render(plan, args.dry_run))
     if args.apply and plan.rewrites:

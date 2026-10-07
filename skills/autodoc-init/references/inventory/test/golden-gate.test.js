@@ -8,7 +8,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { runGoldenGate } from '../golden-gate.js';
+import { ownedPages, runGoldenGate } from '../golden-gate.js';
+import { listPages } from '../graph-check.js';
 import { findFiles } from '../assert-no-agent-writes.js';
 
 function page({ type = 'service', title, body = '', extra = '' }) {
@@ -253,6 +254,126 @@ test('a malformed symmetric budget still throws even when the lost budget is giv
     () => gateConfig(baselineFiles(), { pageSetLostBudget: 0, pageSetSymmetricDiffBudget: -1 }),
     /pageSetSymmetricDiffBudget must be a declared non-negative integer/,
   );
+});
+
+// --- gh#592: a first /autodoc-init build has an empty baseline ---------------
+// Every page of a first build is "only-rendered", so the symmetric budget is
+// unpassable by construction there. /autodoc-init Step 5c picks the lost-only
+// mode when the baseline holds zero content pages; these pin the two outcomes
+// that choice relies on, without any change to the gate itself.
+function thirteenPages() {
+  const files = {};
+  for (let i = 1; i <= 13; i += 1) {
+    files[`services/New${i}.md`] = page({ title: `New${i}`, extra: SERVICE_EXTRA });
+  }
+  return files;
+}
+
+test('gh#592: empty baseline + 13 rendered pages passes under pageSetLostBudget 0, reporting 13 created', () => {
+  // Nav-only baseline: what a scaffolded-but-never-built corpus holds.
+  const baseline = { 'CLAUDE.md': '# scaffold\n', 'log.md': '# log\n' };
+  const run = gateConfig(thirteenPages(), { pageSetLostBudget: 0 }, { baseline });
+  const ps = resultOf(run, 'page-set');
+  assert.ok(ps.ok, ps.detail);
+  assert.match(ps.detail, /0 lost <= budget 0/);
+  assert.match(ps.detail, /13 created/);
+  assert.ok(run.ok, JSON.stringify(run.results, null, 2));
+});
+
+test('gh#592: a populated baseline still fails 13 > 12 under the symmetric budget', () => {
+  const baseline = standaloneBaseline();
+  const rendered = { ...standaloneBaseline(), ...thirteenPages() };
+  const run = gateConfig(rendered, { pageSetSymmetricDiffBudget: 12 }, { baseline });
+  const ps = resultOf(run, 'page-set');
+  assert.ok(!ps.ok, ps.detail);
+  assert.match(ps.detail, /symmetric difference 13 > budget 12/);
+  assert.ok(!run.ok);
+});
+
+// --- pages the renderer does not own -----------------------------------------
+// The live corpus legitimately holds human-owned pages the renderer never
+// produces: a Review Backlog the update intake reads and writes back, and
+// other `type: meta` notes. Counting them as lost made every refresh of such a
+// corpus fail page-set at budget 0. They are excluded from the page-set count
+// only; a rendered page that genuinely disappears must still fail.
+function baselineWithUnowned() {
+  return {
+    ...standaloneBaseline(),
+    'Review Backlog.md': page({ type: 'meta', title: 'Review Backlog' }),
+    // a backlog file is human-owned by name, whatever its frontmatter says
+    'Review Backlog (parked).md': '# Review Backlog (parked)\n\nNo frontmatter at all.\n',
+    'Skill Hardening.md': page({ type: 'meta', title: 'Skill Hardening' }),
+  };
+}
+
+test('unowned baseline pages (type: meta, Review Backlog*) do not count as lost', () => {
+  const run = gateConfig(standaloneBaseline(), { pageSetLostBudget: 0 }, { baseline: baselineWithUnowned() });
+  const ps = resultOf(run, 'page-set');
+  assert.ok(ps.ok, ps.detail);
+  assert.match(ps.detail, /0 lost <= budget 0/);
+  assert.match(ps.detail, /3 not renderer-owned/);
+  assert.ok(run.ok, JSON.stringify(run.results, null, 2));
+});
+
+test('unowned baseline pages do not hide a genuinely lost rendered page', () => {
+  const files = standaloneBaseline();
+  delete files['services/Two.md'];
+  const run = gateConfig(files, { pageSetLostBudget: 0 }, { baseline: baselineWithUnowned() });
+  const ps = resultOf(run, 'page-set');
+  assert.ok(!ps.ok, ps.detail);
+  assert.match(ps.detail, /1 lost > budget 0/);
+  assert.match(ps.detail, /only-baseline: services\/Two\.md;/);
+  assert.doesNotMatch(ps.detail, /Review Backlog|Skill Hardening/);
+  assert.ok(!run.ok);
+});
+
+test('unowned baseline pages are excluded from the symmetric count too', () => {
+  const run = gateConfig(standaloneBaseline(), { pageSetSymmetricDiffBudget: 0 }, { baseline: baselineWithUnowned() });
+  const ps = resultOf(run, 'page-set');
+  assert.ok(ps.ok, ps.detail);
+  assert.match(ps.detail, /symmetric difference 0 <= budget 0/);
+  // and on the rendered side: an unowned page there is not a "created" page
+  const rendered = { ...standaloneBaseline(), 'Review Backlog.md': page({ type: 'meta', title: 'Review Backlog' }) };
+  const both = gateConfig(rendered, { pageSetSymmetricDiffBudget: 0 }, { baseline: standaloneBaseline() });
+  assert.match(resultOf(both, 'page-set').detail, /symmetric difference 0 <= budget 0/);
+});
+
+test('a content-typed page whose name is not a backlog still counts as lost', () => {
+  // Only `type: meta` and the Review Backlog* name are unowned; a root page of
+  // a content type is the renderer's and its loss must register.
+  const baseline = { ...standaloneBaseline(), 'Backlog Service.md': page({ title: 'Backlog Service', extra: SERVICE_EXTRA }) };
+  const run = gateConfig(standaloneBaseline(), { pageSetLostBudget: 0 }, { baseline });
+  const ps = resultOf(run, 'page-set');
+  assert.ok(!ps.ok, ps.detail);
+  assert.match(ps.detail, /1 lost > budget 0; only-baseline: Backlog Service\.md/);
+});
+
+test('a "Review Backlog" name below the root is a content page and still counts as lost', () => {
+  // The intake only reads backlog files at the corpus root, so the name exempts
+  // nothing in a subfolder.
+  const baseline = {
+    ...standaloneBaseline(),
+    'services/Review Backlog Worker.md': page({ title: 'Review Backlog Worker', extra: SERVICE_EXTRA }),
+  };
+  const run = gateConfig(standaloneBaseline(), { pageSetLostBudget: 0 }, { baseline });
+  const ps = resultOf(run, 'page-set');
+  assert.ok(!ps.ok, ps.detail);
+  assert.match(ps.detail, /1 lost > budget 0; only-baseline: services\/Review Backlog Worker\.md/);
+});
+
+test('ownedPages counts what page-set compares: a backlog-only tree is empty', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gg-owned-'));
+  try {
+    mkdirSync(join(dir, 'services'));
+    writeFileSync(join(dir, 'index.md'), '# nav\n');
+    writeFileSync(join(dir, 'Review Backlog.md'), page({ type: 'meta', title: 'Review Backlog' }));
+    writeFileSync(join(dir, 'Notes.md'), page({ type: 'meta', title: 'Notes' }));
+    assert.equal(ownedPages(listPages(dir, { excludeNav: true })).length, 0);
+    writeFileSync(join(dir, 'services', 'One.md'), page({ title: 'One', extra: SERVICE_EXTRA }));
+    assert.deepEqual(ownedPages(listPages(dir, { excludeNav: true })).map((p) => p.file), ['services/One.md']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('assert-no-agent-writes finds stray files recursively', () => {

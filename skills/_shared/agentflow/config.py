@@ -21,6 +21,7 @@ Deps: PyYAML only.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import logging
 import os
@@ -191,6 +192,10 @@ class Verification:
 class WorkSource:
     kind: str = "filesystem"
     bug_triage: bool = False
+    #: How many open issues one issue-intake read may answer for; past it the intake readers
+    #: refuse (``issue_intake._refuse_past_the_page``). A profile key and never a CLI flag: a
+    #: seat must not be able to step past that guard on its own.
+    open_issue_page: int = 200
 
 
 @dataclass
@@ -319,13 +324,82 @@ def _reject_unknown_keys(data: dict, file, prefix: str = "") -> None:
             _reject_unknown_keys(value, file, f"{path}.")
 
 
+#: Every key the schema reads, per block path ("" = a file's top level), environment and
+#: project unioned. A key not read YET is not an unknown key: the builders read in order and
+#: stop at the first failure, so at the moment a required key is found missing, legitimate
+#: keys further down (`autodoc_root`, `worktree_root`) are still unread - and suggesting one
+#: as a misspelling would tell the operator to rename a correct key. Only keys outside this
+#: set may be suggested. Unioning the two files over-excludes a little, which costs at most
+#: a missed hint and never a wrong one. Kept equal to the builders' own reads by a test that
+#: derives the same map from this module's source, so a new reader cannot drift past it.
+_SCHEMA_KEYS: dict = {
+    "": frozenset({
+        "aliases", "audit", "autodoc_root", "canonical_repo", "communities", "data_root",
+        "deprecated_mirror", "deprecated_mirror_checkout", "domains", "editor_cmd",
+        "excluded_domains", "generation_skills", "git_host", "harness_notes", "lock_dir",
+        "mtime_cutoff_iso", "name", "notify", "parallel_builders", "person", "publish_repo",
+        "question_style", "schema_version", "shell", "staging", "status_board_url_template",
+        "suite_root", "vault", "verification", "work_source", "worktree_root",
+    }),
+    "audit": frozenset({"idle_wake_minutes", "notify", "roles", "window"}),
+    "canonical_repo": frozenset({"base_branch", "host_ref", "local_checkout", "python"}),
+    "communities": frozenset({"pins"}),
+    "generation_skills": frozenset({"polishing", "provision"}),
+    "git_host": frozenset({"cli", "kind"}),
+    "notify": frozenset({"ascii_only", "kind", "topic_env", "url_env"}),
+    "parallel_builders": frozenset({"count", "enabled"}),
+    "person": frozenset({"name"}),
+    "publish_repo": frozenset({"cadence", "host_ref"}),
+    "staging": frozenset({"checkout_path", "deploy_host_ssh", "deploy_recipe", "url"}),
+    "vault": frozenset({
+        "autodoc_update_skill", "hot_cache", "mirror_helper", "root", "save_skill", "subdir",
+    }),
+    "verification": frozenset({"roles", "strategy", "test_login", "url"}),
+    "work_source": frozenset({"bug_triage", "kind", "open_issue_page"}),
+}
+
+
+def _near_miss(data, key: str, block: str) -> Optional[str]:
+    """The UNKNOWN key in *data* that looks like a misspelling of *key*, or None.
+
+    WHY: `_reject_unknown_keys` runs only after every required check passes, so a typo'd
+    REQUIRED key was reported as missing, the operator added it as advised, and only the
+    next run named the stray spelling (gh#882). Looking among the block's unknown keys at
+    the moment the required one is found missing names both in one run. *block* is the
+    block's path in `_SCHEMA_KEYS`; a schema key is never a candidate, read yet or not.
+    Only an ABSENT key gets a hint: one present but null was spelled right.
+    """
+    if not isinstance(data, dict) or key in data:
+        return None
+    known = _SCHEMA_KEYS.get(block, frozenset())
+    strays = [k for k in data if isinstance(k, str) and k not in known]
+    match = difflib.get_close_matches(key, strays, n=1)
+    return match[0] if match else None
+
+
+def _missing_key(data, key: str, fp: str, file, reason: str, remediation: str) -> ConfigError:
+    """The ConfigError for a missing required *key*, naming a near-miss stray when there is one.
+
+    One builder for every missing-key raise, so every block (environment, project,
+    verification, ...) gets the hint and none drifts back to the bare message.
+    """
+    stray = _near_miss(data, key, fp.rpartition(".")[0])
+    if stray is None:
+        return ConfigError(fp, file, reason, remediation)
+    return ConfigError(
+        fp, file,
+        f"{reason}; found '{stray}' - a misspelling?",
+        f"rename '{stray}:' to '{key}:', or {remediation}",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Primitive validators (each raises ConfigError on the FIRST failure)
 # --------------------------------------------------------------------------- #
 def _require_block(data: dict, key: str, file) -> dict:
     _note(data, key)
     if not isinstance(data, dict) or data.get(key) is None:
-        raise ConfigError(key, file, f"required block '{key}' is missing", f"add the '{key}:' block")
+        raise _missing_key(data, key, key, file, f"required block '{key}' is missing", f"add the '{key}:' block")
     block = data[key]
     if not isinstance(block, dict):
         raise ConfigError(key, file, f"'{key}' must be a mapping", f"make '{key}' a yaml block")
@@ -336,7 +410,7 @@ def _require_int(data: dict, key: str, file, fp: Optional[str] = None) -> int:
     fp = fp or key
     _note(data, key)
     if key not in data or data[key] is None:
-        raise ConfigError(fp, file, f"required key '{key}' is missing", f"add '{key}:' (int)")
+        raise _missing_key(data, key, fp, file, f"required key '{key}' is missing", f"add '{key}:' (int)")
     v = data[key]
     if isinstance(v, bool) or not isinstance(v, int):
         raise ConfigError(fp, file, f"expected int, got {type(v).__name__}", f"set {fp} to an integer")
@@ -347,7 +421,7 @@ def _require_str(data: dict, key: str, file, fp: Optional[str] = None) -> str:
     fp = fp or key
     _note(data, key)
     if key not in data or data[key] is None:
-        raise ConfigError(fp, file, f"required key '{key}' is missing", f"add '{key}:' (string)")
+        raise _missing_key(data, key, fp, file, f"required key '{key}' is missing", f"add '{key}:' (string)")
     v = data[key]
     if not isinstance(v, str):
         raise ConfigError(fp, file, f"expected string, got {type(v).__name__}", f"set {fp} to a string")
@@ -447,15 +521,69 @@ def _check_path_if_set(value, fp: str, file, *, must_be_dir=False) -> Optional[s
     return str(p)
 
 
-def _check_skill_path_if_set(value, fp: str, file, *, executable=False) -> Optional[str]:
-    """Delegated SKILL.md / script presence-check — a configured-but-missing path is loud."""
-    if value is None:
+@dataclass(frozen=True)
+class PendingSkillDeploy:
+    """Skills a caller is about to deploy into ``<claude_root>/skills/`` (gh#1047).
+
+    Only the installer passes this. A profile may point a delegated field at a SKILL.md
+    under the Claude config dir that the installer itself deploys, and the installer loads
+    the profile before that deploy runs, so the strict presence check failed every fresh
+    machine. With this, a missing ``<claude_root>/skills/<name>/<rel>`` is accepted when
+    *name* is in *shipped* and ``<suite_root>/skills/<name>/<rel>`` is a file. The
+    installer's post-deploy load passes nothing and gets the strict check back.
+    """
+
+    claude_root: Path
+    suite_root: Path
+    shipped: frozenset = frozenset()
+
+
+def _pending_deploy_source(p: Path, pending: Optional[PendingSkillDeploy]) -> Optional[Path]:
+    """The suite file that will be deployed to *p*, or None when *p* is not one."""
+    if pending is None:
+        return None
+    shipped = {os.path.normcase(n) for n in pending.shipped}
+    claude_root = Path(pending.claude_root).expanduser()
+    # Lexical first, so a stale link under skills/ (a moved suite checkout) cannot steer
+    # the comparison; resolved second, so a symlinked Claude dir spelled two ways matches.
+    # Both collapse `..`, so a path that climbs out of skills/ never lines up.
+    for norm in (lambda q: Path(os.path.abspath(q)), lambda q: q.resolve()):
+        skills, target = norm(claude_root / "skills"), norm(p)
+        n = len(skills.parts)
+        if len(target.parts) < n + 2:   # <name>/<file> at the least; a bare dir never ships
+            continue
+        if [os.path.normcase(x) for x in target.parts[:n]] != [os.path.normcase(x) for x in skills.parts]:
+            continue
+        rel = target.parts[n:]
+        if os.path.normcase(rel[0]) not in shipped:
+            continue
+        source = Path(pending.suite_root).expanduser() / "skills" / Path(*rel)
+        if source.is_file():
+            return source
+    return None
+
+
+def _check_skill_path_if_set(value, fp: str, file, *, executable=False,
+                             pending: Optional[PendingSkillDeploy] = None) -> Optional[str]:
+    """Delegated SKILL.md / script presence-check — a configured-but-missing path is loud.
+
+    *pending* (installer only, gh#1047): a missing path the caller is about to deploy
+    passes, checked against its suite source instead.
+    """
+    # Blank means unset. Path("") is Path("."), which exists, so a blank value would pass
+    # the check below and resolve to the process's cwd - printed as `= .` in the resolved
+    # block and followed as if it were a skill. No delegated path is ever a bare directory.
+    if value is None or not value.strip():
         return None
     p = Path(value).expanduser()
+    checked = p
     if not p.exists():
-        raise ConfigError(fp, file, f"delegated path missing: {p}", f"install the SKILL.md/script or set {fp}: null")
-    if executable and not os.access(str(p), os.X_OK):
-        raise ConfigError(fp, file, f"delegated script not executable: {p}", f"make {p} executable or set {fp}: null")
+        source = _pending_deploy_source(p, pending)
+        if source is None:
+            raise ConfigError(fp, file, f"delegated path missing: {p}", f"install the SKILL.md/script or set {fp}: null")
+        checked = source
+    if executable and not os.access(str(checked), os.X_OK):
+        raise ConfigError(fp, file, f"delegated script not executable: {checked}", f"make {checked} executable or set {fp}: null")
     return str(p)
 
 
@@ -487,12 +615,19 @@ def _load_first_yaml_block(file: Path) -> dict:
     return data
 
 
-def config_home() -> Path:
-    """Config root: ``$AGENTFLOW_CONFIG`` (expanded) else ``~/.agentflow/config``.
+def config_home(config_home: "Optional[Path | str]" = None) -> Path:
+    """Config root: *config_home* if given, else ``$AGENTFLOW_CONFIG`` (expanded), else
+    ``~/.agentflow/config``.
 
     Public so every caller — the SessionStart hook included — resolves the root
     HERE. A second copy of these four lines is how the hook and the resolver drift.
+
+    *config_home* lets an in-process caller that serves a home other than the process's
+    (the installer, given ``--config-home``) say so per call. Pinning the variable
+    instead is process-global: two overlapping calls each restore the other's value.
     """
+    if config_home is not None:
+        return Path(config_home).expanduser()
     override = os.environ.get("AGENTFLOW_CONFIG")
     if override:
         return Path(override).expanduser()
@@ -505,7 +640,8 @@ _config_home = config_home  # legacy private alias — existing internal callers
 # --------------------------------------------------------------------------- #
 # Environment builder
 # --------------------------------------------------------------------------- #
-def _build_environment(data: dict, file: Path) -> Environment:
+def _build_environment(data: dict, file: Path, *,
+                       pending: Optional[PendingSkillDeploy] = None) -> Environment:
     _start_recording()
     sv = _require_int(data, "schema_version", file)
     if sv != 1:
@@ -563,13 +699,16 @@ def _build_environment(data: dict, file: Path) -> Environment:
         # This is the ONE error an existing downstream install hits on upgrade, so a
         # remediation that omits an example value costs every one of them a second round
         # trip when they guess a path that does not exist yet.
-        raise ConfigError(
+        raise _missing_key(
+            data,
+            "worktree_root",
             "worktree_root",
             file,
             "required key 'worktree_root' is missing",
             "add 'worktree_root: ~/worktrees' - an EXISTING directory under which each "
-            "lane's per-epic worktree is created as <worktree_root>/<project>/<epic-slug>; "
-            "create it first, then re-run. See SCHEMA.md.",
+            "lane's per-epic worktree is created as <worktree_root>/<project>/<epic-branch> "
+            "(the claim branch name, e<NNNN>-<short>; <epic-slug> in a hand run); create it first, then re-run. "
+            "See SCHEMA.md.",
         )
     worktree_root = _require_dir(_require_str(data, "worktree_root", file), "worktree_root", file)
     status_tpl = _opt_str(data, "status_board_url_template", file, None)
@@ -585,9 +724,9 @@ def _build_environment(data: dict, file: Path) -> Environment:
         vault = Vault(
             root=_require_dir(_require_str(vb, "root", file, "vault.root"), "vault.root", file),  # R* iff block present
             subdir=_opt_str(vb, "subdir", file) or DEFAULT_VAULT_SUBDIR,
-            save_skill=_check_skill_path_if_set(_opt_str(vb, "save_skill", file), "vault.save_skill", file),
-            autodoc_update_skill=_check_skill_path_if_set(_opt_str(vb, "autodoc_update_skill", file), "vault.autodoc_update_skill", file),
-            mirror_helper=_check_skill_path_if_set(_opt_str(vb, "mirror_helper", file), "vault.mirror_helper", file, executable=True),
+            save_skill=_check_skill_path_if_set(_opt_str(vb, "save_skill", file), "vault.save_skill", file, pending=pending),
+            autodoc_update_skill=_check_skill_path_if_set(_opt_str(vb, "autodoc_update_skill", file), "vault.autodoc_update_skill", file, pending=pending),
+            mirror_helper=_check_skill_path_if_set(_opt_str(vb, "mirror_helper", file), "vault.mirror_helper", file, executable=True, pending=pending),
             hot_cache=_check_path_if_set(_opt_str(vb, "hot_cache", file), "vault.hot_cache", file),
         )
 
@@ -658,7 +797,8 @@ def _clamped_idle_wake(minutes: int, file) -> int:
         return floor
     return minutes
 
-def _build_project(data: dict, file: Path, name: str) -> Project:
+def _build_project(data: dict, file: Path, name: str, *,
+                   pending: Optional[PendingSkillDeploy] = None) -> Project:
     _start_recording()
     sv = _require_int(data, "schema_version", file)
     if sv != 1:
@@ -718,16 +858,21 @@ def _build_project(data: dict, file: Path, name: str) -> Project:
         pvb = _require_block(data, "vault", file)
         proj_vault = Vault(
             root=_require_dir(_require_str(pvb, "root", file, "vault.root"), "vault.root", file),
-            save_skill=_check_skill_path_if_set(_opt_str(pvb, "save_skill", file), "vault.save_skill", file),
-            autodoc_update_skill=_check_skill_path_if_set(_opt_str(pvb, "autodoc_update_skill", file), "vault.autodoc_update_skill", file),
-            mirror_helper=_check_skill_path_if_set(_opt_str(pvb, "mirror_helper", file), "vault.mirror_helper", file, executable=True),
+            save_skill=_check_skill_path_if_set(_opt_str(pvb, "save_skill", file), "vault.save_skill", file, pending=pending),
+            autodoc_update_skill=_check_skill_path_if_set(_opt_str(pvb, "autodoc_update_skill", file), "vault.autodoc_update_skill", file, pending=pending),
+            mirror_helper=_check_skill_path_if_set(_opt_str(pvb, "mirror_helper", file), "vault.mirror_helper", file, executable=True, pending=pending),
             hot_cache=_check_path_if_set(_opt_str(pvb, "hot_cache", file), "vault.hot_cache", file),
         )
 
     ver_b = _require_block(data, "verification", file)
     strategy = _require_str(ver_b, "strategy", file, "verification.strategy")
+    # Required, so blank is an error here: the skill-path check below reads blank as unset,
+    # which is right for optional delegated paths and wrong for this one.
+    if not strategy.strip():
+        raise ConfigError("verification.strategy", file, "'verification.strategy' is empty",
+                          "set verification.strategy to an enum value or a SKILL.md path")
     if strategy not in _VERIFICATION_ENUM:  # enum value OR resolvable SKILL.md path
-        _check_skill_path_if_set(strategy, "verification.strategy", file)
+        _check_skill_path_if_set(strategy, "verification.strategy", file, pending=pending)
     # READ, do not ignore. `verification.url` was declared in a live project file and
     # nothing had ever read it: the binding below overwrites the field from staging.url,
     # so the declared value was dead and a divergence between the two would have been
@@ -785,14 +930,22 @@ def _build_project(data: dict, file: Path, name: str) -> Project:
         ws_kind = _opt_str(ws_b, "kind", file, "filesystem", "work_source.kind")
         if ws_kind not in {"github-issues", "gitea", "filesystem", "none"}:
             raise ConfigError("work_source.kind", file, f"'{ws_kind}' not a valid work_source kind", "use github-issues|gitea|filesystem|none")
-        work_source = WorkSource(kind=ws_kind, bug_triage=_opt_bool(ws_b, "bug_triage", file, False, "work_source.bug_triage"))
+        page = _opt_int(ws_b, "open_issue_page", file, 200, "work_source.open_issue_page")
+        # Rejected, not clamped: 0 refuses every read of a non-empty tracker, and a negative
+        # page hands the tracker CLI a nonsense --limit. Neither is a usable preference.
+        if page < 1:
+            raise ConfigError("work_source.open_issue_page", file, f"open_issue_page {page} is below 1",
+                              "set work_source.open_issue_page to 1 or more (default 200)")
+        work_source = WorkSource(kind=ws_kind,
+                                 bug_triage=_opt_bool(ws_b, "bug_triage", file, False, "work_source.bug_triage"),
+                                 open_issue_page=page)
 
     generation_skills = GenerationSkills()
     if _optional_block(data, "generation_skills") is not None:
         gs_b = _require_block(data, "generation_skills", file)
         generation_skills = GenerationSkills(
-            polishing=_check_skill_path_if_set(_opt_str(gs_b, "polishing", file), "generation_skills.polishing", file),
-            provision=_check_skill_path_if_set(_opt_str(gs_b, "provision", file), "generation_skills.provision", file),
+            polishing=_check_skill_path_if_set(_opt_str(gs_b, "polishing", file), "generation_skills.polishing", file, pending=pending),
+            provision=_check_skill_path_if_set(_opt_str(gs_b, "provision", file), "generation_skills.provision", file, pending=pending),
         )
 
     communities = None
@@ -873,9 +1026,9 @@ def _build_project(data: dict, file: Path, name: str) -> Project:
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-def environment_path() -> Path:
+def environment_path(config_home: "Optional[Path | str]" = None) -> Path:
     """``<config-home>/environment.md``, the file :func:`load_environment` reads."""
-    return _config_home() / "environment.md"
+    return _config_home(config_home) / "environment.md"
 
 
 def error_line(exc: BaseException, file: Optional[Path] = None) -> str:
@@ -890,21 +1043,118 @@ def error_line(exc: BaseException, file: Optional[Path] = None) -> str:
     return " ".join(ln.strip() for ln in str(exc).splitlines() if ln.strip())
 
 
-def load_environment() -> Environment:
-    """Load + validate ``<config-home>/environment.md``. Raises ConfigError loudly."""
-    file = environment_path()
+def failure_report(exc: ConfigError, headline: str) -> str:
+    """The stderr text for a config that failed to load, specific error FIRST.
+
+    Seats ntfy the first stderr line on a failed load, and a banner shows only the start of
+    it. With the fixed headline on line 1 they sent the headline and dropped the facts
+    (gh#918). So line 1 is ``[<field>] <reason's first line>`` - field and reason ahead of
+    the file path, which can be long - then the headline, then the full error (file, field,
+    reason, remediation) exactly as ``str(exc)`` gives it. Shared by ``config show`` and the
+    SessionStart hook so the two cannot drift.
+    """
+    reason = next((ln for ln in exc.reason.splitlines() if ln.strip()), "(no reason given)")
+    return f"[{exc.field_path}] {reason}\n{headline}\n{exc}\n"
+
+
+def load_environment(*, config_home: "Optional[Path | str]" = None,
+                     pending_deploy: Optional[PendingSkillDeploy] = None) -> Environment:
+    """Load + validate ``<config-home>/environment.md``. Raises ConfigError loudly.
+
+    *config_home* overrides ``$AGENTFLOW_CONFIG`` for this call only (see :func:`config_home`).
+    *pending_deploy* is for the installer alone, before its skill deploy (see
+    :class:`PendingSkillDeploy`); every other caller leaves it None and gets the strict check.
+    """
+    file = environment_path(config_home)
     data = _load_first_yaml_block(file)
-    return _build_environment(data, file)
+    if pending_deploy is None:   # the exact call every non-installer caller has always made
+        return _build_environment(data, file)
+    return _build_environment(data, file, pending=pending_deploy)
 
 
-def load_project(name: str) -> Project:
-    """Load + validate ``<config-home>/projects/<name>.md``. Raises ConfigError loudly."""
-    file = _config_home() / "projects" / f"{name}.md"
+#: Where the last name :func:`resolve_project_name` returned came from, as ``(name, source)``.
+#: A module-level note rather than a new return value: every caller does
+#: ``load_project(resolve_project_name(arg))``, and changing either signature would break
+#: them all. ``load_project`` reads it only when the name matches, so a stale note can
+#: at worst describe a name that was resolved earlier in the same process. Its scope is
+#: same-name-only - a different name gets no source - and it is not thread-safe: two
+#: threads resolving concurrently can overwrite each other's note.
+_last_resolution: Optional[tuple] = None
+
+
+def _project_name_error(name: str, file: Path, source: Optional[str],
+                        config_home: "Optional[Path | str]" = None) -> Optional[ConfigError]:
+    """Why *name* cannot be loaded as a project, or None when its file exists.
+
+    A name is a FILE STEM. One with a separator or ``..`` reaches other files: ``--project
+    ../environment`` loaded environment.md as a project and failed on a missing ``name:``,
+    which points nowhere near the typo (gh#881). And an unknown name used to get "run the
+    agentflow installer" - heavy, wrong advice for the likeliest launch mistake, reaching a
+    phone through the seats' first-line ntfy. So the FIRST line carries the key facts: the
+    name, where it came from, what IS configured, and the closest match. The installer
+    remediation stays for the one case it fits: nothing configured at all.
+
+    ``field_path`` stays ``<file>`` for an unknown name: callers key on it to report "config
+    file not found" without echoing the message.
+    """
+    origin = f" ({source})" if source else ""
+    # `:` because `C:foo` is drive-relative on Windows and escapes projects/ as surely as a
+    # separator does. Dots only as the whole name: `a..b` is a legal stem.
+    if any(sep in name for sep in ("/", "\\", ":")) or name in (".", ".."):
+        return ConfigError(
+            "<project>", file,
+            f"invalid project name '{name}'{origin}: a name is a bare file stem, not a path; "
+            f"configured: {', '.join(configured_project_names(config_home)) or 'none'}",
+            "pass the bare name of a projects/<name>.md file - separators, drive letters "
+            "and '..' would load some other file as a project",
+        )
+    if file.exists():
+        return None
+    # Listed only on the failure path: a successful load has no use for the directory scan.
+    configured = configured_project_names(config_home)
+    listing = ", ".join(configured)
+    if not configured:
+        return ConfigError(
+            "<file>", file, f"config file not found: {file}",
+            "run the agentflow installer or create the config file",
+        )
+    guess = difflib.get_close_matches(name, configured, n=1)
+    hint = f"; did you mean '{guess[0]}'?" if guess else ""
+    if source == "from $AGENTFLOW_PROJECT":
+        fix = "set $AGENTFLOW_PROJECT to a configured name"
+    else:
+        fix = "pass a configured name to --project"
+    return ConfigError(
+        "<file>", file,
+        f"unknown project '{name}'{origin}; configured: {listing}{hint}",
+        f"{fix}, or create {file} for a new project",
+    )
+
+
+def load_project(name: str, *, source: Optional[str] = None,
+                 config_home: "Optional[Path | str]" = None,
+                 pending_deploy: Optional[PendingSkillDeploy] = None) -> Project:
+    """Load + validate ``<config-home>/projects/<name>.md``. Raises ConfigError loudly.
+
+    *source* says where *name* came from, for the error message. Left None it is taken
+    from the last :func:`resolve_project_name` call when that returned this same name.
+    *config_home* overrides ``$AGENTFLOW_CONFIG`` for this call only (see :func:`config_home`).
+    *pending_deploy*: as for :func:`load_environment`.
+    """
+    if source is None and _last_resolution is not None and _last_resolution[0] == name:
+        source = _last_resolution[1]
+    file = _config_home(config_home) / "projects" / f"{name}.md"
+    problem = _project_name_error(name, file, source, config_home)
+    if problem is not None:
+        raise problem
     data = _load_first_yaml_block(file)
-    return _build_project(data, file, name)
+    if pending_deploy is None:   # the exact call every non-installer caller has always made
+        return _build_project(data, file, name)
+    return _build_project(data, file, name, pending=pending_deploy)
 
 
-def resolve_project_name(explicit: Optional[str] = None) -> Optional[str]:
+def resolve_project_name(explicit: Optional[str] = None, *,
+                         config_home: "Optional[Path | str]" = None) -> Optional[str]:
     """Active project name, highest precedence first:
 
     1. ``explicit`` — the ``--project <name>`` argument off the slash command. It
@@ -914,18 +1164,24 @@ def resolve_project_name(explicit: Optional[str] = None) -> Optional[str]:
     4. ``None`` — environment-only config, which is valid.
 
     Called with ``explicit=None`` this reproduces the SessionStart hook's
-    resolution EXACTLY; the hook's failure semantics are unchanged.
+    resolution EXACTLY; the hook's failure semantics are unchanged. *config_home*
+    overrides ``$AGENTFLOW_CONFIG`` for step 3 only (see :func:`config_home`).
     """
+    global _last_resolution
     if explicit:
+        _last_resolution = (explicit, "from --project")
         return explicit
     from_env = os.environ.get("AGENTFLOW_PROJECT")
     if from_env:
+        _last_resolution = (from_env, "from $AGENTFLOW_PROJECT")
         return from_env
-    projects_dir = config_home() / "projects"
+    projects_dir = _config_home(config_home) / "projects"
     if projects_dir.is_dir():
         candidates = sorted(p.stem for p in projects_dir.glob("*.md"))
         if len(candidates) == 1:  # single-project default
+            _last_resolution = (candidates[0], "the only configured project")
             return candidates[0]
+    _last_resolution = None
     return None
 
 
@@ -1355,6 +1611,13 @@ def render_resolved_block(env: Environment, proj: Optional[Project]) -> str:
         vurl = f", url: {v.url}" if v.url else ""
         vroles = f", roles: {', '.join(v.roles)}" if v.roles else ""
         lines.append(f"[verification] {v.strategy}{vurl}{vroles}")
+        # Unconditional, defaults included: issue intake reads these three keys, and a seat
+        # that cannot see them cannot tell a defaulted profile from a configured one (gh#1031).
+        ws = proj.work_source
+        lines.append(
+            f"[work_source] kind: {ws.kind}, bug_triage: {ws.bug_triage}, "
+            f"open_issue_page: {ws.open_issue_page}"
+        )
         # Printed only when flagged: the block is what every loop reads at session open,
         # so a misconfiguration named here is seen before intake refuses on it.
         _conflict = work_source_host_conflict(env, proj)
@@ -1363,6 +1626,378 @@ def render_resolved_block(env: Environment, proj: Optional[Project]) -> str:
 
     lines.append("=================================")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Declared-dependency check — the auditor's fallback when [product python] is unset
+# --------------------------------------------------------------------------- #
+# With no `canonical_repo.python`, an audit probe runs under the default `python`, which in a
+# fleet session is this suite's venv. A probe that then dies on a missing third-party import
+# reads like a product regression. The auditor is read-only (no scratch venv, no install), so
+# it checks once per pass whether the product's DECLARED distributions are present here and
+# blocks the probe when they are not. Presence only: versions are not compared, because
+# comparing them needs a specifier parser this package does not depend on.
+_PYPROJECT_SOURCE = "pyproject.toml [project].dependencies"
+_REQUIREMENTS_SOURCE = "requirements.txt"
+_UNSET = "product interpreter unset; ran under default python"
+DECLARED_DEPS_PRESENT_EVIDENCE = f"{_UNSET} (declared deps present); versions are not compared"
+# Names what was read, so a product declaring its dependencies elsewhere (setup.py, a lock
+# file) is never reported as having none.
+DECLARED_DEPS_NONE_EVIDENCE = (
+    f"{_UNSET} (no dependencies declared in pyproject.toml [project] or requirements.txt)"
+)
+DECLARED_DEPS_REMEDY = "set canonical_repo.python in projects/<name>.md"
+
+# PEP 508 distribution name at the head of a requirement string.
+_REQ_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+
+def normalize_dist_name(name: str) -> str:
+    """PEP 503 normalized form: runs of ``-_.`` collapse to ``-``, lowercased."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def requirement_name(line: str) -> Optional[str]:
+    """The distribution name in one requirement line, or None for a line that names none.
+
+    Strips extras, version specifiers, markers and comments. Skips blank lines, comments,
+    option lines (``-r``, ``-e``, ``-c``, ``--index-url`` ...), and bare paths or URLs, which
+    name no distribution without building them. A ``name @ url`` direct reference keeps its
+    name.
+    """
+    s = re.split(r"(?:^|\s)#", line, maxsplit=1)[0].strip()
+    if not s or s.startswith(("-", ".", "/", "~")):
+        return None
+    # A bare local archive (`pkg-1.0-py3-none-any.whl`, `pkg.tar.gz`) names a file, not a
+    # distribution. `name @ <url-to-archive>` is a direct reference and keeps its name.
+    head = s.split(";", 1)[0].strip()
+    if "@" not in head and re.search(r"\.(?:whl|zip|tar\.gz|tgz|tar\.bz2|tar\.xz)$", head, re.IGNORECASE):
+        return None
+    m = _REQ_NAME.match(s)
+    if not m:
+        return None
+    rest = s[m.end():].lstrip()
+    # `git+https://...`, `https://...`, `C:\...`: the "name" matched is a scheme or a drive.
+    if rest.startswith((":", "+", "/", "\\")):
+        return None
+    return m.group(0)
+
+
+# --------------------------------------------------------------------------- #
+# Environment markers: a small PEP 508 subset, evaluated for THIS interpreter
+# --------------------------------------------------------------------------- #
+# The check reports what the default python can import here, so a requirement whose marker is
+# false on this platform (`pywin32; sys_platform == "win32"` on Linux) is not declared for it.
+# Only a subset is understood; anything outside it fails open to "applies", so an unparsed
+# marker never hides a requirement.
+_MARKER_VARS = frozenset({
+    "sys_platform", "platform_system", "os_name", "python_version", "platform_machine",
+    "implementation_name",
+})
+_MARKER_TOKEN = re.compile(
+    r"\s*(?:(?P<str>'[^']*'|\"[^\"]*\")|(?P<op>==|!=|<=|>=|<|>)|(?P<paren>[()])"
+    r"|(?P<word>[A-Za-z_][A-Za-z0-9_.]*))"
+)
+
+
+class _MarkerUnsupported(Exception):
+    """A marker outside the supported subset; the caller treats the requirement as applicable."""
+
+
+def _marker_environment() -> dict:
+    """Marker variable values for the running interpreter."""
+    import os
+    import platform
+
+    return {
+        "sys_platform": sys.platform,
+        "platform_system": platform.system(),
+        "os_name": os.name,
+        "python_version": "{}.{}".format(*sys.version_info[:2]),
+        "platform_machine": platform.machine(),
+        "implementation_name": sys.implementation.name,
+    }
+
+
+_MARKER_WS_END = re.compile(r"\s*\Z")
+
+
+def _marker_tokens(marker: str) -> list:
+    tokens, pos = [], 0
+    while pos < len(marker):
+        if _MARKER_WS_END.match(marker, pos):
+            break
+        m = _MARKER_TOKEN.match(marker, pos)
+        if not m:
+            raise _MarkerUnsupported(marker)
+        kind = m.lastgroup
+        text = m.group(kind)
+        tokens.append((kind, text[1:-1] if kind == "str" else text))
+        pos = m.end()
+    return tokens
+
+
+def _version_tuple(value: str) -> tuple:
+    if not re.fullmatch(r"\d+(?:\.\d+)*", value):
+        raise _MarkerUnsupported(value)
+    return tuple(int(p) for p in value.split("."))
+
+
+def _marker_compare(var: str, op: str, value: str, env: dict) -> bool:
+    actual = env[var]
+    if var == "python_version":
+        a, b = _version_tuple(actual), _version_tuple(value)
+        width = max(len(a), len(b))
+        a, b = a + (0,) * (width - len(a)), b + (0,) * (width - len(b))
+    elif op in ("==", "!="):
+        a, b = actual, value
+    else:
+        raise _MarkerUnsupported(f"{var} {op}")
+    return {
+        "==": a == b, "!=": a != b, "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b,
+    }[op]
+
+
+_REVERSED_OP = {"==": "==", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
+
+
+def _marker_eval(tokens: list, env: dict) -> bool:
+    """Recursive descent over ``or`` / ``and`` / parentheses; ``and`` binds tighter."""
+    pos = 0
+
+    def peek():
+        return tokens[pos] if pos < len(tokens) else (None, None)
+
+    def take():
+        nonlocal pos
+        if pos >= len(tokens):
+            raise _MarkerUnsupported("truncated marker")
+        pos += 1
+        return tokens[pos - 1]
+
+    def clause() -> bool:
+        if peek() == ("paren", "("):
+            take()
+            result = disjunction()
+            if take() != ("paren", ")"):
+                raise _MarkerUnsupported("unbalanced parentheses")
+            return result
+        (lk, lv), (ok, ov), (rk, rv) = take(), take(), take()
+        if ok != "op":
+            raise _MarkerUnsupported(f"operator {ov!r}")
+        if lk == "word" and rk == "str" and lv in _MARKER_VARS:
+            return _marker_compare(lv, ov, rv, env)
+        if lk == "str" and rk == "word" and rv in _MARKER_VARS:
+            return _marker_compare(rv, _REVERSED_OP[ov], lv, env)
+        raise _MarkerUnsupported(f"clause {lv!r} {ov} {rv!r}")
+
+    def conjunction() -> bool:
+        result = clause()
+        while peek() == ("word", "and"):
+            take()
+            result = clause() and result
+        return result
+
+    def disjunction() -> bool:
+        result = conjunction()
+        while peek() == ("word", "or"):
+            take()
+            result = conjunction() or result
+        return result
+
+    result = disjunction()
+    if pos != len(tokens):
+        raise _MarkerUnsupported("trailing tokens")
+    return result
+
+
+def requirement_marker(line: str) -> Optional[str]:
+    """The environment marker of one requirement string, or None when it carries none."""
+    s = re.split(r"(?:^|\s)#", line, maxsplit=1)[0]
+    # A direct reference's URL may hold a `;`, so its marker needs whitespace before the `;`.
+    parts = re.split(r"\s;" if "@" in s.split(";", 1)[0] else ";", s, maxsplit=1)
+    if len(parts) < 2:
+        return None
+    # Per-requirement options (`--hash=...`) may follow the marker on a requirements line.
+    marker = re.split(r"\s--", parts[1], maxsplit=1)[0].strip()
+    return marker or None
+
+
+def marker_applies(marker: Optional[str], env: Optional[dict] = None) -> bool:
+    """Whether a requirement with this marker applies to the running interpreter.
+
+    Supports ``<var> <op> '<value>'`` and ``'<value>' <op> <var>`` clauses over
+    ``sys_platform``, ``platform_system``, ``os_name``, ``python_version``,
+    ``platform_machine`` and ``implementation_name``, joined by ``and`` / ``or`` with
+    parentheses. ``==`` / ``!=`` work for every variable; ``<``, ``<=``, ``>``, ``>=`` only for
+    ``python_version``, compared as integer tuples. Anything else (``extra``, ``in``, an
+    unknown variable, malformed text) returns True: an unparsed marker never drops a
+    requirement, and this never raises.
+    """
+    if not marker:
+        return True
+    try:
+        return _marker_eval(_marker_tokens(marker), _marker_environment() if env is None else env)
+    except (_MarkerUnsupported, RecursionError):
+        # Deeply nested parentheses exhaust the recursive-descent stack; that is malformed
+        # input like any other and must not escape as a traceback.
+        return True
+
+
+@dataclass(frozen=True)
+class DeclaredDeps:
+    """Result of ``declared_deps_check``. ``source`` is None when nothing was declared."""
+
+    repo: str
+    source: Optional[str]
+    declared: tuple
+    missing: tuple
+
+    @property
+    def declared_count(self) -> int:
+        return len(self.declared)
+
+    @property
+    def blocks(self) -> bool:
+        return bool(self.missing)
+
+    @property
+    def evidence(self) -> str:
+        return DECLARED_DEPS_NONE_EVIDENCE if self.source is None else DECLARED_DEPS_PRESENT_EVIDENCE
+
+    @property
+    def blocked_on(self) -> Optional[str]:
+        if not self.missing:
+            return None
+        return (
+            "probe cannot run: product interpreter unset and declared distributions missing "
+            f"under default python ({self.source}): {', '.join(self.missing)}; "
+            f"remedy: {DECLARED_DEPS_REMEDY}"
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "repo": self.repo,
+            "source": self.source,
+            "declared_count": self.declared_count,
+            "missing": list(self.missing),
+            "evidence": self.evidence,
+            "blocked_on": self.blocked_on,
+        }
+
+
+def _declared_requirements(root: Path) -> tuple:
+    """(source, [requirement strings]) from pyproject [project].dependencies, else
+    requirements.txt; (None, []) when neither declares any."""
+    import tomllib
+
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise ConfigError(
+                "project.dependencies", pyproject,
+                f"pyproject.toml could not be read: {exc}",
+                "fix the file - the auditor cannot tell which dependencies the product declares",
+            ) from exc
+        project = data.get("project", {})
+        if not isinstance(project, dict):
+            raise ConfigError(
+                "project.dependencies", pyproject,
+                "[project] is not a table",
+                "declare [project] as a TOML table",
+            )
+        deps = project.get("dependencies")
+        if deps:
+            if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
+                raise ConfigError(
+                    "project.dependencies", pyproject,
+                    "[project].dependencies is not a list of requirement strings",
+                    "declare dependencies as a TOML array of strings",
+                )
+            return _PYPROJECT_SOURCE, deps
+    reqs = root / "requirements.txt"
+    if reqs.is_file():
+        lines = _requirements_lines(reqs, set(), None)
+        if any(requirement_name(line) for line in lines):
+            return _REQUIREMENTS_SOURCE, lines
+    return None, []
+
+
+# `-r base.txt`, `-rbase.txt`, `--requirement base.txt`, `--requirement=base.txt`. Constraint
+# files (`-c`) only narrow versions and declare nothing, so they are not followed.
+_REQ_INCLUDE = re.compile(r"^(?:-r\s*|--requirement(?:\s*=\s*|\s+))(?P<path>\S+)")
+
+
+def _requirements_lines(path: Path, visited: set, included_from: Optional[Path]) -> list:
+    """Every line of a requirements file, with ``-r`` includes expanded in place.
+
+    An include resolves against the including file's directory. A file already read is
+    skipped, so a cycle terminates. An include that cannot be read fails like an unreadable
+    ``requirements.txt``: a declaration the check cannot see must not read as none.
+    """
+    visited.add(path.resolve())
+    label = "requirements.txt" if included_from is None else (
+        f"requirements include {path} (from {included_from})"
+    )
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(
+            "requirements", path, f"{label} could not be read: {exc}",
+            "fix the file's permissions or encoding (it must be UTF-8)" if included_from is None
+            else "fix the -r path, or the included file's permissions or encoding (UTF-8)",
+        ) from exc
+    out: list = []
+    for line in lines:
+        m = _REQ_INCLUDE.match(re.split(r"(?:^|\s)#", line, maxsplit=1)[0].strip())
+        if not m:
+            out.append(line)
+            continue
+        target = m.group("path")
+        if re.match(r"[A-Za-z][A-Za-z0-9+.-]+://", target):
+            raise ConfigError(
+                "requirements", path, f"{label} includes a remote file ({target})",
+                "the check reads local files only; vendor the included file into the repo",
+            )
+        child = path.parent / target
+        if child.resolve() not in visited:
+            out.extend(_requirements_lines(child, visited, path))
+    return out
+
+
+def declared_deps_check(repo_root, installed: Optional[set] = None) -> DeclaredDeps:
+    """Which of the product's declared distributions are absent under THIS interpreter.
+
+    ``installed`` is a set of distribution names (any spelling) for tests; by default it is
+    every distribution ``importlib.metadata`` can see. Names compare PEP 503 normalized. A
+    requirement whose environment marker is false here is not declared for this interpreter,
+    so it is neither checked nor counted (see ``marker_applies``).
+    Raises ``ConfigError`` when the repo root is missing or a declaration file is unreadable.
+    """
+    root = Path(repo_root).expanduser()
+    if not root.is_dir():
+        raise ConfigError(
+            "canonical_repo.local_checkout", root, "repo root does not exist",
+            "point --repo at the product checkout",
+        )
+    source, reqs = _declared_requirements(root)
+    names: list = []
+    seen: set = set()
+    for req in reqs:
+        name = requirement_name(req)
+        if name and normalize_dist_name(name) not in seen and marker_applies(requirement_marker(req)):
+            seen.add(normalize_dist_name(name))
+            names.append(name)
+    if installed is None:
+        import importlib.metadata
+
+        installed = {d.metadata["Name"] for d in importlib.metadata.distributions()
+                     if d.metadata["Name"]}
+    have = {normalize_dist_name(n) for n in installed}
+    missing = tuple(n for n in names if normalize_dist_name(n) not in have)
+    return DeclaredDeps(repo=str(root), source=source, declared=tuple(names), missing=missing)
 
 
 def render_project_claude_md(proj):
@@ -1410,6 +2045,7 @@ def render_project_claude_md(proj):
 
 # --------------------------------------------------------------------------- #
 # CLI — `python -m agentflow.config show [--project <name>]`
+#       `python -m agentflow.config declared-deps --repo <repo_root>`
 # --------------------------------------------------------------------------- #
 def _cmd_show(args: argparse.Namespace) -> int:
     """Print the resolved block for the named project. Same resolver, same hard-fail."""
@@ -1424,10 +2060,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if repo_rules:
             out += repo_rules + "\n"
     except ConfigError as e:
-        # Same two-line shape the SessionStart hook uses: headline, then the full
-        # error (file / field / reason / remediation all live in str(e)).
-        sys.stderr.write("agentflow config resolution FAILED\n")
-        sys.stderr.write(f"{e}\n")
+        # Same shape the SessionStart hook uses: the specific error, the headline, then
+        # the full error (file / field / reason / remediation all live in str(e)).
+        sys.stderr.write(failure_report(e, "agentflow config resolution FAILED"))
         sys.stderr.flush()
         return 1
 
@@ -1439,6 +2074,20 @@ def _cmd_show(args: argparse.Namespace) -> int:
     sys.stdout.write(out)
     sys.stdout.flush()
     return 0
+
+
+def _cmd_declared_deps(args: argparse.Namespace) -> int:
+    """Print the declared-deps result as JSON. Same failure shape as ``show``."""
+    try:
+        result = declared_deps_check(args.repo)
+    except ConfigError as e:
+        sys.stderr.write("agentflow declared-deps check FAILED\n")
+        sys.stderr.write(f"{e}\n")
+        sys.stderr.flush()
+        return 2
+    sys.stdout.write(json.dumps(result.to_dict()) + "\n")
+    sys.stdout.flush()
+    return 1 if result.blocks else 0
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -1472,9 +2121,23 @@ def main(argv: Optional[list] = None) -> int:
         ),
     )
 
+    deps = sub.add_parser(
+        "declared-deps",
+        help="check the product's declared dependencies are installed under this python",
+        description=(
+            "Read pyproject.toml [project].dependencies, else requirements.txt, at --repo and "
+            "print JSON naming any declared distribution not installed under this "
+            "interpreter. Exit 0 when none is missing (or none is declared), 1 when any is, "
+            "2 when a declaration file cannot be read. Versions are not compared."
+        ),
+    )
+    deps.add_argument("--repo", metavar="PATH", required=True, help="the product repo root")
+
     args = parser.parse_args(argv)
     if args.command == "show":
         return _cmd_show(args)
+    if args.command == "declared-deps":
+        return _cmd_declared_deps(args)
     parser.error(f"unknown command: {args.command}")  # unreachable — argparse guards
     return 2
 

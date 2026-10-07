@@ -1,9 +1,10 @@
 """gh#116: the ref sweep, and the several ways it could delete something alive.
 
 Every test drives REAL git against a real local bare remote - no network, and no mock standing in
-for git. Only one test monkeypatches anything, and it says why at the call site; the property that
-monkeypatch used to hide (`live_remote_heads` returning None rather than an empty set) is asserted
-directly against a genuinely unreachable remote, because a test that replaces the function under
+for git. A monkeypatch stands only where a seam cannot be driven honestly - the project config,
+the `gh` merged-PR reader (no test may reach the network) and a failing worktree list - and says
+why at the call site. The property a monkeypatch once hid (`live_remote_heads` returning None
+rather than an empty set) is asserted directly against a genuinely unreachable remote, because a test that replaces the function under
 test cannot hold that function's contract.
 """
 
@@ -31,9 +32,14 @@ def _init(path: Path, bare: bool = False) -> Path:
         check=True, capture_output=True,
     )
     if not bare:
-        for k, v in (("user.email", "t@e.st"), ("user.name", "t")):
-            _git(path, "config", k, v)
+        _configure(path)
     return path
+
+
+def _configure(path: Path) -> None:
+    """Identity, and signing pinned off so a machine with global commit signing still passes."""
+    for k, v in (("user.email", "t@e.st"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        _git(path, "config", k, v)
 
 
 @pytest.fixture
@@ -50,8 +56,7 @@ def checkout(tmp_path: Path) -> Path:
 
     work = tmp_path / "work"
     subprocess.run(["git", "clone", str(bare), str(work)], check=True, capture_output=True)
-    for k, v in (("user.email", "t@e.st"), ("user.name", "t")):
-        _git(work, "config", k, v)
+    _configure(work)
     _git(work, "fetch", "origin")
     return work
 
@@ -430,16 +435,17 @@ def _refusal_sites() -> tuple:
 def test_the_refusal_sites_are_an_exclusive_chain_plus_an_independent_guard():
     """The shape the paragraph now describes, asserted against the code that has it.
 
-    Three mutually exclusive impoverished-remote cases in one chain, plus ONE independently
-    guarded refusal (`fetch.prune`) that can stand beside any of them. Not cosmetic: it is the
+    Three mutually exclusive impoverished-remote cases in one chain, plus TWO independently
+    guarded refusals (`fetch.prune`, and the local-branch deletion refusal) that can stand beside
+    any of them. Not cosmetic: it is the
     difference between "at most one refusal per run" and "up to two", which is what a reader
     needs in order to interpret a report at all.
     """
     chain, independent, total = _refusal_sites()
 
-    assert (chain, independent, total) == (3, 1, 4), (
+    assert (chain, independent, total) == (3, 2, 5), (
         f"refusal shape is now chain={chain} independent={independent} total={total}, not "
-        "(3, 1, 4). The steward refs paragraph states this shape in prose and its count sentence "
+        "(3, 2, 5). The steward refs paragraph states this shape in prose and its count sentence "
         "is scoped to the chain, so update skills/steward/SKILL.md in the same commit - a count "
         "nothing checks is exactly how gh#492 happened."
     )
@@ -496,10 +502,12 @@ def test_the_steward_paragraph_scopes_its_count_to_the_derived_number():
         "refusal in the module, which is four, and that reading is what got the paragraph filed "
         "as wrong when it was right under its own predicate."
     )
-    assert "FOURTH refusal" in text, (
-        "the paragraph must name the independently-guarded fourth refusal beside the count, so a "
-        "reader who greps the code for refusal sites can reconcile four with three instead of "
-        "concluding the document is stale."
+    _, independent, _ = _refusal_sites()
+    more = f"{_NUMBER_WORDS[independent].upper()} MORE refusal"
+    assert more in text, (
+        f"the paragraph must name the {independent} independently-guarded refusal(s) beside the "
+        f"count ('{more}'), so a reader who greps the code for refusal sites can reconcile the "
+        "total with the chain instead of concluding the document is stale."
     )
 
 
@@ -529,3 +537,335 @@ def test_the_paragraph_no_longer_predicts_that_the_refusal_cannot_clear():
         "returns. Replacing one absolute prediction with the opposite absolute would reproduce "
         "gh#492 in the other direction."
     )
+
+
+
+# --------------------------------------------------------------------------------------------- #
+# Merged LOCAL branches: deleted under --apply only when all three guards hold.
+#
+# (1) no head on origin, (2) tip == the headRefOid of a merged PR with the same head name,
+# (3) checked out in no worktree. The merged-PR set is always a stub here: no test calls `gh`.
+# --------------------------------------------------------------------------------------------- #
+def _reader(heads: dict):
+    return lambda: refs.MergedHeads(heads={k: frozenset(v) for k, v in heads.items()})
+
+
+def _never_called():
+    raise AssertionError("the merged-PR reader must not be called here")
+
+
+def _merged_local(checkout: Path, name: str = "feature/done") -> str:
+    """A local branch with its own commit and no head on origin - what a merged lane leaves."""
+    _git(checkout, "checkout", "-q", "-b", name)
+    (checkout / f"{name.replace('/', '_')}.txt").write_text("work\n", encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-q", "-m", f"work on {name}")
+    sha = _git(checkout, "rev-parse", "HEAD").strip()
+    _git(checkout, "checkout", "-q", "master")
+    return sha
+
+
+def _has_branch(checkout: Path, name: str) -> bool:
+    return name in refs.local_branch_tips(checkout)
+
+
+def test_an_exact_merged_pr_head_with_no_origin_head_is_deleted_under_apply(checkout):
+    sha = _merged_local(checkout)
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {sha}}))
+
+    assert p.deletable == [("feature/done", sha)]
+    assert _has_branch(checkout, "feature/done"), "planning deletes nothing"
+
+    failures, lines = refs.apply(checkout, p)
+    assert failures == 0, lines
+    assert not _has_branch(checkout, "feature/done")
+    assert _has_branch(checkout, "master"), "nothing else went with it"
+    assert any("deleted feature/done" in line for line in lines)
+
+
+def test_guard_1_a_branch_still_on_origin_is_never_a_candidate(checkout):
+    """Its tip IS the merged PR head, but origin still has the branch: not deleted."""
+    _git(checkout, "branch", "feature/live", "origin/feature/live")
+    sha = refs.local_branch_tips(checkout)["feature/live"]
+
+    p = refs.plan(checkout, pr_reader=_reader({"feature/live": {sha}}))
+
+    assert p.deletable == []
+
+
+def test_guard_2_a_merged_but_moved_branch_is_kept_with_its_reason(checkout):
+    """The tip is not the merged head: someone committed after the merge. Kept, and said why."""
+    sha = _merged_local(checkout)
+    other = _git(checkout, "rev-parse", "master").strip()
+    assert other != sha
+
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {other}}))
+
+    assert p.deletable == []
+    assert any("feature/done" in k and "merged but moved" in k for k in p.kept), p.kept
+
+
+def test_guard_2_a_never_merged_branch_is_kept_with_its_reason(checkout):
+    _merged_local(checkout)
+    p = refs.plan(checkout, pr_reader=_reader({}))
+
+    assert p.deletable == []
+    assert any("feature/done" in k and "never merged" in k for k in p.kept), p.kept
+
+
+def test_guard_2_matches_the_sha_under_the_same_head_name_only(checkout):
+    """A sha-only match would delete a branch whose tip happens to be ANOTHER PR's head."""
+    sha = _merged_local(checkout)
+    p = refs.plan(checkout, pr_reader=_reader({"some/other-branch": {sha}}))
+
+    assert p.deletable == []
+
+
+def test_guard_2_a_reused_head_name_matches_any_of_its_merged_heads(checkout):
+    sha = _merged_local(checkout)
+    older = _git(checkout, "rev-parse", "master").strip()
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {older, sha}}))
+
+    assert p.deletable == [("feature/done", sha)]
+
+
+def test_guard_3_a_branch_checked_out_in_a_worktree_is_kept(checkout, tmp_path):
+    sha = _merged_local(checkout)
+    _git(checkout, "worktree", "add", "-q", str(tmp_path / "wt"), "feature/done")
+
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {sha}}))
+
+    assert p.deletable == []
+    assert any("feature/done" in k and "checked out" in k for k in p.kept), p.kept
+
+
+def test_the_current_branch_is_never_deleted(checkout):
+    sha = _merged_local(checkout)
+    _git(checkout, "checkout", "-q", "feature/done")
+
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {sha}}))
+
+    assert p.deletable == []
+
+
+def test_the_base_branch_is_never_a_candidate(checkout):
+    sha = _merged_local(checkout)
+    p = refs.plan(checkout, base="feature/done", pr_reader=_reader({"feature/done": {sha}}))
+
+    assert p.deletable == []
+
+
+def test_an_unreadable_worktree_list_refuses_and_deletes_nothing(checkout, monkeypatch):
+    """Monkeypatched because a repo where `worktree list` fails while every other read works
+    cannot be built honestly. The property: an unknown set of held branches deletes nothing,
+    instead of reading as an empty set."""
+    sha = _merged_local(checkout)
+    monkeypatch.setattr(refs, "worktree_branches", lambda repo: None)
+
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {sha}}))
+
+    assert p.deletable == []
+    assert any("could not list worktrees" in r for r in p.refused)
+
+
+def test_no_pr_reader_deletes_nothing_and_says_why_without_refusing(checkout):
+    _merged_local(checkout)
+    p = refs.plan(checkout)
+
+    assert p.deletable == []
+    assert any("no merged-PR reader" in k for k in p.kept), p.kept
+    assert not any("merged-PR" in r for r in p.refused), "a missing reader is not a finding"
+
+
+def test_a_failed_pr_read_refuses_and_deletes_nothing(checkout):
+    _merged_local(checkout)
+    p = refs.plan(checkout, pr_reader=lambda: refs.MergedHeads(failed="HTTP 502"))
+
+    assert p.deletable == []
+    assert any("merged-PR read failed (HTTP 502)" in r for r in p.refused)
+    assert not p.is_clean, "a blind sweep must not exit 0"
+
+
+def test_an_unreachable_remote_deletes_no_local_branch(checkout):
+    sha = _merged_local(checkout)
+    _git(checkout, "remote", "set-url", "origin", str(checkout / "does-not-exist.git"))
+
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {sha}}))
+
+    assert p.deletable == []
+
+
+def test_the_pr_reader_is_not_called_without_a_candidate(checkout):
+    """No local branch lacks an origin head here, so there is nothing to ask the host about."""
+    p = refs.plan(checkout, pr_reader=_never_called)
+    assert p.deletable == []
+
+
+def test_apply_refuses_a_branch_that_moved_between_plan_and_apply(checkout):
+    sha = _merged_local(checkout)
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {sha}}))
+    assert p.deletable == [("feature/done", sha)]
+
+    master = _git(checkout, "rev-parse", "master").strip()
+    _git(checkout, "update-ref", "refs/heads/feature/done", master)
+
+    failures, lines = refs.apply(checkout, p)
+    assert failures == 1, lines
+    assert refs.local_branch_tips(checkout)["feature/done"] == master, "the moved branch survives"
+
+
+def test_apply_keeps_a_branch_checked_out_between_plan_and_apply(checkout, tmp_path):
+    """`update-ref -d` does not protect a checked-out branch, so apply re-reads the worktrees."""
+    sha = _merged_local(checkout)
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {sha}}))
+    _git(checkout, "worktree", "add", "-q", str(tmp_path / "late"), "feature/done")
+
+    failures, lines = refs.apply(checkout, p)
+    assert failures == 1, lines
+    assert _has_branch(checkout, "feature/done")
+    assert any("KEPT feature/done" in line for line in lines)
+
+
+def test_a_pending_deletion_is_not_clean_and_the_apply_makes_it_clean(checkout):
+    _git(checkout, "config", "fetch.prune", "true")
+    sha = _merged_local(checkout)
+    reader = _reader({"feature/done": {sha}})
+
+    assert not refs.plan(checkout, pr_reader=reader).is_clean
+    refs.apply(checkout, refs.plan(checkout, pr_reader=reader))
+    assert refs.plan(checkout, pr_reader=reader).is_clean
+
+
+# --------------------------------------------------------------------------------------------- #
+# The merged-PR reader, driven through its runner seam with fake output only.
+# --------------------------------------------------------------------------------------------- #
+def test_merged_pr_heads_parses_names_to_sets_of_oids():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, (
+            '[{"headRefName": "a", "headRefOid": "111", "isCrossRepository": false},'
+            ' {"headRefName": "a", "headRefOid": "222", "isCrossRepository": false},'
+            ' {"headRefName": "b", "headRefOid": "", "isCrossRepository": false}]'
+        ), ""
+
+    got = refs.merged_pr_heads("o/r", "github", "gh", runner=runner)
+
+    assert got.heads == {"a": frozenset({"111", "222"})}, "an item with no oid is skipped"
+    assert calls[0][:3] == ["gh", "pr", "list"] and "merged" in calls[0]
+    assert "headRefName,headRefOid,isCrossRepository" in calls[0]
+
+
+def test_merged_pr_heads_skips_fork_prs_and_items_that_do_not_say():
+    """A fork PR's head is a branch in another repository, so its name says nothing about ours."""
+    out = (
+        '[{"headRefName": "fork", "headRefOid": "111", "isCrossRepository": true},'
+        ' {"headRefName": "unsaid", "headRefOid": "222"},'
+        ' {"headRefName": "ours", "headRefOid": "333", "isCrossRepository": false}]'
+    )
+    got = refs.merged_pr_heads("o/r", "github", "gh", runner=lambda a: (0, out, ""))
+    assert got.heads == {"ours": frozenset({"333"})}
+
+
+def test_merged_pr_heads_reports_a_failed_or_unreadable_read_as_failed():
+    assert refs.merged_pr_heads("o/r", "github", "gh", runner=lambda a: (1, "", "boom")).failed
+    assert refs.merged_pr_heads("o/r", "github", "gh", runner=lambda a: (0, "{nope", "")).failed
+    assert refs.merged_pr_heads("o/r", "github", "gh", runner=lambda a: (0, "{}", "")).failed
+
+
+def test_merged_pr_heads_has_no_reader_for_a_non_github_host():
+    def runner(argv):
+        raise AssertionError("gh must not run for a host it cannot read")
+
+    got = refs.merged_pr_heads("o/r", "gitea", "tea", runner=runner)
+    assert got.heads is None and got.unavailable and not got.failed
+
+
+# --------------------------------------------------------------------------------------------- #
+# The CLI: dry run by default, deletion only under --apply.
+# --------------------------------------------------------------------------------------------- #
+def _stub_config(monkeypatch, checkout: Path, sha: str) -> None:
+    from types import SimpleNamespace
+
+    from agentflow import config
+
+    monkeypatch.setattr(config, "load_project", lambda name: SimpleNamespace(
+        canonical_repo=SimpleNamespace(
+            local_checkout=str(checkout), base_branch="master", host_ref="o/r"
+        )
+    ))
+    monkeypatch.setattr(config, "load_environment", lambda: SimpleNamespace(
+        git_host=SimpleNamespace(kind="github", cli="gh")
+    ))
+    # The CLI's only route to `gh`, replaced so no test can reach the network.
+    monkeypatch.setattr(refs, "merged_pr_heads", lambda *a, **k: refs.MergedHeads(
+        heads={"feature/done": frozenset({sha})}
+    ))
+
+
+def test_the_cli_is_a_dry_run_unless_apply_is_typed(checkout, monkeypatch, capsys):
+    sha = _merged_local(checkout)
+    _stub_config(monkeypatch, checkout, sha)
+
+    rc = refs.main(["--project", "x"])
+    out = capsys.readouterr().out
+
+    assert rc == 1, "a pending deletion is not clean"
+    assert "merged local branches to delete (1)" in out and "feature/done" in out
+    assert _has_branch(checkout, "feature/done"), "no --apply, no deletion"
+
+    refs.main(["--project", "x", "--apply"])
+    out = capsys.readouterr().out
+    assert not _has_branch(checkout, "feature/done")
+    assert "deleted feature/done" in out
+
+
+# --------------------------------------------------------------------------------------------- #
+# Branches held without a porcelain `branch` line, and names `refname:short` would mangle.
+# --------------------------------------------------------------------------------------------- #
+def test_a_branch_mid_rebase_in_another_worktree_is_held(checkout, tmp_path):
+    """A stopped rebase shows its worktree as DETACHED, yet the branch is still in use there and
+    `branch -D` refuses it. Driven by a real rebase stopped part-way in a linked worktree."""
+    sha = _merged_local(checkout)
+    wt = tmp_path / "rebasing"
+    _git(checkout, "worktree", "add", "-q", str(wt), "feature/done")
+    root = _git(checkout, "rev-list", "--max-parents=0", "master").strip()
+    stopped = subprocess.run(
+        ["git", "-C", str(wt), "rebase", "--force-rebase", "--exec", "false", root],
+        capture_output=True, text=True,
+    )
+    assert stopped.returncode != 0, "the rebase must stop part-way for this test to mean anything"
+    porcelain = _git(checkout, "worktree", "list", "--porcelain")
+    assert "branch refs/heads/feature/done" not in porcelain, "porcelain shows it detached"
+    assert refs.local_branch_tips(checkout)["feature/done"] == sha, "the ref has not moved yet"
+
+    assert "feature/done" in refs.worktree_branches(checkout)
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {sha}}))
+    assert p.deletable == []
+
+
+def test_a_worktree_whose_git_dir_cannot_be_read_refuses_deletion(checkout, tmp_path):
+    """What a vanished worktree holds is unknown, and unknown keeps rather than deletes."""
+    import shutil
+
+    sha = _merged_local(checkout)
+    gone = tmp_path / "vanished"
+    _git(checkout, "worktree", "add", "-q", str(gone), "-b", "other-work")
+    shutil.rmtree(gone)
+
+    assert refs.worktree_branches(checkout) is None
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {sha}}))
+    assert p.deletable == []
+    assert any("could not list worktrees" in r for r in p.refused)
+
+
+def test_a_branch_sharing_its_name_with_a_tag_is_still_named_correctly(checkout):
+    """`%(refname:short)` turns branch `x` into `heads/x` when tag `x` exists, so the branch would
+    match no merged PR head and could never be deleted."""
+    sha = _merged_local(checkout)
+    _git(checkout, "tag", "feature/done", "master")
+
+    assert "feature/done" in refs.local_branches(checkout)
+    p = refs.plan(checkout, pr_reader=_reader({"feature/done": {sha}}))
+    assert p.deletable == [("feature/done", sha)]

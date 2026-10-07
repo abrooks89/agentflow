@@ -573,7 +573,7 @@ def test_touched_paths_fixes_the_order_and_deduplicates_at_the_seam(repo, monkey
     Deleting the `sorted({...})` left the whole file green. The contract is that downstream
     order does not depend on git's, so it is asserted where git's answer is the input.
     """
-    monkeypatch.setattr(fvd, "_git", lambda *a, **k: "z/b.py\na.py\nz/b.py\n\n  \n")
+    monkeypatch.setattr(fvd, "_git", lambda *a, **k: "z/b.py\0a.py\0z/b.py\0")
     assert fvd.touched_paths(repo, "BASE", "HEAD") == ("a.py", "z/b.py")
 
 
@@ -1433,3 +1433,496 @@ def test_one_name_on_both_sides_is_ONE_branch_and_the_local_ref_is_the_one_read(
     assert "docs/REGISTRY.md" in fvd.epic_touched_paths(
         epic_repo, "master", "E-0734-gh293-live-seam"
     ), "read the lagging remote ref; an unpushed commit's paths vanished from the seam"
+
+
+# --- the live seam's two silent wrong answers: a lane-namespaced branch, a zero-commit branch -
+
+
+def test_a_LANE_NAMESPACED_branch_resolves_to_its_work_not_to_None(epic_repo):
+    """`jr2/e0767-x` is E-0767's branch. `None` here sent the seam to the declaration unread."""
+    _git(epic_repo, "branch", "jr2/e0767-resolve-deployed-skill-paths", "e0734-gh293-live-seam")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0767-resolve-deployed-skill-paths") == (
+        "refs/heads/jr2/e0767-resolve-deployed-skill-paths"
+    )
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0767-resolve-deployed-skill-paths") == (
+        "skills/_shared/agentflow/files_vs_diff.py",
+        "skills/_shared/tests/test_files_vs_diff.py",
+    )
+
+
+def test_a_namespaced_and_a_bare_branch_for_one_epic_are_TWO_candidates_and_refuse(epic_repo):
+    _git(epic_repo, "branch", "jr2/e0734-gh293-live-seam", "e0734-gh293-live-seam")
+
+    with pytest.raises(fvd.AmbiguousEpicBranch) as exc:
+        fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam")
+    assert not isinstance(exc.value, fvd.OffConventionEpicBranch), (
+        "two well-formed candidates are ambiguity, not a naming slip"
+    )
+    msg = str(exc.value)
+    assert ": e0734-gh293-live-seam, jr2/e0734-gh293-live-seam " in msg, msg
+
+
+@pytest.mark.parametrize("stray", ["fix-e0734-followup", "e0734-gh293/sub", "e0734/sub"])
+def test_the_id_ANYWHERE_ELSE_in_a_name_REFUSES_and_names_the_branch(epic_repo, stray):
+    """A naming slip is repaired by renaming; it must not downgrade to the declaration.
+
+    Asserted beside the conventional branch too: the stray may be where the work is, so the
+    conventional candidate alone is not a measurement.
+    """
+    _git(epic_repo, "branch", stray, "e0734-gh293-live-seam")
+    _git(epic_repo, "branch", "-m", "e0734-gh293-live-seam", "parked-elsewhere")
+
+    with pytest.raises(fvd.OffConventionEpicBranch) as exc:
+        fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam")
+    assert stray in str(exc.value)
+    assert isinstance(exc.value, fvd.AmbiguousEpicBranch), (
+        "callers that refuse on ambiguity must refuse on an off-convention name without change"
+    )
+
+    _git(epic_repo, "branch", "e0734-gh293-live-seam", "parked-elsewhere")
+    with pytest.raises(fvd.OffConventionEpicBranch) as exc:
+        fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam")
+    assert stray in str(exc.value) and "e0734-gh293-live-seam," in str(exc.value) + ","
+
+
+def test_a_token_bounded_by_more_digits_or_letters_is_STILL_not_the_epic(epic_repo):
+    """The refusal must not swallow other epics: `e07341-` and `xe0734-` are not E-0734's."""
+    for other in ("e07341-a-different-epic", "fix-e07341-other", "xe0734-not-a-token"):
+        _git(epic_repo, "branch", other, "e0734-gh293-live-seam")
+    _git(epic_repo, "branch", "-D", "e0734-gh293-live-seam")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam") is None
+
+
+def test_a_branch_with_ZERO_commits_off_base_answers_None_not_the_empty_tuple(epic_repo):
+    """Cut, not yet committed: the empty diff says nothing about the seam, so it is not `()`.
+
+    Paired on one repository with the branch one commit later, so an implementation that
+    returns `None` for every branch fails, and with the empty-commit branch, so `()` keeps
+    meaning "commits exist and none touched a path".
+    """
+    _git(epic_repo, "branch", "e0768-account-limit-keystone", "master")
+    assert fvd.resolve_epic_branch(epic_repo, "E-0768-the-fleet-cannot-survive") == (
+        "refs/heads/e0768-account-limit-keystone"
+    ), "the branch exists; it is the empty range that must not read as a free seam"
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0768-the-fleet-cannot-survive") is None
+
+    _git(epic_repo, "checkout", "e0768-account-limit-keystone")
+    _write(epic_repo, "README.md", "first green slice\n")
+    _commit(epic_repo, "first slice")
+    _git(epic_repo, "checkout", "master")
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0768-the-fleet-cannot-survive") == (
+        "README.md",
+    )
+
+    _git(epic_repo, "checkout", "-b", "e0800-touched-nothing")
+    _git(epic_repo, "commit", "--allow-empty", "-m", "a branch that moved no file")
+    _git(epic_repo, "checkout", "master")
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0800-touched-nothing") == ()
+
+
+def test_a_zero_commit_REMOTE_branch_and_a_merged_branch_also_answer_None(epic_repo):
+    """Both have nothing of their own off base; neither is evidence a seam is free."""
+    master = _git(epic_repo, "rev-parse", "master").strip()
+    _git(epic_repo, "update-ref", "refs/remotes/origin/e0802-pushed-at-cut", master)
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0802-pushed-at-cut") is None
+
+    _git(epic_repo, "merge", "--no-ff", "-m", "land it", "e0734-gh293-live-seam")
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") is None
+
+
+def test_ANOTHER_epics_conventional_branch_mentioning_this_id_does_not_wedge_it(epic_repo):
+    """`e0932-autodoc-update-e0925-review` is E-0932's branch; E-0925 must not refuse on it."""
+    _git(epic_repo, "branch", "e0932-autodoc-update-e0925-review", "e0734-gh293-live-seam")
+    _git(epic_repo, "branch", "jr2/e0933-after-e0925", "e0734-gh293-live-seam")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0925-review-me") is None
+    assert fvd.resolve_epic_branch(epic_repo, "E-0932-autodoc-update") == (
+        "refs/heads/e0932-autodoc-update-e0925-review"
+    )
+
+
+def test_a_MIXED_CASE_name_resolves_or_refuses_rather_than_slipping_to_None(epic_repo):
+    _git(epic_repo, "branch", "jr2/E0767-shouted", "e0734-gh293-live-seam")
+    assert fvd.resolve_epic_branch(epic_repo, "E-0767-shouted") == (
+        "refs/heads/jr2/E0767-shouted"
+    )
+
+    _git(epic_repo, "branch", "fix-E0768-shouted", "e0734-gh293-live-seam")
+    with pytest.raises(fvd.OffConventionEpicBranch) as exc:
+        fvd.resolve_epic_branch(epic_repo, "E-0768-shouted")
+    assert "fix-E0768-shouted" in str(exc.value)
+
+
+def test_a_local_bare_branch_and_a_pushed_NAMESPACED_one_are_two_names_and_refuse(epic_repo):
+    """Deduplication is by full name, so these do not collapse; ambiguity is the honest answer."""
+    sha = _git(epic_repo, "rev-parse", "e0734-gh293-live-seam").strip()
+    _git(epic_repo, "update-ref", "refs/remotes/origin/jr2/e0734-gh293-live-seam", sha)
+
+    with pytest.raises(fvd.AmbiguousEpicBranch) as exc:
+        fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam")
+    assert not isinstance(exc.value, fvd.OffConventionEpicBranch)
+
+
+# --------------------------------------------------------------------------- #
+# A byte-order mark before the spec's first line
+# --------------------------------------------------------------------------- #
+def test_a_BOM_spec_whose_first_line_is_Files_reads_like_its_BOMLESS_bytes(repo, tmp_path, capsys):
+    """plan_parser and epic_survey read specs as utf-8-sig, so this reader must too. With the BOM
+    kept, `## Files` on line 1 no longer matches its `^`-anchored heading, and the run reports a
+    spec with no Files section and every touched path UNDECLARED."""
+    text = f"## Files\n\n- {BT}docs/REGISTRY.md{BT} - the one declared path\n"
+    plain = tmp_path / "plain.md"
+    plain.write_bytes(text.encode("utf-8"))
+    bom = tmp_path / "bom.md"
+    bom.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+
+    payloads = []
+    for spec in (plain, bom):
+        assert fvd.main(["--repo", str(repo), "--spec", str(spec), "--commit", "HEAD", "--json"]) == 0
+        payloads.append(json.loads(capsys.readouterr().out))
+
+    control, with_bom = payloads
+    assert control["declared_count"] == 1, "the control must actually declare a path"
+    for key in ("declared_count", "undeclared", "over_declared"):
+        assert with_bom[key] == control[key], key
+
+
+# --------------------------------------------------------------------------- #
+# The token's right boundary mirrors its left
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("stray", ["e0734_fix", "e0734.wip", "fix-e0734_x"])
+def test_an_id_bounded_by_ANY_non_alphanumeric_on_the_right_REFUSES(epic_repo, stray):
+    """Only `-`, `/` and end-of-name used to close the token, so these slipped to `None`."""
+    _git(epic_repo, "branch", stray, "e0734-gh293-live-seam")
+    _git(epic_repo, "branch", "-D", "e0734-gh293-live-seam")
+
+    with pytest.raises(fvd.OffConventionEpicBranch) as exc:
+        fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam")
+    assert stray in str(exc.value)
+
+
+def test_digits_running_on_past_the_id_are_still_another_epic_under_the_wider_boundary(epic_repo):
+    for other in ("e07341-x", "e07341_x", "fix-e07341.x"):
+        _git(epic_repo, "branch", other, "e0734-gh293-live-seam")
+    _git(epic_repo, "branch", "-D", "e0734-gh293-live-seam")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam") is None
+
+
+# --------------------------------------------------------------------------- #
+# Spent leftover branches drop out before the ambiguity count
+# --------------------------------------------------------------------------- #
+def _squash_into_master(repo: Path, branch: str) -> None:
+    _git(repo, "merge", "--squash", branch)
+    _git(repo, "commit", "-m", f"squash {branch}")
+
+
+def _live_branch(repo: Path, name: str, rel: str, text: str) -> None:
+    _git(repo, "checkout", "-b", name, "master")
+    _write(repo, rel, text)
+    _commit(repo, f"work on {name}")
+    _git(repo, "checkout", "master")
+
+
+def test_a_SQUASH_merged_branch_reads_as_None_not_as_its_old_paths(epic_repo):
+    """A squash leaves the branch ahead of base with all its bytes already in base."""
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") is not None, (
+        "control: before the squash the branch is live work"
+    )
+    _squash_into_master(epic_repo, "e0734-gh293-live-seam")
+    assert fvd.range_commits(epic_repo, "master", "refs/heads/e0734-gh293-live-seam")[1] == 1, (
+        "the squashed branch is still ahead by commit count; only its content is spent"
+    )
+
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") is None
+
+
+def test_a_NO_FF_merged_leftover_beside_a_live_branch_resolves_to_the_live_one(epic_repo):
+    _git(epic_repo, "merge", "--no-ff", "-m", "land it", "e0734-gh293-live-seam")
+    _live_branch(epic_repo, "jr2/e0734-second-pass", "README.md", "second pass\n")
+
+    with pytest.raises(fvd.AmbiguousEpicBranch):
+        fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam")  # control: no base
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master") == (
+        "refs/heads/jr2/e0734-second-pass"
+    )
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") == (
+        "README.md",
+    )
+
+
+def test_a_SQUASHED_leftover_beside_a_live_branch_resolves_to_the_live_one(epic_repo):
+    _squash_into_master(epic_repo, "e0734-gh293-live-seam")
+    _live_branch(epic_repo, "e0734-second-pass", "README.md", "second pass\n")
+
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") == (
+        "README.md",
+    )
+
+
+def test_an_EMPTY_leftover_beside_a_one_commit_live_branch_resolves_to_the_live_one(epic_repo):
+    _git(epic_repo, "branch", "e0734-cut-and-abandoned", "master")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master") == (
+        "refs/heads/e0734-gh293-live-seam"
+    )
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") == (
+        "skills/_shared/agentflow/files_vs_diff.py",
+        "skills/_shared/tests/test_files_vs_diff.py",
+    )
+
+
+def test_two_LIVE_branches_still_refuse_with_a_base_given(epic_repo):
+    _live_branch(epic_repo, "jr2/e0734-other-take", "README.md", "other take\n")
+
+    with pytest.raises(fvd.AmbiguousEpicBranch) as exc:
+        fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master")
+    assert not isinstance(exc.value, fvd.OffConventionEpicBranch)
+    with pytest.raises(fvd.AmbiguousEpicBranch):
+        fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam")
+
+
+def test_a_branch_whose_content_only_PARTLY_reached_base_is_not_spent(epic_repo):
+    """One of its two paths landed; the other is still live work, so the seam is still held."""
+    _write(epic_repo, "skills/_shared/agentflow/files_vs_diff.py", "the resolver\n")
+    _commit(epic_repo, "half of the branch reached base")
+
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") == (
+        "skills/_shared/agentflow/files_vs_diff.py",
+        "skills/_shared/tests/test_files_vs_diff.py",
+    )
+
+
+def test_a_path_the_branch_DELETED_is_spent_only_once_base_lacks_it_too(epic_repo):
+    _git(epic_repo, "checkout", "-b", "e0805-drop-a-file", "master")
+    _git(epic_repo, "rm", "-q", "README.md")
+    _commit(epic_repo, "drop the readme")
+    _git(epic_repo, "checkout", "master")
+
+    _write(epic_repo, "docs/REGISTRY.md", "unrelated base drift\n")
+    _commit(epic_repo, "base moves on")
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0805-drop-a-file") == ("README.md",)
+
+    _git(epic_repo, "rm", "-q", "README.md")
+    _commit(epic_repo, "base drops it too")
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0805-drop-a-file") is None
+
+
+def test_an_unreadable_NON_UTF8_spec_exits_two_and_says_so(repo, tmp_path, capsys):
+    spec = tmp_path / "latin1.md"
+    spec.write_bytes(f"## Files\n\n- {BT}docs/REGISTRY.md{BT} - café\n".encode("latin-1"))
+
+    rc = fvd.main(["--repo", str(repo), "--spec", str(spec), "--commit", "HEAD"])
+
+    assert rc == 2
+    assert "could not read spec:" in capsys.readouterr().out, (
+        "every other main() error prints to stdout; this one must match"
+    )
+
+
+def test_a_branch_adding_only_a_NON_ASCII_path_is_live_and_reports_the_name_unquoted(epic_repo):
+    """Without -z git C-quotes the name, the quoted string matches no path, and live reads spent."""
+    name = "docs/caf\u00e9.py"
+    _live_branch(epic_repo, "e0806-accented-name", name, "accented\n")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0806-accented-name", base="master") == (
+        "refs/heads/e0806-accented-name"
+    )
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0806-accented-name") == (name,)
+
+
+def test_a_branch_touching_more_paths_than_one_command_line_holds_is_still_judged(epic_repo):
+    """No touched path is passed as an argument, so the Windows command-line cap never bites."""
+    _git(epic_repo, "checkout", "-b", "e0807-bulk-rename", "master")
+    paths = [f"bulk/a-fairly-long-directory-name/entry-{i:04d}.txt" for i in range(1500)]
+    for rel in paths:
+        _write(epic_repo, rel, "bulk\n")
+    _commit(epic_repo, "bulk add")
+    _git(epic_repo, "checkout", "master")
+
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0807-bulk-rename") == tuple(sorted(paths))
+
+
+def test_a_squashed_leftover_reads_LIVE_again_once_base_edits_one_of_its_paths(epic_repo):
+    """Spent is judged tip to tip, so it is not permanent; the docs say delete merged leftovers."""
+    _squash_into_master(epic_repo, "e0734-gh293-live-seam")
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") is None
+
+    _write(epic_repo, "skills/_shared/agentflow/files_vs_diff.py", "base moved on\n")
+    _commit(epic_repo, "base edits a path the leftover touched")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master") == (
+        "refs/heads/e0734-gh293-live-seam"
+    )
+
+
+def test_a_spent_REMOTE_only_leftover_beside_a_live_local_branch_resolves_to_the_local(epic_repo):
+    sha = _git(epic_repo, "rev-parse", "e0734-gh293-live-seam").strip()
+    _squash_into_master(epic_repo, "e0734-gh293-live-seam")
+    _git(epic_repo, "update-ref", "refs/remotes/origin/e0734-gh293-live-seam", sha)
+    _git(epic_repo, "branch", "-D", "e0734-gh293-live-seam")
+    _live_branch(epic_repo, "e0734-second-pass", "README.md", "second pass\n")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master") == (
+        "refs/heads/e0734-second-pass"
+    )
+
+
+# Spent OFF-CONVENTION leftovers drop out too; a live one still refuses
+# --------------------------------------------------------------------------- #
+def _spent_off_convention_leftover(repo: Path, name: str) -> None:
+    """`name` carries the seam's work, squash-merged into master; the conventional name is gone."""
+    _git(repo, "branch", "-m", "e0734-gh293-live-seam", name)
+    _squash_into_master(repo, name)
+
+
+@pytest.mark.parametrize("stray", ["fix-e0734-followup", "e0734_wip"])
+def test_a_SPENT_off_convention_leftover_beside_a_live_branch_resolves_to_the_live_one(
+    epic_repo, stray
+):
+    """Its work is already in base, so the stray name cannot be where the work is."""
+    _spent_off_convention_leftover(epic_repo, stray)
+    _live_branch(epic_repo, "e0734-second-pass", "README.md", "second pass\n")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master") == (
+        "refs/heads/e0734-second-pass"
+    )
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") == (
+        "README.md",
+    )
+
+
+def test_a_LIVE_off_convention_branch_still_refuses_with_a_base_given(epic_repo):
+    _live_branch(epic_repo, "fix-e0734-followup", "README.md", "followup\n")
+
+    with pytest.raises(fvd.OffConventionEpicBranch) as exc:
+        fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master")
+    assert "fix-e0734-followup" in str(exc.value)
+    assert "e0734-gh293-live-seam" in str(exc.value), "the live conventional name is named too"
+
+
+def test_a_SPENT_off_convention_leftover_alone_answers_None(epic_repo):
+    _spent_off_convention_leftover(epic_repo, "fix-e0734-followup")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master") is None
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") is None
+
+
+def test_WITHOUT_a_base_a_spent_off_convention_name_still_refuses(epic_repo):
+    """No base means no spent test, so the naming slip is all there is to go on."""
+    _spent_off_convention_leftover(epic_repo, "fix-e0734-followup")
+
+    with pytest.raises(fvd.OffConventionEpicBranch) as exc:
+        fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam")
+    assert "fix-e0734-followup" in str(exc.value)
+
+
+def _spent_local_live_remote(repo: Path, name: str) -> None:
+    """`name`'s pushed ref keeps its live work; the local ref of that name is reset to master."""
+    sha = _git(repo, "rev-parse", name).strip()
+    _git(repo, "update-ref", f"refs/remotes/origin/{name}", sha)
+    _git(repo, "branch", "-f", name, "master")
+
+
+def test_an_off_convention_name_SPENT_LOCALLY_but_LIVE_on_the_remote_still_refuses(epic_repo):
+    """A name is spent only when every ref is; the local copy must not hide the pushed work."""
+    _live_branch(epic_repo, "fix-e0734-followup", "README.md", "followup\n")
+    _spent_local_live_remote(epic_repo, "fix-e0734-followup")
+
+    with pytest.raises(fvd.OffConventionEpicBranch) as exc:
+        fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master")
+    assert "fix-e0734-followup" in str(exc.value)
+
+
+def test_a_conventional_name_SPENT_LOCALLY_but_LIVE_on_the_remote_is_not_dropped(epic_repo):
+    """Live by its remote ref, so the remote ref is the one read: the spent local copy is not."""
+    _spent_local_live_remote(epic_repo, "e0734-gh293-live-seam")
+
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master") == (
+        "refs/remotes/origin/e0734-gh293-live-seam"
+    )
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") == (
+        "skills/_shared/agentflow/files_vs_diff.py",
+        "skills/_shared/tests/test_files_vs_diff.py",
+    )
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam") == (
+        "refs/heads/e0734-gh293-live-seam"
+    ), "control: without a base nothing is judged, so local wins as before"
+
+
+def test_a_LIVE_off_convention_name_beside_a_SPENT_conventional_leftover_names_only_the_live(
+    epic_repo,
+):
+    _squash_into_master(epic_repo, "e0734-gh293-live-seam")
+    _live_branch(epic_repo, "fix-e0734-followup", "README.md", "followup\n")
+
+    with pytest.raises(fvd.OffConventionEpicBranch) as exc:
+        fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master")
+    msg = str(exc.value)
+    assert "fix-e0734-followup" in msg
+    assert "e0734-gh293-live-seam" not in msg, msg
+
+
+# --- gh#1123: an epic id takes ASCII digits only ------------------------------------------------
+
+
+@pytest.mark.parametrize("zero", [0x0660, 0xFF10], ids=["arabic-indic", "fullwidth"])
+def test_an_epic_id_spelled_in_NON_ASCII_digits_is_not_an_epic_id(zero):
+    """`\\d` takes any Unicode decimal digit, so `E-` plus Arabic-Indic digits derived a prefix."""
+    spelled = "".join(chr(zero + int(c)) for c in "0734")
+    with pytest.raises(ValueError):
+        fvd.epic_branch_prefix(f"E-{spelled}-gh293-live-seam")
+    with pytest.raises(ValueError):
+        fvd.epic_branch_prefix(f"E-073{spelled[-1]}")
+    assert fvd.epic_branch_prefix("E-0734-gh293-live-seam") == "e0734", "control"
+
+
+@pytest.mark.parametrize("zero", [0x0660, 0xFF10], ids=["arabic-indic", "fullwidth"])
+def test_a_leaf_spelled_in_NON_ASCII_digits_is_no_epics_conventional_branch(zero):
+    """Read as conventional, such a leaf mentioning this epic's id would be excused as another
+    epic's branch instead of refusing as an off-convention one."""
+    spelled = "".join(chr(zero + int(c)) for c in "0932")
+    assert fvd._CONVENTIONAL_LEAF_RE.match(f"e{spelled}-review-e0734-fixes") is None
+    assert fvd._CONVENTIONAL_LEAF_RE.match("e0932-review-e0734-fixes"), "control"
+
+
+# --- gh#1065: one name, two LIVE refs that diverged - the seam is their union ------------------
+
+
+def _diverged_remote(repo: Path, name: str, rel: str, text: str) -> None:
+    """Point `refs/remotes/origin/<name>` at a commit off master that the local `name` lacks."""
+    _git(repo, "checkout", "-b", "scratch-remote-side", "master")
+    _write(repo, rel, text)
+    _commit(repo, "pushed from another clone")
+    sha = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "checkout", "master")
+    _git(repo, "branch", "-D", "scratch-remote-side")
+    _git(repo, "update-ref", f"refs/remotes/origin/{name}", sha)
+
+
+def test_a_DIVERGED_local_and_remote_ref_of_one_name_read_as_the_UNION_of_their_paths(epic_repo):
+    """Reading the local ref alone left the remote's paths out of the seam (gh#1065)."""
+    _diverged_remote(epic_repo, "e0734-gh293-live-seam", "docs/REGISTRY.md", "remote work\n")
+    assert fvd.resolve_epic_branch(epic_repo, "E-0734-gh293-live-seam", base="master") == (
+        "refs/heads/e0734-gh293-live-seam"
+    ), "control: still ONE name, so no ambiguity, and the local ref still answers the resolver"
+
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") == (
+        "docs/REGISTRY.md",
+        "skills/_shared/agentflow/files_vs_diff.py",
+        "skills/_shared/tests/test_files_vs_diff.py",
+    ), "the remote ref's path vanished from the seam"
+
+
+def test_a_SPENT_remote_ref_beside_a_live_local_adds_nothing_to_the_union(epic_repo):
+    """Fail-closed as E-1052 left it: a spent copy is dropped before the union is taken."""
+    _diverged_remote(epic_repo, "e0734-gh293-live-seam", "docs/REGISTRY.md", "remote work\n")
+    _git(epic_repo, "merge", "--squash", "refs/remotes/origin/e0734-gh293-live-seam")
+    _git(epic_repo, "commit", "-m", "squash the remote side")
+
+    assert fvd.epic_touched_paths(epic_repo, "master", "E-0734-gh293-live-seam") == (
+        "skills/_shared/agentflow/files_vs_diff.py",
+        "skills/_shared/tests/test_files_vs_diff.py",
+    )

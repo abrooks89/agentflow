@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import inspect
 import os
 import re
 import subprocess
@@ -146,7 +147,9 @@ def test_waiting_question_parks_and_answer_applies(env):
     # dev-manager answers; raiser applies.
     assert env.run("answer", "--actor", "dev-manager", "--id", "Q-0001", "--answer", "tarball per run", "--by", "dev-manager") == 0
     assert env.reg().questions["Q-0001"].fields["state"] == "answered"
-    # only-raiser can find it via read --answered-for.
+    # only-raiser can find it via read --answered-for. Unpark first: apply refuses while the
+    # row still waits on the question (waited_on_live).
+    assert env.run("release", "--actor", "jr-dev-1", "--id", "E-0001-first-queued-item", "--state", "building") == 0
     assert env.run("apply", "--actor", "jr-dev-1", "--id", "Q-0001") == 0
     assert env.reg().questions["Q-0001"].fields["state"] == "applied"
 
@@ -177,6 +180,162 @@ def test_deploy_lock_take_and_release_liveness(env):
     assert registry._parse_iso(reg.deploy_taken_at) is not None  # real clock stamp
     assert env.run("deploy-lock", "release", "--actor", "lead-dev") == 0
     assert env.reg().deploy_holder == "none"
+
+
+# The Deploy lock is ONE field line in the Queue. A Note is free text any lane writes, so a
+# Note that merely mentions the lock -- even one shaped like the field -- must never be read
+# as the holder, and no lock verb may ever rewrite it. Only the anchored field line counts.
+_LOCK_LINE = "- **Deploy lock** — holder: none, taken-at: -"
+
+
+def _spoof_lock_note(env) -> str:
+    """Post a Note shaped like a held Deploy lock line and return the Note's raw line."""
+    assert env.run("note", "--actor", "lead-dev", "--text",
+                   f"**Deploy lock** — holder: jr-dev-1, taken-at: {_now_iso()}") == 0
+    (line,) = [ln for ln in env.section("Queue").split("\n")
+               if "**Deploy lock**" in ln and "jr-dev-1" in ln]
+    return line
+
+
+def _damage_lock_line(env, damage: str) -> None:
+    _replace_line(env, _LOCK_LINE + "\n",
+                  "- **Deploy lok** — holder: none, taken-at: -\n" if damage == "typo" else "")
+    assert not any(registry._is_deploy_lock_field(ln) for ln in env.section("Queue").split("\n"))
+
+
+@pytest.mark.parametrize("damage", ["typo", "missing"])
+def test_a_spoofed_lock_note_is_not_the_holder_when_the_lock_line_is_damaged(env, capsys, damage):
+    _spoof_lock_note(env)
+    _damage_lock_line(env, damage)
+    assert env.reg().deploy_holder != "jr-dev-1", "the holder was read out of a Note"
+    # The "holder" must not be able to merge on it either, and the refusal names the damage
+    # rather than calling the lock FREE (which would send the lane to a `take` that refuses).
+    _assert_refused(env, capsys, "file_damaged", "deploy-lock", "assert", "--actor", "jr-dev-1")
+
+
+@pytest.mark.parametrize("damage", ["typo", "missing"])
+@pytest.mark.parametrize("verb", ["take", "release"])
+def test_lock_verbs_refuse_file_damaged_and_never_edit_a_note(env, capsys, damage, verb):
+    note = _spoof_lock_note(env)
+    _damage_lock_line(env, damage)
+    before = env.text()
+    _assert_refused(env, capsys, "file_damaged", "deploy-lock", verb, "--actor", "jr-dev-1")
+    assert env.text() == before, "a refused lock verb must leave the board byte-identical"
+    assert note in env.text().split("\n"), "the Note was rewritten"
+
+
+@pytest.mark.parametrize("damage", ["typo", "missing"])
+def test_validate_flags_a_queue_with_no_deploy_lock_line(env, capsys, damage):
+    _spoof_lock_note(env)
+    capsys.readouterr()
+    _damage_lock_line(env, damage)
+    assert env.run("validate") == 2
+    err = capsys.readouterr().err
+    assert "Deploy lock" in err and "line" in err, err
+
+
+def test_a_lock_note_on_an_intact_board_is_inert(env, capsys):
+    """Control: with the real line intact, the Note neither sets the holder nor gets rewritten."""
+    note = _spoof_lock_note(env)
+    assert env.reg().deploy_holder == "none"
+    assert env.run("validate") == 0
+    assert env.run("deploy-lock", "take", "--actor", "lead-dev") == 0
+    assert env.reg().deploy_holder == "lead-dev"
+    assert note in env.text().split("\n"), "take rewrote the Note"
+    assert env.run("deploy-lock", "release", "--actor", "lead-dev") == 0
+    assert env.reg().deploy_holder == "none"
+    assert note in env.text().split("\n"), "release rewrote the Note"
+    lock = [ln for ln in env.section("Queue").split("\n") if registry._is_deploy_lock_field(ln)]
+    assert lock == [_LOCK_LINE], lock
+
+
+# A lock line that keeps its `- **Deploy lock**` prefix but lost a field is damage `validate`
+# reports at every lane's wake, so the steward's `repair` must be able to mend it in place.
+_UNREADABLE_LOCK_LINES = [
+    "- **Deploy lock** — holder none, taken-at -",
+    "- **Deploy lock** — holder: none",
+    "- **Deploy lock** —",
+]
+
+
+@pytest.mark.parametrize("bad", _UNREADABLE_LOCK_LINES)
+def test_an_unreadable_lock_line_fails_validate_and_steward_repair_recovers_it(env, capsys, bad):
+    _replace_line(env, _LOCK_LINE, bad)
+    assert env.run("validate") == 2
+    err = capsys.readouterr().err
+    assert "unreadable" in err and bad in err, err
+    assert env.run("repair", "--actor", "steward", "--section", "Queue",
+                   "--old-line", bad, "--new-line", _LOCK_LINE) == 0, capsys.readouterr().err
+    assert env.run("validate") == 0, capsys.readouterr().err
+    lock = [ln for ln in env.section("Queue").split("\n") if registry._is_deploy_lock_field(ln)]
+    assert lock == [_LOCK_LINE], lock
+    assert env.run("deploy-lock", "take", "--actor", "lead-dev") == 0
+    assert env.reg().deploy_holder == "lead-dev"
+
+
+@pytest.mark.parametrize("verb", ["take", "release", "assert"])
+def test_lock_verbs_refuse_an_unreadable_lock_line_naming_the_repair(env, capsys, verb):
+    bad = _UNREADABLE_LOCK_LINES[0]
+    _replace_line(env, _LOCK_LINE, bad)
+    before = env.text()
+    rc = env.run("deploy-lock", verb, "--actor", "lead-dev")
+    err = capsys.readouterr().err
+    assert rc == 2 and "file_damaged" in err, (rc, err)
+    assert "unreadable" in err and "repair --section Queue" in err, err
+    assert env.text() == before
+
+
+def test_a_missing_lock_line_points_at_git_history_not_a_bare_repair(env, capsys):
+    """`repair` cannot insert a line, so the missing case must not offer it as the way back."""
+    _replace_line(env, _LOCK_LINE + "\n", "")
+    assert env.run("validate") == 2
+    err = capsys.readouterr().err
+    assert "missing" in err and "git history" in err and "cannot insert" in err, err
+    assert "unreadable" not in err, err
+
+
+def test_an_unreadable_lock_line_cannot_be_planted_over_a_row(env, capsys):
+    """Inert to the parse like any non-row line, so writing one over a row deletes the row."""
+    row = _queue_line(env, _pub(env, "alpha-thing-one"))
+    _assert_not_a_row_refused(env, capsys, "Queue", row, _UNREADABLE_LOCK_LINES[0])
+
+
+def test_a_second_readable_lock_line_is_still_refused_beside_an_unreadable_one(env, capsys):
+    """Readability decides which line is THE lock line; a readable copy over a row is still a
+    second one when a readable line is already on the board."""
+    bad = _inject_queue_line(env, "| E-0009 | broken |")
+    before = env.text()
+    _assert_refused(env, capsys, "repair_boilerplate_line", "repair", "--actor", "steward",
+                    "--section", "Queue", "--old-line", bad,
+                    "--new-line", "- **Deploy lock** — holder: jr-dev-1, taken-at: 2026-09-29T00:00Z")
+    assert env.text() == before
+
+
+@pytest.mark.parametrize("spoofed", [
+    # A bare bullet, the field text on the next line.
+    "-\n**Deploy lock** — holder: jr-dev-1, taken-at: {ts}",
+    # The holder value pushed onto the next line.
+    "- **Deploy lock** — holder:\njr-dev-1, taken-at: {ts}",
+    # taken-at pushed onto the next line.
+    "- **Deploy lock** — holder: jr-dev-1,\ntaken-at: {ts}",
+])
+def test_the_lock_field_never_spans_two_lines(env, capsys, spoofed):
+    _replace_line(env, _LOCK_LINE, spoofed.format(ts=_now_iso()))
+    assert env.reg().deploy_holder != "jr-dev-1", "the holder was read across a line break"
+    assert env.run("validate") == 2
+    capsys.readouterr()
+    before = env.text()
+    for verb in ("assert", "take"):
+        _assert_refused(env, capsys, "file_damaged", "deploy-lock", verb, "--actor", "jr-dev-1")
+    assert env.text() == before
+
+
+def test_a_lock_rewrite_keeps_the_blank_line_after_the_field(env):
+    """The rewrite span ends at the field's own line; it used to swallow a following blank."""
+    _replace_line(env, _LOCK_LINE + "\n", _LOCK_LINE + "\n\n")
+    assert env.run("deploy-lock", "take", "--actor", "lead-dev") == 0
+    assert env.run("deploy-lock", "release", "--actor", "lead-dev") == 0
+    assert _LOCK_LINE + "\n\n" in env.text()
 
 
 def test_blocker_lifecycle(env):
@@ -340,6 +499,27 @@ def test_both_manager_roles_may_assign_blocker_ownership(env):
     assert env.run("assign-blocker", "--actor", "steward", "--id", "B-0001", "--owner", "lead-dev") == 0
     env.run("raise-blocker", "--actor", "jr-dev-2", "--work", "E-0052", "--description", "y")
     assert env.run("assign-blocker", "--actor", "dev-manager", "--id", "B-0002", "--owner", "lead-dev") == 0
+
+
+def test_steward_may_not_reassign_a_blocker_another_seat_owns(env, capsys):
+    """Re-pointing another seat's blocker overrides that seat's call; that is dev-manager's."""
+    env.run("raise-blocker", "--actor", "jr-dev-2", "--work", "E-0051", "--description", "x", "--owner", "lead-dev")
+    rc = env.run("assign-blocker", "--actor", "steward", "--id", "B-0001", "--owner", "dev-manager")
+    err = capsys.readouterr().err
+    assert rc == 2, f"expected refusal (2), got {rc}; stderr={err!r}"
+    assert "blocker_assign_steward_owned" in err, err
+    assert "'lead-dev'" in err, err
+
+
+def test_steward_hands_away_its_own_blocker(env):
+    """The Owned-Blocker sweep's hand-off: a row the steward owns goes to the seat that can act."""
+    env.run("raise-blocker", "--actor", "steward", "--description", "x", "--owner", "steward")
+    assert env.run("assign-blocker", "--actor", "steward", "--id", "B-0001", "--owner", "lead-dev") == 0
+
+
+def test_dev_manager_reassigns_a_blocker_another_seat_owns(env):
+    env.run("raise-blocker", "--actor", "jr-dev-2", "--work", "E-0051", "--description", "x", "--owner", "lead-dev")
+    assert env.run("assign-blocker", "--actor", "dev-manager", "--id", "B-0001", "--owner", "jr-dev-1") == 0
 
 
 def test_refuse_directive_by_non_devmanager(env, capsys):
@@ -1121,6 +1301,421 @@ def test_acquire_edit_lock_api_steals_when_aged(tmp_path):
     assert stolen.stole_from == "jr-dev-1"
     assert stolen.stole_age > registry.EDIT_LOCK_STALE
     stolen.release()
+
+
+# --------------------------------------------------------------------------- #
+# Edit-lock steal races: one winner per steal, a robbed holder writes and releases nothing,
+# and a holder that died on this host does not make every writer wait out the stale window.
+# Every interleave is forced in-process through a monkeypatched seam, so none of these sleep.
+# --------------------------------------------------------------------------- #
+def _backdate(lock_path: Path, seconds: float = 900) -> None:
+    old = time.time() - seconds
+    for target in (*lock_path.iterdir(), lock_path):
+        os.utime(target, (old, old))
+
+
+def _here() -> str:
+    """The HOST and PIDNS lines a holder in this test process would record."""
+    return f"HOST={registry._this_host()}\nPIDNS={registry._this_pid_namespace()}\n"
+
+
+def _plant_holder(lock_path: Path, body: str) -> None:
+    lock_path.mkdir()
+    (lock_path / "holder").write_text(body, encoding="utf-8", newline="\n")
+
+
+def test_edit_lock_records_nonce_pid_and_host_and_releases_cleanly(tmp_path):
+    """The control: an uncontended acquire records who holds it, and its own release frees it."""
+    lock = acquire_edit_lock(tmp_path / "locks", "demo", "jr-dev-1", timeout=1.0)
+    holder = registry._lock_holder(lock.path)
+    assert holder.actor == "jr-dev-1"
+    assert holder.nonce == lock.nonce and lock.nonce
+    assert holder.pid == os.getpid()
+    assert holder.host == registry._this_host()
+    assert holder.pidns == registry._this_pid_namespace()
+    assert lock.stole_from is None
+    assert lock.release() is True
+    assert not lock.path.exists()
+
+
+def test_a_normal_cli_write_leaves_no_lock_behind(env):
+    assert (
+        env.run(
+            "status",
+            "--actor",
+            "lead-dev",
+            "--state",
+            "building",
+            "--work",
+            "E-0001",
+            "--phase",
+            "p",
+            "--eta",
+            _eta(),
+        )
+        == 0
+    )
+    assert env.reg().agents["lead-dev"].status == "building"
+    assert not (env.lock_dir / "demo-registry.lock").exists()
+    assert _STEAL not in env.text()
+
+
+@pytest.mark.parametrize("seam", ["_lock_age", "_lock_holder"])
+def test_two_stealers_judging_one_stale_lock_yield_exactly_one_holder(tmp_path, monkeypatch, seam):
+    """A judges the lock stale; before A breaks it, B judges the same lock stale and steals it.
+    A must then find B's fresh lock and back off, never break it as well."""
+    lock_dir = tmp_path / "locks"
+    first = acquire_edit_lock(lock_dir, "demo", "jr-dev-1", timeout=1.0)
+    _backdate(first.path)
+    real = getattr(registry, seam)
+    b: dict = {}
+
+    def interleave(path):
+        seen = real(path)  # A's judgement uses what it saw BEFORE B ran
+        if not b:
+            b["lock"] = None
+            b["lock"] = acquire_edit_lock(lock_dir, "demo", "lead-dev", timeout=1.0, poll=0.01)
+        return seen
+
+    monkeypatch.setattr(registry, seam, interleave)
+    with pytest.raises(registry.LockHeldError):
+        acquire_edit_lock(lock_dir, "demo", "jr-dev-2", timeout=0.3, poll=0.01)
+    monkeypatch.setattr(registry, seam, real)
+    thief = b["lock"]
+    assert thief.stole_from == "jr-dev-1"
+    assert registry._lock_holder(thief.path).nonce == thief.nonce, "A broke B's lock too"
+    assert thief.release() is True
+
+
+def test_a_stealer_waits_while_another_holds_the_steal_guard(tmp_path):
+    """Stealers serialize: while a live process is inside the guard, nobody else breaks the lock."""
+    from agentflow import lock_file
+
+    lock_dir = tmp_path / "locks"
+    first = acquire_edit_lock(lock_dir, "demo", "jr-dev-1", timeout=1.0)
+    _backdate(first.path)
+    guard = lock_file.acquire(registry._steal_guard_path(first.path))
+    try:
+        with pytest.raises(registry.LockHeldError):
+            acquire_edit_lock(lock_dir, "demo", "lead-dev", timeout=0.2, poll=0.01)
+        assert registry._lock_holder(first.path).nonce == first.nonce
+    finally:
+        guard.release()
+    assert first.release() is True
+
+
+def test_release_after_a_steal_leaves_the_thiefs_lock(tmp_path):
+    lock_dir = tmp_path / "locks"
+    a = acquire_edit_lock(lock_dir, "demo", "jr-dev-1", timeout=1.0)
+    _backdate(a.path)
+    b = acquire_edit_lock(lock_dir, "demo", "lead-dev", timeout=1.0)
+    assert b.stole_from == "jr-dev-1"
+    assert a.release() is False
+    assert b.path.is_dir(), "the robbed holder removed the thief's lock"
+    assert registry._lock_holder(b.path).nonce == b.nonce
+    assert b.release() is True
+    assert not b.path.exists()
+
+
+def _pause_status_then(env, monkeypatch, during):
+    """Run `during()` between A's read under the lock and A's write, inside A's own `status`."""
+    real_fn, needs_log = registry._MUTATORS["status"]
+
+    def paused(text, a):
+        new_text = real_fn(text, a)
+        during()
+        return new_text
+
+    monkeypatch.setitem(registry._MUTATORS, "status", (paused, needs_log))
+
+
+def _a_status(env):
+    return env.run(
+        "status",
+        "--actor",
+        "lead-dev",
+        "--state",
+        "building",
+        "--work",
+        "E-0001",
+        "--phase",
+        "p",
+        "--eta",
+        _eta(),
+    )
+
+
+def test_a_holder_robbed_mid_write_by_a_cli_note_writes_nothing(env, monkeypatch, capsys):
+    lock_path = env.lock_dir / "demo-registry.lock"
+
+    def b_steals_and_writes():
+        _backdate(lock_path)
+        assert env.run("note", "--actor", "jr-dev-1", "--text", "B landed") == 0
+
+    _pause_status_then(env, monkeypatch, b_steals_and_writes)
+    capsys.readouterr()
+    rc = _a_status(env)
+    err = capsys.readouterr().err
+    assert rc == 3, err
+    assert "edit_lock_stolen" in err
+    queue = env.section("Queue")
+    assert "jr-dev-1 -> fleet: B landed" in queue
+    assert "jr-dev-1 -> fleet: broke stale registry edit-lock (prev lead-dev" in queue
+    assert env.reg().agents["lead-dev"].status != "building", "the robbed write landed"
+
+
+def test_a_robbed_holder_refuses_even_before_the_thief_writes(env, monkeypatch, capsys):
+    """The board is still the copy A read, so only the nonce can tell A it no longer holds the lock.
+    A's release must also leave the thief's lock exactly where it is."""
+    lock_path = env.lock_dir / "demo-registry.lock"
+    thief: dict = {}
+
+    def b_steals_and_holds():
+        _backdate(lock_path)
+        thief["lock"] = acquire_edit_lock(env.lock_dir, "demo", "jr-dev-1", timeout=1.0)
+
+    _pause_status_then(env, monkeypatch, b_steals_and_holds)
+    before = env.text()
+    capsys.readouterr()
+    rc = _a_status(env)
+    err = capsys.readouterr().err
+    assert rc == 3, err
+    assert "edit_lock_stolen" in err
+    assert env.text() == before
+    b = thief["lock"]
+    assert registry._lock_holder(lock_path).nonce == b.nonce, "A released the thief's lock"
+    assert b.release() is True
+
+
+def test_a_board_rewritten_under_a_held_lock_is_not_overwritten(env, monkeypatch, capsys):
+    """A writer that bypassed the lock changed the board after A read it: A's copy is stale."""
+
+    def out_of_band():
+        env.registry_path.write_text(env.text() + "\n<!-- out of band -->\n", encoding="utf-8")
+
+    _pause_status_then(env, monkeypatch, out_of_band)
+    capsys.readouterr()
+    rc = _a_status(env)
+    err = capsys.readouterr().err
+    assert rc == 3, err
+    assert "edit_lock_stolen" in err
+    assert "<!-- out of band -->" in env.text()
+    assert env.reg().agents["lead-dev"].status != "building"
+    assert not (env.lock_dir / "demo-registry.lock").exists(), "A still held it, so A releases it"
+
+
+def test_a_dead_same_host_holder_is_broken_on_the_first_acquire(env, monkeypatch):
+    lock_path = env.lock_dir / "demo-registry.lock"
+    _plant_holder(lock_path, f"jr-dev-2\n{_now_iso()}\nNONCE=gone\nPID=424242\n{_here()}")
+    monkeypatch.setattr(registry, "_pid_alive", lambda pid: pid != 424242)
+    # timeout 0: there is no second pass, so only a break on the first look can succeed.
+    assert (
+        env.run(
+            "status",
+            "--actor",
+            "lead-dev",
+            "--state",
+            "building",
+            "--work",
+            "E-0001",
+            "--phase",
+            "p",
+            "--eta",
+            _eta(),
+            timeout="0",
+        )
+        == 0
+    )
+    queue = env.section("Queue")
+    assert "lead-dev -> fleet: broke stale registry edit-lock (prev jr-dev-2," in queue
+    assert env.reg().agents["lead-dev"].status == "building"
+
+
+@pytest.mark.parametrize(
+    "body, probe_says_alive",
+    [
+        pytest.param("jr-dev-2\n{now}\nNONCE=x\nPID=424242\n{here}", True, id="alive-same-host"),
+        # Same hostname, another PID space (WSL beside Windows, a host-network container): the
+        # PID names an unrelated process here, so a probe that says dead must not be asked.
+        pytest.param(
+            "jr-dev-2\n{now}\nNONCE=x\nPID=424242\nHOST={host}\nPIDNS=elsewhere\n",
+            False,
+            id="other-pid-namespace",
+        ),
+        pytest.param(
+            "jr-dev-2\n{now}\nNONCE=x\nPID=424242\nHOST={host}\n", False, id="no-pid-namespace"
+        ),
+        # A PID means nothing on another host, so even a probe that says dead must not be asked.
+        pytest.param(
+            "jr-dev-2\n{now}\nNONCE=x\nPID=424242\nHOST=some-other-host\n", False, id="other-host"
+        ),
+        pytest.param("jr-dev-2\n{now}\n", False, id="legacy-no-pid"),
+    ],
+)
+def test_a_fresh_holder_not_provably_dead_still_blocks(env, monkeypatch, body, probe_says_alive):
+    lock_path = env.lock_dir / "demo-registry.lock"
+    _plant_holder(lock_path, body.format(now=_now_iso(), host=registry._this_host(), here=_here()))
+    monkeypatch.setattr(registry, "_pid_alive", lambda pid: probe_says_alive)
+    assert (
+        env.run("status", "--actor", "lead-dev", "--state", "idle", "--eta", _eta(), timeout="0.2")
+        == 3
+    )
+    assert (lock_path / "holder").read_text(encoding="utf-8").startswith("jr-dev-2")
+
+
+def test_a_legacy_holder_without_nonce_or_pid_is_still_stolen_when_stale(tmp_path):
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    lock_path = lock_dir / "demo-registry.lock"
+    _plant_holder(lock_path, "jr-dev-2\n2000-01-01T00:00Z\n")
+    _backdate(lock_path)
+    holder = registry._lock_holder(lock_path)
+    assert (holder.actor, holder.nonce, holder.pid, holder.host) == ("jr-dev-2", None, 0, None)
+    stolen = acquire_edit_lock(lock_dir, "demo", "lead-dev", timeout=1.0)
+    assert stolen.stole_from == "jr-dev-2"
+    assert stolen.release() is True
+
+
+def test_the_pid_probe_tells_a_live_process_from_an_exited_one():
+    assert registry._pid_alive(os.getpid()) is True
+    flags = (
+        subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    )
+    child = subprocess.Popen([sys.executable, "-c", "pass"], creationflags=flags)
+    child.wait(timeout=30)
+    assert registry._pid_alive(child.pid) is False
+
+
+def test_a_robbed_cull_archives_nothing_and_keeps_the_overflow_files(env, monkeypatch, capsys):
+    """A cull robbed between computing its sweep and appending the log must not archive notes
+    its refused registry write will never drop: they would be duplicated in the log, and the
+    overflow files their pointers name would be deleted while those notes are still live."""
+    path = _overflow(env, "robbed-cull.md", "the long form\n")
+    text = f"go with plan B, reasoning in {_pointer(path.name)}"
+    assert env.run("note", "--actor", "dev-manager", "--to", "lead-dev", "--text", text) == 0
+    assert env.run("note", "--actor", "lead-dev", "--strike", "--match", "plan B") == 0
+    lock_path = env.lock_dir / "demo-registry.lock"
+    real = registry._cmd_cull
+
+    def paused(text, a):
+        result = real(text, a)
+        _backdate(lock_path)
+        assert env.run("note", "--actor", "jr-dev-1", "--text", "B landed") == 0
+        return result
+
+    monkeypatch.setattr(registry, "_cmd_cull", paused)
+    log_before = env.log_path.read_text(encoding="utf-8") if env.log_path.exists() else None
+    capsys.readouterr()
+    rc = env.run("cull", "--actor", "steward")
+    err = capsys.readouterr().err
+    assert rc == 3, err
+    assert "edit_lock_stolen" in err
+    log_after = env.log_path.read_text(encoding="utf-8") if env.log_path.exists() else None
+    assert log_after == log_before, "a robbed cull archived notes it did not drop"
+    assert path.exists(), "a robbed cull deleted an overflow file its live note still names"
+    queue = env.section("Queue")
+    assert "jr-dev-1 -> fleet: B landed" in queue
+    assert "plan B" in queue
+
+
+def test_a_robbed_stealer_refusing_leaves_the_thiefs_board(env, monkeypatch, capsys):
+    """A took a stale lock, so a refusal of its verb would still write its steal Note. If B
+    stole A's hold meanwhile, that Note goes on a board A no longer owns: it must not land."""
+    lock_path = env.lock_dir / "demo-registry.lock"
+    _plant_holder(lock_path, f"jr-dev-2\n{_now_iso()}\n")
+    _backdate(lock_path)
+    real_fn, needs_log = registry._MUTATORS["status"]
+
+    def refusing(text, a):
+        real_fn(text, a)
+        _backdate(lock_path)
+        assert env.run("note", "--actor", "jr-dev-1", "--text", "B landed") == 0
+        raise registry.RegistryError("refused after the steal")
+
+    monkeypatch.setitem(registry._MUTATORS, "status", (refusing, needs_log))
+    capsys.readouterr()
+    rc = _a_status(env)
+    err = capsys.readouterr().err
+    assert rc == 3, err
+    assert "edit_lock_stolen" in err
+    queue = env.section("Queue")
+    assert "jr-dev-1 -> fleet: B landed" in queue, "A's refusal wrote over the thief's board"
+    assert "jr-dev-1 -> fleet: broke stale registry edit-lock (prev lead-dev" in queue
+    assert "(prev jr-dev-2" not in queue
+
+
+def test_a_steal_guard_past_its_bound_is_cleared_even_while_its_pid_looks_alive(tmp_path, capsys):
+    """A stealer killed inside the guard whose PID was then reused would leave a guard that
+    reads alive forever; with the lock breakable too, every writer would exit 3 until a human
+    deleted it. Our own PID stands in for the reused one: `lock_file` alone never frees it."""
+    from agentflow import lock_file
+
+    lock_dir = tmp_path / "locks"
+    first = acquire_edit_lock(lock_dir, "demo", "jr-dev-1", timeout=1.0)
+    _backdate(first.path)
+    guard_path = registry._steal_guard_path(first.path)
+    lock_file.acquire(guard_path)
+    old = time.time() - registry._STEAL_GUARD_STALE - 30
+    os.utime(guard_path, (old, old))
+    capsys.readouterr()
+    stolen = acquire_edit_lock(lock_dir, "demo", "lead-dev", timeout=1.0, poll=0.01)
+    assert stolen.stole_from == "jr-dev-1"
+    assert "cleared steal guard" in capsys.readouterr().err
+    assert not guard_path.exists()
+    assert stolen.release() is True
+
+
+def test_a_lock_retaken_by_another_breakable_holder_is_not_broken_as_the_judged_one(
+    tmp_path, monkeypatch
+):
+    """Breakable is not enough inside the guard: the hold must be the one judged, byte for byte.
+    Both holders here are dead, so only the byte comparison can tell them apart."""
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    lock_path = lock_dir / "demo-registry.lock"
+    _plant_holder(lock_path, f"jr-dev-1\n{_now_iso()}\nNONCE=a\nPID=424241\n{_here()}")
+    monkeypatch.setattr(registry, "_pid_alive", lambda pid: False)
+    breakable, _, observed = registry._breakable(lock_path, registry.EDIT_LOCK_STALE)
+    assert breakable
+    (lock_path / "holder").write_text(
+        f"jr-dev-2\n{_now_iso()}\nNONCE=b\nPID=424242\n{_here()}", encoding="utf-8", newline="\n"
+    )
+    assert registry._breakable(lock_path, registry.EDIT_LOCK_STALE)[0], "control: still breakable"
+    body = registry._holder_body("lead-dev", "c")
+    assert registry._steal(lock_path, observed, registry.EDIT_LOCK_STALE, body) is None
+    assert registry._lock_holder(lock_path).nonce == "b"
+
+
+def _deny_holder_reads(monkeypatch, times: float) -> dict:
+    real = Path.read_text
+    left = {"n": times}
+
+    def flaky(self, *args, **kwargs):
+        if self.name == "holder" and left["n"] > 0:
+            left["n"] -= 1
+            raise PermissionError(13, "sharing violation")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    return left
+
+
+def test_a_briefly_denied_holder_read_does_not_disown_a_live_hold(tmp_path, monkeypatch):
+    lock = acquire_edit_lock(tmp_path / "locks", "demo", "jr-dev-1", timeout=1.0)
+    left = _deny_holder_reads(monkeypatch, 3)
+    assert lock.still_ours() is True
+    assert left["n"] == 0, "the denied reads were never attempted"
+    monkeypatch.undo()
+    assert lock.release() is True
+
+
+def test_a_holder_read_denied_past_the_retry_window_is_not_ours(tmp_path, monkeypatch):
+    lock = acquire_edit_lock(tmp_path / "locks", "demo", "jr-dev-1", timeout=1.0)
+    monkeypatch.setattr(registry, "_HOLDER_DENIED_RETRY", 0.05)
+    _deny_holder_reads(monkeypatch, float("inf"))
+    assert lock.still_ours() is False
+    monkeypatch.undo()
+    assert lock.release() is True
 
 
 # --------------------------------------------------------------------------- #
@@ -2173,14 +2768,17 @@ def test_a_repair_filed_under_another_section_cannot_displace_the_questions_sect
         assert env.run("raise-blocker", "--actor", "steward", "--description", f"filler {n}") == 0
     rows = [ln for ln in env.section("Blockers").split("\n") if ln.startswith("| B-")]
     assert len(rows) == len(_FABRICATED_BLOCK)
-    # Planted bottom-up so the `## Questions` crown lands last; the inert lines before it change
-    # no parsed record and are allowed through, which is why the CROWN is what must refuse.
+    # Planted bottom-up so the `## Questions` crown lands last. The bullet lines before it change
+    # no parsed record, and are refused anyway because none of them is a row of the Blockers
+    # table; the crown is refused in its own right.
     results = [
         env.run("repair", "--actor", "steward", "--section", "Blockers",
                 "--old-line", row, "--new-line", fabricated)
         for row, fabricated in zip(reversed(rows), reversed(_FABRICATED_BLOCK))
     ]
     assert results[-1] == 2, "the crowning `## Questions` heading must be refused"
+    assert results == [2] * len(results), "no step of the plant may land"
+    assert [ln for ln in env.section("Blockers").split("\n") if ln.startswith("| B-")] == rows
     q = env.reg().questions["Q-0001"]
     assert q.fields["state"] == "open"
     assert q.fields["answered_by"] == "-"
@@ -2524,6 +3122,168 @@ def test_refused_directive_stamps_no_heartbeat(env, capsys):
     before = env.text()
     _assert_refused(env, capsys, "directive_devmanager", "directive", "--actor", "auditor", "--text", "nope")
     assert env.text() == before
+
+
+# --------------------------------------------------------------------------- #
+# The human's seat (ETA_HORIZON_EXEMPT): every write is its proof of life, `read --stale`
+# never marks it reap-eligible, and `reap` refuses it.
+# --------------------------------------------------------------------------- #
+#: Each write verb the exempt seat can run: (setup argv run before the heartbeat is aged,
+#: the seat's own write). Setup by other lanes never touches dev-manager's row.
+_EXEMPT_SEAT_WRITES = {
+    "note": ((), ("note", "--actor", "dev-manager", "--to", "lead-dev", "--text", "promote E-0042")),
+    "ask": ((), ("ask", "--actor", "dev-manager", "--urgency", "waiting",
+                 "--question", "q?", "--default", "d")),
+    "answer": (
+        (("ask", "--actor", "jr-dev-1", "--urgency", "waiting", "--question", "q?", "--default", "d"),),
+        ("answer", "--actor", "dev-manager", "--id", "Q-0001", "--answer", "yes", "--by", "human"),
+    ),
+    "apply": (
+        (("ask", "--actor", "dev-manager", "--urgency", "waiting", "--question", "q?", "--default", "d"),
+         ("answer", "--actor", "steward", "--id", "Q-0001", "--answer", "yes", "--by", "steward")),
+        ("apply", "--actor", "dev-manager", "--id", "Q-0001"),
+    ),
+    "retract": (
+        (("ask", "--actor", "dev-manager", "--urgency", "waiting", "--question", "q?", "--default", "d"),),
+        ("retract", "--actor", "dev-manager", "--id", "Q-0001", "--reason", "moot"),
+    ),
+    "raise-blocker": ((), ("raise-blocker", "--actor", "dev-manager", "--work", "E-0051",
+                           "--description", "base branch missing")),
+    "resolve-blocker": (
+        (("raise-blocker", "--actor", "jr-dev-2", "--work", "E-0051", "--description", "d"),
+         ("assign-blocker", "--actor", "steward", "--id", "B-0001", "--owner", "dev-manager")),
+        ("resolve-blocker", "--actor", "dev-manager", "--id", "B-0001"),
+    ),
+    "assign-blocker": (
+        (("raise-blocker", "--actor", "jr-dev-2", "--work", "E-0051", "--description", "d"),),
+        ("assign-blocker", "--actor", "dev-manager", "--id", "B-0001", "--owner", "lead-dev"),
+    ),
+    "expire-directive": (
+        (("directive", "--actor", "dev-manager", "--text", "hold merges"),),
+        ("expire-directive", "--actor", "dev-manager", "--match", "hold merges"),
+    ),
+}
+
+
+@pytest.mark.parametrize("verb", sorted(_EXEMPT_SEAT_WRITES))
+def test_every_write_by_the_exempt_seat_moves_only_its_own_heartbeat(env, verb):
+    """The seat coordinates through these verbs and never sends the `status` write a loop's
+    firing contract does, so each must be its proof of life, and nothing more: status, work,
+    phase, eta and waiting_on stay as the row owner wrote them, and no other row moves."""
+    assert "dev-manager" in registry.ETA_HORIZON_EXEMPT
+    setup, write = _EXEMPT_SEAT_WRITES[verb]
+    assert env.run("status", "--actor", "dev-manager", "--state", "idle", "--work", "E-0007",
+                   "--phase", "triage", "--eta", "2026-08-30T12:00Z") == 0
+    for argv in setup:
+        assert env.run(*argv) == 0, argv
+    _stale_heartbeat(env, "dev-manager")
+    before = env.reg().agents
+    assert env.run(*write) == 0, write
+    after = env.reg().agents
+    now = after["dev-manager"]
+    was = before["dev-manager"]
+    assert now.heartbeat != was.heartbeat == "2020-01-01T00:00Z"
+    assert now.heartbeat.startswith(_now_iso()[:13])  # same hour
+    assert (now.status, now.work, now.phase, now.eta, now.waiting_on) == (
+        was.status, was.work, was.phase, was.eta, was.waiting_on)
+    for agent, row in before.items():
+        if agent != "dev-manager":
+            assert after[agent] == row, f"{verb} moved {agent}'s row"
+
+
+def test_a_non_exempt_lanes_note_leaves_its_heartbeat_alone(env):
+    """Control: only `status` stamps a loop's row. A builder that keeps noting past a lapsed
+    eta must still age out, or the looks-alive-and-is-not shape goes quiet."""
+    assert "lead-dev" not in registry.ETA_HORIZON_EXEMPT
+    assert env.run("status", "--actor", "lead-dev", "--state", "building",
+                   "--phase", "p", "--eta", _eta()) == 0
+    _stale_heartbeat(env, "lead-dev")
+    assert env.run("note", "--actor", "lead-dev", "--to", "jr-dev-1", "--text", "rebase") == 0
+    assert env.reg().agents["lead-dev"].heartbeat == "2020-01-01T00:00Z"
+
+
+def test_exempt_seat_write_does_not_stamp_a_stood_down_row(env):
+    """A fresh heartbeat under a phase saying the lane is stopped is the row
+    `stand_down_heartbeat_only` refuses; the seat's write still lands."""
+    _set_agent_row(env, "dev-manager", heartbeat="2020-01-01T00:00Z", eta="2020-01-01T01:00Z",
+                   phase="stood down by steward: away")
+    assert env.run("note", "--actor", "dev-manager", "--to", "lead-dev", "--text", "hi") == 0
+    assert env.reg().agents["dev-manager"].heartbeat == "2020-01-01T00:00Z"
+    assert any("hi" in n for n in env.reg().notes)
+
+
+def test_exempt_seat_write_does_not_stamp_a_reaped_row(env):
+    """A reaped phase says the lane is dead; a fresh heartbeat under it would contradict it."""
+    _set_agent_row(env, "dev-manager", heartbeat="2020-01-01T00:00Z", eta="2020-01-01T01:00Z",
+                   phase=registry.REAPED_PHASE)
+    assert env.run("note", "--actor", "dev-manager", "--to", "lead-dev", "--text", "back") == 0
+    assert env.reg().agents["dev-manager"].heartbeat == "2020-01-01T00:00Z"
+    assert any("back" in n for n in env.reg().notes)
+
+
+def test_exempt_seat_write_on_a_fresh_board_does_not_make_its_row_invisible(env, capsys):
+    """A fresh row carries heartbeat '-' and eta '-' and the alarm skips it as never started.
+    Stamping only the heartbeat would leave eta '-' beside a fresh heartbeat, which the
+    missed-wake alarm reports INVISIBLE (no-eta). The first `status` write declares the eta."""
+    row = env.reg().agents["dev-manager"]
+    assert (row.heartbeat, row.eta) == ("-", "-")
+    assert env.run("note", "--actor", "dev-manager", "--to", "lead-dev", "--text", "hello") == 0
+    assert env.reg().agents["dev-manager"].heartbeat == "-"
+    capsys.readouterr()
+    main(["read", "--file", str(env.registry_path), "--missed-wakes"])
+    out = capsys.readouterr().out
+    assert not any("dev-manager" in ln and "INVISIBLE" in ln for ln in out.splitlines()), out
+
+
+def test_refused_write_by_the_exempt_seat_stamps_nothing(env, capsys):
+    """The stamp rides the verb's write; a refused verb writes nothing, stamp included."""
+    assert env.run("status", "--actor", "dev-manager", "--state", "idle",
+                   "--phase", "triage", "--eta", "2026-08-30T12:00Z") == 0
+    _stale_heartbeat(env, "dev-manager")
+    before = env.text()
+    rc = env.run("answer", "--actor", "dev-manager", "--id", "Q-0999",
+                 "--answer", "yes", "--by", "dev-manager")
+    assert rc == 2, capsys.readouterr().err
+    assert env.text() == before
+
+
+def test_exempt_seat_write_lands_when_it_has_no_agents_row(env):
+    """The write is the payload; the stamp is a side effect and never costs it."""
+    text = env.text()
+    agents = _section(text, "Agents")
+    kept = [ln for ln in agents.splitlines(keepends=True)
+            if not ln.strip().startswith("| dev-manager ")]
+    env.registry_path.write_text(text.replace(agents, "".join(kept)), encoding="utf-8")
+    assert env.run("note", "--actor", "dev-manager", "--to", "lead-dev", "--text", "rowless") == 0
+    assert any("rowless" in n for n in env.reg().notes)
+    assert "dev-manager" not in env.reg().agents
+
+
+def test_stale_exempt_row_is_flagged_never_reap_eligible_even_with_a_live_ping(env):
+    """Listed, because a seat away past its return is worth reporting; never due the probe."""
+    _set_agent(env, "dev-manager", heartbeat="2026-06-01T00:00Z", eta="2026-05-01T00:00Z")
+    _set_agent(env, "lead-dev", heartbeat="2026-06-01T00:00Z", eta="2026-05-01T00:00Z")
+    for lane in ("dev-manager", "lead-dev"):
+        assert env.run("note", "--actor", "steward", "--to", lane,
+                       "--text", _REAL_LIVENESS_PING) == 0
+    assert _mark(env, "dev-manager") == registry.STALE_FLAG
+    assert _mark(env, "lead-dev") == registry.STALE_REAP_ELIGIBLE  # control: same ping promotes
+
+
+def test_reap_refuses_the_exempt_seat_with_every_override_and_changes_nothing(env, capsys):
+    _set_agent_row(env, "dev-manager", heartbeat="2020-01-01T00:00Z", eta="2020-01-01T01:00Z")
+    assert any(s.agent == "dev-manager" for s in registry.stale_rows(env.reg(), datetime.now(UTC)))
+    before = env.text()
+    _assert_refused(env, capsys, "reap_exempt_seat", "reap", "--actor", "steward", "--agent", "dev-manager")
+    _assert_refused(env, capsys, "reap_exempt_seat", "reap", "--actor", "steward", "--agent",
+                    "dev-manager", "--force", "--reason", "human confirmed", "--override-stand-down")
+    assert env.text() == before
+
+
+def test_reap_still_reaps_a_stale_non_exempt_row(env):
+    """Control: the refusal is the exempt set, not every stale row."""
+    assert _reap_stale(env, "jr-dev-1") == 0
+    assert registry.is_reaped_phase(env.reg().agents["jr-dev-1"].phase)
 
 
 # --------------------------------------------------------------------------- #
@@ -3454,7 +4214,7 @@ def test_stale_ignores_a_lapsed_eta_when_the_heartbeat_is_fresh(env):
 
 
 def test_stale_skips_a_row_that_never_wrote_a_heartbeat_or_an_eta(env):
-    """A freshly initialized registry is all dashes - reporting six dead loops is noise."""
+    """A freshly initialized registry is all dashes - reporting every loop dead is noise."""
     assert registry.stale_rows(env.reg(), _NOW, 3) == []
 
 
@@ -4566,6 +5326,12 @@ _STEAL = "broke stale registry edit-lock"
     ("repair_boilerplate_line",
      ("repair", "--actor", "steward", "--section", "Queue", "--old-line", "| E-1 | x |",
       "--new-line", "<!-- planted -->")),
+    ("repair_not_a_row",
+     ("repair", "--actor", "steward", "--section", "Blockers", "--old-line", "| B-1 | x |",
+      "--new-line", "- state: open")),
+    ("repair_note_line",
+     ("repair", "--actor", "steward", "--section", "Queue",
+      "--old-line", "  - [2026-01-01T00:00Z] lead-dev -> fleet: hi", "--new-line", "")),
     ("stand_down_needs_reason",
      ("stand-down", "--actor", "steward", "--agent", "jr-dev-1", "--reason", " ")),
 ])
@@ -5025,7 +5791,7 @@ def test_two_notes_pointing_at_one_file_in_a_single_sweep_collect_it_once(env):
 
 @pytest.mark.parametrize("escape", ["../secret.md", "sub/inner.md"])
 def test_cull_skips_a_traversal_pointer_and_the_target_file_survives(env, escape):
-    """This path DELETES files as dev-manager, and a note body is written by six loops.
+    """This path DELETES files as dev-manager, and a note body is written by every loop.
 
     Asserting "no exception" would pass with the guard deleted; the assertion that bites is
     that the file the pointer escapes to is still on disk afterwards.
@@ -6418,6 +7184,8 @@ def test_a_missing_deploy_lock_line_is_damaged_not_absent(env, capsys):
     assert rc == 2, f"expected 2, got {rc}; stderr={err!r}"
     assert "file_damaged" in err, f"got {err!r}"
     assert "registry init" not in err, f"got {err!r}"
+    # The rule text names no defect, so the detail must carry this loss's recovery itself.
+    assert "restore the `**Deploy lock**` line" in err and "never `init`" in err, err
 
 
 def test_the_three_file_keys_are_three_distinct_documented_rules():
@@ -6444,7 +7212,8 @@ def test_the_three_file_keys_are_three_distinct_documented_rules():
 #: the moment to ask whether it should have gone through `_read_registry_text` instead.
 _ALLOWED_FILE_READS = Counter({
     ("_read_registry_text", "read_text"): 1,  # THE registry read (gh#134's one door)
-    ("_lock_holder", "read_text"): 1,         # the edit-lock holder file, not the registry
+    ("_read_holder_text", "read_text"): 1,    # the edit-lock holder file, not the registry
+    ("_clear_aged_steal_guard", "read_text"): 2,  # <lock>.steal, judged then re-read
     ("_template_text", "read_text"): 1,       # templates/registry.md, for `init`
     ("_run_mutation", "read_bytes"): 1,       # a culled note's overflow body
     ("_run_mutation", "read_text"): 1,        # registry-log.md
@@ -8892,6 +9661,22 @@ def test_report_names_the_janitor_exemption_it_records():
     assert "exempt from that binding: dev-manager" in report
 
 
+def test_report_keeps_the_open_rule_outside_the_assign_blocker_exemption():
+    """dev-manager is exempt from the OWNERSHIP limit on `assign-blocker`, never from OPEN.
+
+    The report prints the janitor line straight under `bound_by`, so a bound_by that led with
+    "only an OPEN blocker" read as exempting dev-manager from that too.
+    """
+    report = capability_report()
+    i = report.index("  assign-blocker: steward, dev-manager")
+    block = report[i: i + 5]
+    assert (
+        "      also bound by: only a blocker the actor owns or one with no owner "
+        "(and, for every actor including the exempt one, only an OPEN blocker)"
+    ) in block, block
+    assert "      exempt from that binding: dev-manager" in block, block
+
+
 def test_report_states_the_promotion_verdict_for_every_restricted_verb():
     """Whether an item is flaggable is derived here, not left for the seat to re-derive.
 
@@ -9836,7 +10621,7 @@ def test_repair_may_not_rewrite_a_retraction_reason(env, capsys):
     assert "the real reason" in env.text()
 
 
-def test_a_queue_row_parked_on_a_retracted_question_is_REPORTED(env):
+def test_a_queue_row_parked_on_a_retracted_question_is_REPORTED(env, capsys):
     """Retraction protected the Agents row (`status --waiting-on` validates against the live
     set) and not the Queue row, because `release` never validated its referent. After a retract
     the row sat `parked`, still claimed, pointing at an id in neither section, and the strand
@@ -9848,11 +10633,28 @@ def test_a_queue_row_parked_on_a_retracted_question_is_REPORTED(env):
     assert env.run("release", "--actor", "jr-dev-1", "--id", "E-0001-first-queued-item",
                    "--state", "parked", "--waiting-on", "Q-0001") == 0
     assert env.run("validate") == 0, "parked on a LIVE question is fine"
-    assert env.run("retract", "--actor", "jr-dev-1", "--id", "Q-0001", "--reason", "died") == 0
+    # The write path now refuses to orphan the row (waited_on_live); validate is the backstop
+    # for a referent consumed some other way, so consume it by hand to keep that reachable.
+    assert env.run("retract", "--actor", "jr-dev-1", "--id", "Q-0001", "--reason", "died") == 2
+    assert env.run("validate") == 0
+    _consume_question_by_hand(env, "open", "retracted")
+    _assert_parked_on_nothing(env, capsys)
+
+
+def _consume_question_by_hand(env, old_state: str, new_state: str) -> None:
+    text = env.text()
+    assert text.count(f"- state: {old_state}") == 1
+    env.registry_path.write_text(
+        text.replace(f"- state: {old_state}", f"- state: {new_state}"), encoding="utf-8")
+
+
+def _assert_parked_on_nothing(env, capsys) -> None:
+    capsys.readouterr()
     assert env.run("validate") == 2, "parked on a consumed question must be reported"
+    assert "the row is parked on nothing" in capsys.readouterr().err
 
 
-def test_a_queue_row_parked_on_an_APPLIED_question_is_reported_too(env):
+def test_a_queue_row_parked_on_an_APPLIED_question_is_reported_too(env, capsys):
     """Not a retract special case - the same orphan exists for the answer path and was never
     reported either."""
     assert env.run("publish", "--actor", "lead-dev", "--slug", "first-queued-item",
@@ -9863,8 +10665,10 @@ def test_a_queue_row_parked_on_an_APPLIED_question_is_reported_too(env):
                    "--state", "parked", "--waiting-on", "Q-0001") == 0
     assert env.run("answer", "--actor", "dev-manager", "--by", "human",
                    "--id", "Q-0001", "--answer", "yes") == 0
-    assert env.run("apply", "--actor", "jr-dev-1", "--id", "Q-0001") == 0
-    assert env.run("validate") == 2
+    assert env.run("apply", "--actor", "jr-dev-1", "--id", "Q-0001") == 2
+    assert env.run("validate") == 0
+    _consume_question_by_hand(env, "answered", "applied")
+    _assert_parked_on_nothing(env, capsys)
 
 
 # --------------------------------------------------------------------------- #
@@ -10095,6 +10899,29 @@ def test_publish_prints_the_id_it_allocated(env, capsys):
     assert env.run("publish", "--actor", "lead-dev", "--slug", "export-pipeline-artifacts",
                    "--title", "x", "--lane", "jr-dev-1") == 0
     assert "published: E-0001-export-pipeline-artifacts" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("title, odd", [
+    ("BUG GH#14 - fix (p100)", "GH#14"),
+    ("BUG #12 - fix (p100)", "#12"),
+])
+def test_publish_warns_when_the_title_cites_an_issue_not_as_gh_n(env, capsys, title, odd):
+    """gh#909: the held predicate reads these forms, but the canonical spelling is lowercase
+    gh#N. The publish still lands (rc 0); the warning is on stderr and is ASCII."""
+    assert env.run("publish", "--actor", "lead-dev", "--slug", "fix-a-bug",
+                   "--title", title, "--lane", "jr-dev-1") == 0
+    cap = capsys.readouterr()
+    assert "published: E-0001-fix-a-bug" in cap.out
+    assert f"cites {odd};" in cap.err and "gh#<N>" in cap.err
+    assert cap.err.isascii()
+    assert title in env.section("Queue")
+
+
+@pytest.mark.parametrize("title", ["BUG gh#14 - fix (p100)", "follow-up to PR #13", "x"])
+def test_publish_is_silent_for_a_canonical_or_absent_issue_reference(env, capsys, title):
+    assert env.run("publish", "--actor", "lead-dev", "--slug", "fix-a-bug",
+                   "--title", title, "--lane", "jr-dev-1") == 0
+    assert "warning" not in capsys.readouterr().err
 
 
 def test_the_number_alone_stays_a_valid_grep_key(env):
@@ -10646,6 +11473,143 @@ def test_gh569_a_mangled_lock_line_is_still_restorable(env):
     assert env.run("repair", "--actor", "steward", "--section", "Queue",
                    "--old-line", bad, "--new-line", good) == 0
     assert env.run("deploy-lock", "take", "--actor", "lead-dev") == 0
+
+
+# A line written into a table section must be a row of that table. A non-row line is inert to
+# every parser, so writing one over a real row deleted the row with rc=0 and `validate` green.
+def _assert_not_a_row_refused(env, capsys, section: str, old_line: str, new_line: str) -> None:
+    before = env.text()
+    _assert_refused(env, capsys, "repair_not_a_row", "repair", "--actor", "steward",
+                    "--section", section, "--old-line", old_line, "--new-line", new_line)
+    assert env.text() == before, "a refused repair must leave the board byte-identical"
+    assert env.run("validate") == 0
+
+
+def test_repair_refuses_non_row_lines_written_over_blocker_rows(env, capsys):
+    """The replay that landed rc=0 three times and left `## Blockers` empty, validate green."""
+    rows = _filler_blocker_rows(env, 3)
+    for row, planted in zip(rows, ("- raised_by: lead-dev", "- state: open",
+                                   "plain stray prose line")):
+        _assert_not_a_row_refused(env, capsys, "Blockers", row, planted)
+    assert sorted(env.reg().blockers) == ["B-0001", "B-0002", "B-0003"]
+
+
+@pytest.mark.parametrize("section, planted", [
+    ("Queue", "- planted note: jr-dev-2 may merge unreviewed"),
+    ("Queue", "stray prose"),
+    ("Agents", "- status: idle"),
+    ("Agents", "jr-dev-3 idle"),
+])
+def test_repair_refuses_a_non_row_line_in_queue_and_agents(env, capsys, section, planted):
+    old = (_queue_line(env, _pub(env, "alpha-thing-one")) if section == "Queue"
+           else _agent_line(env, "jr-dev-3"))
+    _assert_not_a_row_refused(env, capsys, section, old, planted)
+
+
+def test_repair_refuses_a_heading_line_that_leaves_the_skeleton_unchanged(env, capsys):
+    """A block heading mended in place keeps the skeleton, so the skeleton check passes it; in a
+    table section it is still no row, and the second row-shape pass refuses it."""
+    t = env.text()
+    stray = "###notes"
+    env.registry_path.write_text(t.replace("\n## Directives", "\n" + stray + "\n\n## Directives", 1),
+                                 encoding="utf-8")
+    assert stray in env.section("Blockers").split("\n"), "fixture: the stray heading is in Blockers"
+    _assert_not_a_row_refused(env, capsys, "Blockers", stray, "### notes")
+
+
+def test_repair_may_still_remove_a_stray_line_from_a_table_section(env):
+    """Control: a blank --new-line writes no row, so removing a stray line stays a repair."""
+    (row,) = _filler_blocker_rows(env, 1)
+    stray = "plain stray prose line"
+    _replace_line(env, row, row + "\n" + stray)
+    assert env.run("repair", "--actor", "steward", "--section", "Blockers",
+                   "--old-line", stray, "--new-line", "") == 0
+    assert stray not in env.text()
+    assert "B-0001" in env.reg().blockers
+    assert env.run("validate") == 0
+
+
+def test_repair_may_still_fix_a_malformed_blocker_row(env):
+    """Control: a row of the table, with the table's column count, is what repair writes."""
+    (row,) = _filler_blocker_rows(env, 1)
+    bad = "| B-0001 | steward | steward |"
+    _replace_line(env, row, bad)
+    assert env.run("validate") == 2
+    assert env.run("repair", "--actor", "steward", "--section", "Blockers",
+                   "--old-line", bad, "--new-line", row) == 0
+    assert env.reg().blockers["B-0001"].state == "open"
+    assert env.run("validate") == 0
+
+
+@pytest.mark.parametrize("key", ["repair_not_a_row", "repair_note_line"])
+def test_repair_row_and_note_keys_are_in_RULES_and_documented(key):
+    assert key in RULES
+    assert RULES[key].startswith("REGISTRY.md #What-repair-may-not-touch:"), RULES[key]
+    doc = (_SHARED.parents[1] / "docs" / "REGISTRY.md").read_text(encoding="utf-8")
+    assert f"(`{key}`, exit 2)" in doc, f"{key} has no paragraph in What `repair` may not touch"
+
+
+# A Note bullet is owned by `note --strike` and the cull, never by repair. Writing a row over a
+# live Note minted a Queue row with rc=0 and validate green, and deleted another lane's Note.
+def _live_note_line(env, text: str) -> str:
+    hits = [ln for ln in env.section("Queue").split("\n") if ln.lstrip().startswith("- ")
+            and text in ln]
+    assert len(hits) == 1, f"expected one Note line for {text!r}, got {hits}"
+    return hits[0]
+
+
+@pytest.mark.parametrize("new_line", [
+    "| E-0099-minted | minted item | jr-dev-1 | - | ready | - | - |",
+    "",
+])
+def test_repair_refuses_a_note_bullet_as_old_line(env, capsys, new_line):
+    assert env.run("note", "--actor", "lead-dev", "--text", "hello fleet") == 0
+    note = _live_note_line(env, "hello fleet")
+    before = env.text()
+    _assert_refused(env, capsys, "repair_note_line", "repair", "--actor", "steward",
+                    "--section", "Queue", "--old-line", note, "--new-line", new_line)
+    assert env.text() == before, "a refused repair must leave the board byte-identical"
+    assert env.run("validate") == 0
+    assert "E-0099-minted" not in env.reg().queue
+
+
+def test_repair_refuses_a_struck_note_bullet_too(env, capsys):
+    """A struck Note is the cull's to remove, with its log receipt; repair would skip both."""
+    assert env.run("note", "--actor", "lead-dev", "--text", "done with this") == 0
+    assert env.run("note", "--actor", "lead-dev", "--strike", "--match", "done with this") == 0
+    struck = _live_note_line(env, "done with this")
+    before = env.text()
+    _assert_refused(env, capsys, "repair_note_line", "repair", "--actor", "steward",
+                    "--section", "Queue", "--old-line", struck, "--new-line", "")
+    assert env.text() == before
+
+
+def test_a_live_note_cannot_be_overwritten_with_a_second_deploy_lock_line(env, capsys):
+    """The singleton-restore exemption is not a route around the Note refusal: with the lock
+    line intact, writing another over a Note is a duplicate, refused under the lock."""
+    assert env.run("note", "--actor", "lead-dev", "--text", "keep me") == 0
+    note = _live_note_line(env, "keep me")
+    before = env.text()
+    _assert_refused(env, capsys, "repair_boilerplate_line", "repair", "--actor", "steward",
+                    "--section", "Queue", "--old-line", note,
+                    "--new-line", "- **Deploy lock** — holder: jr-dev-1, taken-at: -")
+    assert env.text() == before
+
+
+def test_a_note_that_lost_its_bullet_is_not_written_back_by_repair(env, capsys):
+    """Coherent with the above: repair neither removes nor writes a Note bullet. A Note whose
+    `- ` marker was mangled away is no Note to any parser, so it is not `repair_note_line`'s;
+    writing a bullet back is a non-row line in a table section, refused as `repair_not_a_row`.
+    The sender re-`note`s it; the stray line itself stays removable with a blank --new-line."""
+    assert env.run("note", "--actor", "lead-dev", "--text", "mangled one") == 0
+    note = _live_note_line(env, "mangled one")
+    mangled = note.replace("- [", "[", 1)
+    _replace_line(env, note, mangled)
+    _assert_not_a_row_refused(env, capsys, "Queue", mangled, note)
+    assert env.run("repair", "--actor", "steward", "--section", "Queue",
+                   "--old-line", mangled, "--new-line", "") == 0
+    assert "mangled one" not in env.section("Queue")
+    assert env.run("validate") == 0
 
 
 def test_gh681_the_refusal_key_is_in_RULES_and_documented():
@@ -11248,7 +12212,7 @@ def test_gh334_lead_dev_cells_name_publish_relane_withdraw(env, capsys, col, val
 
 @pytest.mark.parametrize("col, value", [
     (3, "jr-dev-1"),   # claimed_by
-    (4, "building"),   # state
+    (4, "done"),       # state -- `done` keeps '-' valid; an in-flight one would be refused
     (5, "Q-0001"),     # waiting_on -- claimant-only via release, and live
 ])
 def test_gh334_claimant_cells_name_claim_release_and_reap(env, capsys, col, value):
@@ -11311,9 +12275,255 @@ def test_gh334_a_row_validate_rejects_stays_repairable(env, capsys, col, bad):
     assert env.reg().queue[rid].state == "ready"
 
 
+# --------------------------------------------------------------------------- #
+# gh#811: on a Queue row validate REJECTS, repair may change only the cells validate flags.
+# The guard used to step aside for the whole row, so mending a bad `state` also rewrote the
+# lane, claimant and notes at rc=0.
+# --------------------------------------------------------------------------- #
+def _break_queue_row(env, capsys, rid: str, **bad) -> tuple[list[str], str]:
+    """Corrupt *rid*'s Queue row cell by cell (column index -> value); return (good cells, line)."""
+    old = _queue_line(env, rid)
+    good = registry._cells(old)
+    cells = list(good)
+    for col, value in bad.items():
+        cells[int(col[1:])] = value
+    broken = registry._fmt_row(cells)
+    _replace_line(env, old, broken)
+    assert env.run("validate") == 2
+    capsys.readouterr()
+    return good, broken
+
+
+def test_gh811_repro_mending_the_flagged_state_changes_only_that_cell(env, capsys):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, c4="shiped")
+    before = env.text()
+    rc = _repair(env, "Queue", broken, registry._fmt_row(good))
+    assert rc == 0, capsys.readouterr().err
+    assert env.run("validate") == 0
+    after = registry._cells(_queue_line(env, rid))
+    assert after == good, after
+    # The broken line is the only one that changed, apart from the audit Note appended (which
+    # replaces the empty `- **Notes** — (none)` placeholder).
+    gone = [ln for ln in before.split("\n") if ln not in env.text().split("\n")
+            and not ln.startswith("- **Notes**")]
+    assert gone == [broken], gone
+
+
+def test_gh811_repro_rewriting_unflagged_cells_of_a_rejected_row_is_refused(env, capsys):
+    """The issue's repro: state corrupted to 'shiped', then lane, claimant, state and notes all
+    rewritten by one repair, rc 0. Only state was flagged, so the rest is refused."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, c4="shiped")
+    cells = list(good)
+    cells[2], cells[3], cells[4], cells[6] = "jr-dev-2", "jr-dev-2", "building", "steward wrote"
+    err = _assert_queue_owned_refusal(env, capsys, broken, registry._fmt_row(cells))
+    assert "`validate` rejects" in err and "bad state 'shiped'" in err, err
+    assert "may only mend the flagged cell(s): state." in err, err
+    assert "would also change: lane, claimed_by, notes," in err, err
+    assert "`relane`" in err and "`claim`" in err, err
+    row = registry._cells(_queue_line(env, rid))
+    assert row[2:5] == ["jr-dev-1", "-", "shiped"], row
+
+
+@pytest.mark.parametrize("col, value", [
+    (1, "a different work item"),
+    (2, "jr-dev-2"),
+    (3, "jr-dev-1"),
+    (6, "steward was here"),
+])
+def test_gh811_one_unflagged_cell_beside_the_mend_is_refused(env, capsys, col, value):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, c4="shiped")
+    cells = list(good)
+    cells[col] = value
+    err = _assert_queue_owned_refusal(env, capsys, broken, registry._fmt_row(cells))
+    assert f"would also change: {registry._QUEUE_COLUMNS[col]}," in err, err
+
+
+def test_gh811_two_flagged_cells_may_be_mended_in_one_repair(env, capsys):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, c2="nobody", c4="shiped")
+    rc = _repair(env, "Queue", broken, registry._fmt_row(good))
+    assert rc == 0, capsys.readouterr().err
+    assert env.run("validate") == 0
+    assert registry._cells(_queue_line(env, rid)) == good
+
+
+def test_gh811_two_flagged_cells_still_refuse_a_third(env, capsys):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, c2="nobody", c4="shiped")
+    cells = list(good)
+    cells[6] = "steward wrote"
+    err = _assert_queue_owned_refusal(env, capsys, broken, registry._fmt_row(cells))
+    assert "may only mend the flagged cell(s): lane, state." in err, err
+    assert "would also change: notes," in err, err
+
+
+def test_gh811_deleting_a_rejected_non_duplicate_row_is_refused(env, capsys):
+    """A blank --new-line changes every cell; only the duplicate-id case keeps that rule."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    _, broken = _break_queue_row(env, capsys, rid, c4="shiped")
+    err = _assert_queue_owned_refusal(env, capsys, broken, "")
+    assert ("Deleting the row would also remove: id, work item, lane, claimed_by, waiting_on, "
+            "notes,") in err, err
+    # The owner clauses name only the stray columns, never a fixed list.
+    assert "id, work item, lane, notes belong(s) to lead-dev" in err, err
+    assert "claimed_by, waiting_on belong(s) to the claimant" in err, err
+
+
+def test_gh811_a_bad_id_row_stays_deletable(env, capsys):
+    """The parser drops a row whose id fails _E_ID, so every owning verb and the cull are blind
+    to it: a blank --new-line is the only clean way to remove it. `validate` reports it off the
+    raw line, and the deletion clears that finding."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    old = _queue_line(env, rid)
+    bad = old.replace(f"| {rid} |", "| E-OOO1-alpha-thing-one |")
+    _replace_line(env, old, bad)
+    assert rid not in env.reg().queue
+    assert env.run("validate") == 2, "a bad-id row must not pass validate"
+    assert "Queue: bad id 'E-OOO1-alpha-thing-one'" in capsys.readouterr().err
+    rc = _repair(env, "Queue", bad, "")
+    assert rc == 0, capsys.readouterr().err
+    assert bad not in env.text()
+    assert env.run("validate") == 0
+
+
+def test_an_unknown_agent_row_stays_deletable(env, capsys):
+    """The parser drops an Agents row naming no fleet loop, so `validate` reports it off the raw
+    line; a blank --new-line must clear it, or the finding would wedge every wake gate."""
+    _add_table_row(env, "Agents", _UNKNOWN_AGENT_ROW)
+    assert env.run("validate") == 2, "fixture precondition: the row is a finding"
+    capsys.readouterr()
+    rc = _repair(env, "Agents", _UNKNOWN_AGENT_ROW, "")
+    assert rc == 0, capsys.readouterr().err
+    assert _UNKNOWN_AGENT_ROW not in env.text()
+    assert env.run("validate") == 0, capsys.readouterr().err
+
+
+def test_gh811_a_mend_may_not_leave_a_row_parked_on_nothing(env, capsys):
+    """A parked row with a dead waiting_on, mended to '-', would sit parked and claimed waiting
+    on nothing: `release` refuses that shape and `validate` cannot see it."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, c3="jr-dev-1", c4="parked", c5="Q-0999")
+    assert "parked on nothing" in (env.run("validate"), capsys.readouterr().err)[1]
+    cells = registry._cells(broken)
+    cells[5] = "-"
+    err = _assert_queue_owned_refusal(env, capsys, broken, registry._fmt_row(cells))
+    assert "waiting on nothing" in err and "`release`" in err and "`reap`" in err, err
+    # Nor may the mend re-point the park at a live referent: waiting_on is the claimant's, and
+    # a mended owner-held cell may only be cleared. Such a row goes to `release` or `reap`.
+    cells[5] = _ask_one(env)
+    capsys.readouterr()
+    err = _assert_queue_owned_refusal(env, capsys, _queue_line(env, rid), registry._fmt_row(cells))
+    assert "may only clear" in err and "`release`" in err, err
+    assert registry._cells(_queue_line(env, rid))[5] == "Q-0999"
+
+
+@pytest.mark.parametrize("col, bad, neighbour, other", [
+    (2, "nobody", 1, "a different work item"),   # lane
+    (3, "nobody", 2, "jr-dev-2"),                # claimed_by
+    (4, "shiped", 6, "steward wrote"),           # state
+    (5, "Q-0999", 6, "steward wrote"),           # waiting_on, on a row that is not parked
+])
+def test_gh811_each_check_flags_exactly_its_own_cell(env, capsys, col, bad, neighbour, other):
+    """Pins the check -> column mapping: mending the corrupted cell alone passes, and the same
+    mend with one neighbouring cell changed is refused. (The id check is exempt: see above.)"""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, **{f"c{col}": bad})
+    cells = list(good)
+    cells[neighbour] = other
+    err = _assert_queue_owned_refusal(env, capsys, broken, registry._fmt_row(cells))
+    assert f"may only mend the flagged cell(s): {registry._QUEUE_COLUMNS[col]}." in err, err
+    rc = _repair(env, "Queue", broken, registry._fmt_row(good))
+    assert rc == 0, capsys.readouterr().err
+    assert env.run("validate") == 0
+    assert registry._cells(_queue_line(env, rid)) == good
+
+
 def test_gh334_the_refusal_key_is_in_RULES():
     assert "repair_queue_owned" in RULES
     assert RULES["repair_queue_owned"].startswith("REGISTRY.md #")
+
+
+# --------------------------------------------------------------------------- #
+# repair may not rewrite a Blockers row `validate` already accepts either: owner and state have
+# owning verbs, and a repaired owner let the steward resolve a blocker it was never assigned.
+# --------------------------------------------------------------------------- #
+def _blocker_line(env, bid: str) -> str:
+    return next(ln for ln in env.section("Blockers").split("\n") if ln.startswith(f"| {bid} |"))
+
+
+def test_repair_cannot_take_over_a_blocker_another_seat_owns(env, capsys):
+    """The review repro: raise owned by lead-dev, repair the owner to steward, steward resolves."""
+    env.run("raise-blocker", "--actor", "jr-dev-2", "--work", "E-0051", "--description", "x",
+            "--owner", "lead-dev")
+    assert env.run("validate") == 0
+    capsys.readouterr()
+    old = _blocker_line(env, "B-0001")
+    cells = registry._cells(old)
+    cells[2] = "steward"
+    before = env.text()
+    rc = _repair(env, "Blockers", old, registry._fmt_row(cells))
+    err = capsys.readouterr().err
+    assert rc == 2, f"expected refusal (2), got {rc}; stderr={err!r}"
+    assert "repair_blocker_owned" in err, err
+    assert "`assign-blocker`" in err and "`resolve-blocker`" in err, err
+    assert env.text() == before, "a refused repair must leave the board byte-identical"
+    assert env.reg().blockers["B-0001"].owner == "lead-dev"
+    _assert_refused(env, capsys, "blocker_owner_resolves",
+                    "resolve-blocker", "--actor", "steward", "--id", "B-0001")
+
+
+def test_repair_cannot_resolve_a_well_formed_blocker(env, capsys):
+    env.run("raise-blocker", "--actor", "steward", "--description", "x", "--owner", "steward")
+    old = _blocker_line(env, "B-0001")
+    cells = registry._cells(old)
+    cells[4] = "resolved"
+    rc = _repair(env, "Blockers", old, registry._fmt_row(cells))
+    err = capsys.readouterr().err
+    assert rc == 2 and "repair_blocker_owned" in err, err
+    assert env.reg().blockers["B-0001"].state == "open"
+
+
+@pytest.mark.parametrize("col, bad, mend, owner", [
+    (4, "opne", "open", "lead-dev"),        # bad state enum
+    (2, "nobody", "-", "-"),                # bad owner: an owner-held cell, only cleared
+    (0, "B-OOO1", "B-0001", "lead-dev"),    # corrupted id (the parser cannot see the row)
+])
+def test_a_blocker_row_validate_rejects_stays_repairable(env, capsys, col, bad, mend, owner):
+    env.run("raise-blocker", "--actor", "jr-dev-2", "--description", "x", "--owner", "lead-dev")
+    old = _blocker_line(env, "B-0001")
+    cells = registry._cells(old)
+    cells[col] = bad
+    broken = registry._fmt_row(cells)
+    _replace_line(env, old, broken)
+    assert env.run("validate") == 2 or "B-0001" not in env.reg().blockers
+    capsys.readouterr()
+    cells[col] = mend
+    rc = _repair(env, "Blockers", broken, registry._fmt_row(cells))
+    assert rc == 0, capsys.readouterr().err
+    assert env.run("validate") == 0
+    assert env.reg().blockers["B-0001"].owner == owner
+
+
+def test_a_duplicate_blocker_id_stays_repairable(env, capsys):
+    env.run("raise-blocker", "--actor", "jr-dev-2", "--description", "x", "--owner", "lead-dev")
+    old = _blocker_line(env, "B-0001")
+    cells = registry._cells(old)
+    cells[2] = "jr-dev-1"
+    twin = registry._fmt_row(cells)
+    _replace_line(env, old, old + "\n" + twin)
+    assert env.run("validate") == 2
+    capsys.readouterr()
+    rc = _repair(env, "Blockers", twin, "")
+    assert rc == 0, capsys.readouterr().err
+    assert env.run("validate") == 0
+    assert env.reg().blockers["B-0001"].owner == "lead-dev"
+
+
+def test_repair_blocker_owned_is_in_RULES():
+    assert RULES["repair_blocker_owned"].startswith("REGISTRY.md #Blockers")
 
 
 # --------------------------------------------------------------------------- #
@@ -11396,3 +12606,1523 @@ def test_gh191_urgency_and_default_stay_repairable(env, field, broken, fixed):
                    "--old-line", broken, "--new-line", fixed) == 0
     assert env.reg().questions["Q-0001"].fields[field] == fixed.split(": ", 1)[1]
     assert env.run("validate") == 0
+
+
+# --------------------------------------------------------------------------- #
+# gh#987: the janitor and question verbs judged one row and wrote another, or wrote a row that
+# had no owner's consent. Each test asserts the exact key, exit 2 and a byte-identical board.
+# --------------------------------------------------------------------------- #
+def _duplicate_question(env) -> None:
+    """Q-0001 answered by the human, then an OPEN twin of it after it - the issue's board.
+
+    The parse keeps the LAST block (open) and `_edit_qfield` wrote the FIRST (answered), so a
+    retract or answer judged the open twin and overwrote the human's decision.
+    """
+    assert _ask(env) == 0
+    assert env.run("answer", "--actor", "dev-manager", "--by", "human",
+                   "--id", "Q-0001", "--answer", "B, per human") == 0
+    text = env.text()
+    s, e = _section_bounds(text)["Questions"]
+    body = text[s:e]
+    m = re.search(r"^### Q-0001[ \t]*\n(?:- .*\n?)+", body, re.M)
+    assert m, body
+    block = m.group(0).rstrip("\n")
+    twin = (block.replace("- state: answered", "- state: open")
+            .replace("- answer: B, per human", "- answer: -")
+            .replace("- answered_by: human", "- answered_by: -"))
+    assert twin != block and "- state: open" in twin
+    body = body.replace(block, block + "\n\n" + twin, 1)
+    env.registry_path.write_text(text[:s] + body + text[e:], encoding="utf-8")
+    assert env.text().count("### Q-0001") == 2
+
+
+def test_gh987_validate_reports_a_duplicated_question_id(env, capsys):
+    _duplicate_question(env)
+    capsys.readouterr()
+    assert env.run("validate") == 2
+    err = capsys.readouterr().err
+    assert "Questions: 'Q-0001' appears on 2 blocks" in err, err
+
+
+@pytest.mark.parametrize("verb, args", [
+    ("retract", ["--actor", "lead-dev", "--id", "Q-0001", "--reason", "premise gone"]),
+    ("answer", ["--actor", "dev-manager", "--by", "dev-manager", "--id", "Q-0001",
+                "--answer", "yes rename"]),
+    ("apply", ["--actor", "lead-dev", "--id", "Q-0001"]),
+])
+def test_gh987_question_verbs_refuse_a_duplicated_id_before_judging(env, capsys, verb, args):
+    _duplicate_question(env)
+    before = env.text()
+    capsys.readouterr()
+    _assert_refused(env, capsys, "id_duplicate", verb, *args)
+    assert env.text() == before, "a refused write must leave the board byte-identical"
+
+
+def test_gh987_the_question_writer_itself_refuses_a_duplicated_id(env):
+    """The writer's own guard, for any future caller that skips the verbs' pre-check: it wrote
+    the FIRST block while every reader saw the last."""
+    _duplicate_question(env)
+    with pytest.raises(RegistryError) as ei:
+        registry._edit_qfield(env.section("Questions"), "Q-0001", {"state": "applied"})
+    assert ei.value.rule_key == "id_duplicate"
+
+
+def test_gh987_stand_down_on_an_agent_with_no_row_is_id_exists_not_a_crash(env, capsys):
+    """Exit 1 means 'the write did not land, re-run'; a missing row never lands, so it is 2."""
+    _replace_line(env, _agent_line(env, "jr-dev-3") + "\n", "")
+    assert env.run("validate") == 0
+    before = env.text()
+    capsys.readouterr()
+    _assert_refused(env, capsys, "id_exists", "stand-down", "--actor", "steward",
+                    "--agent", "jr-dev-3", "--reason", "not provisioned")
+    assert env.text() == before
+
+
+def test_gh987_repair_refuses_a_well_formed_agents_row(env, capsys):
+    """The faked-heartbeat repro: a stale row repaired to a fresh one vanished from
+    `read --stale` with rc 0. Every cell of a well-formed Agents row is its lane's own
+    (`status`), and a dead lane's is the steward's through `reap`."""
+    _set_agent_row(env, "jr-dev-2", heartbeat="2020-01-01T00:00Z", eta="2020-01-01T01:00Z",
+                   status="building")
+    old = _agent_line(env, "jr-dev-2")
+    cells = registry._cells(old)
+    cells[4], cells[5] = "2026-10-03T07:40Z", "2026-10-03T12:00Z"
+    before = env.text()
+    capsys.readouterr()
+    _assert_refused(env, capsys, "repair_agents_owned", "repair", "--actor", "steward",
+                    "--section", "Agents", "--old-line", old,
+                    "--new-line", registry._fmt_row(cells))
+    assert env.text() == before
+    assert "repaired ##" not in env.text()
+
+
+def test_gh987_a_duplicated_agents_row_stays_repairable_and_the_note_names_the_agent(env, capsys):
+    good = _agent_line(env, "jr-dev-2")
+    twin = good.replace("| idle |", "| building |", 1)
+    assert twin != good
+    _replace_line(env, good, good + "\n" + twin)
+    assert env.run("validate") == 2
+    capsys.readouterr()
+    assert _repair(env, "Agents", twin, "") == 0, capsys.readouterr().err
+    assert env.run("validate") == 0
+    assert "repaired ## Agents: jr-dev-2" in env.text(), env.section("Queue")
+
+
+def test_gh987_a_malformed_agents_row_repair_note_names_the_agent(env, capsys):
+    good = _agent_line(env, "jr-dev-3")
+    broken = good.replace("| idle |", "| zombie |", 1)
+    _replace_line(env, good, broken)
+    assert _repair(env, "Agents", broken, good) == 0, capsys.readouterr().err
+    assert "repaired ## Agents: jr-dev-3" in env.text(), env.section("Queue")
+
+
+def test_gh987_stand_down_refuses_an_already_reaped_row(env, capsys):
+    """Standing down a reaped row erased the reap mark and sent a lane holding nothing back
+    into `read --stale` as an escalation, which `reap` then refused as stood down."""
+    assert _reap_stale(env, "jr-dev-1") == 0
+    before = env.text()
+    capsys.readouterr()
+    _assert_refused(env, capsys, "stand_down_reaped", "stand-down", "--actor", "steward",
+                    "--agent", "jr-dev-1", "--reason", "human paused")
+    assert env.text() == before
+
+
+@pytest.mark.parametrize("agent, key", [
+    ("steward", "stand_down_self"),
+    ("dev-manager", "stand_down_exempt_seat"),
+])
+def test_gh987_stand_down_refuses_its_own_actor_and_the_exempt_seat(env, capsys, agent, key):
+    before = env.text()
+    _assert_refused(env, capsys, key, "stand-down", "--actor", "steward",
+                    "--agent", agent, "--reason", "x")
+    assert env.text() == before
+
+
+@pytest.mark.parametrize("key, section", [
+    ("repair_agents_owned", "#Agents"),
+    ("stand_down_reaped", "#Agents"),
+    ("stand_down_self", "#Liveness-sweep"),
+    ("stand_down_exempt_seat", "#Liveness-sweep"),
+])
+def test_gh987_new_keys_are_in_RULES_and_documented(key, section):
+    assert RULES[key].startswith(f"REGISTRY.md {section}"), RULES[key]
+    doc = (Path(__file__).resolve().parents[3] / "docs" / "REGISTRY.md").read_text(encoding="utf-8")
+    assert f"`{key}`" in doc, key
+
+
+def test_gh987_registry_md_documents_repair_queue_owned_beside_repair_blocker_owned():
+    doc = (Path(__file__).resolve().parents[3] / "docs" / "REGISTRY.md").read_text(encoding="utf-8")
+    assert "`repair_queue_owned`" in doc
+    assert "**What these three keys do not close.**" in doc
+
+
+def test_gh987_a_duplicated_question_names_the_hand_edit_not_only_repair(env, capsys):
+    """Answered-first + open-last is the issue's own shape, and no steward `repair` can clear it:
+    `--old-line` matches the first block and touching an answered heading is refused. A message
+    that only said "(steward repair)" sent the reader to a verb that cannot do it."""
+    _duplicate_question(env)
+    capsys.readouterr()
+    assert env.run("validate") == 2
+    err = capsys.readouterr().err
+    assert "human hand edit" in err and "cull" in err, err
+    _assert_refused(env, capsys, "id_duplicate",
+                    "retract", "--actor", "lead-dev", "--id", "Q-0001", "--reason", "gone")
+
+
+def test_gh987_deleting_a_duplicated_queue_row_names_the_id_in_the_note(env, capsys):
+    """A blank --new-line leaves nothing to name, so the Note reads the replaced line's id."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    old = _queue_line(env, rid)
+    cells = registry._cells(old)
+    cells[1] = "a twin of it"
+    twin = registry._fmt_row(cells)
+    _replace_line(env, old, old + "\n" + twin)
+    assert env.run("validate") == 2
+    capsys.readouterr()
+    assert _repair(env, "Queue", twin, "") == 0, capsys.readouterr().err
+    assert env.run("validate") == 0
+    notes = _repair_notes(env)
+    assert len(notes) == 1 and f"repaired ## Queue: {rid}" in notes[0], notes
+    assert "a twin of it" not in notes[0]
+
+
+def test_gh987_deleting_a_duplicated_blocker_row_names_the_id_in_the_note(env, capsys):
+    env.run("raise-blocker", "--actor", "jr-dev-2", "--description", "x", "--owner", "lead-dev")
+    old = _blocker_line(env, "B-0001")
+    cells = registry._cells(old)
+    cells[2] = "jr-dev-1"
+    twin = registry._fmt_row(cells)
+    _replace_line(env, old, old + "\n" + twin)
+    capsys.readouterr()
+    assert _repair(env, "Blockers", twin, "") == 0, capsys.readouterr().err
+    notes = _repair_notes(env)
+    assert len(notes) == 1 and "repaired ## Blockers: B-0001" in notes[0], notes
+
+
+def test_gh987_registry_md_no_longer_claims_validate_has_no_duplicate_id_check():
+    doc = (Path(__file__).resolve().parents[3] / "docs" / "REGISTRY.md").read_text(encoding="utf-8")
+    assert "no duplicate-id check" not in doc
+
+
+# --------------------------------------------------------------------------- #
+# Consuming an id a Queue row still waits on (gh#773)
+# --------------------------------------------------------------------------- #
+_WAITED_ROW = "E-0001-otherproj-export"
+
+
+def _make_referent(env, verb: str) -> str:
+    """Raise the id *verb* consumes, ready for that verb, and return it."""
+    if verb == "resolve-blocker":
+        assert env.run("raise-blocker", "--actor", "jr-dev-1", "--owner", "jr-dev-1",
+                       "--description", "otherproj base branch missing") == 0
+        return "B-0001"
+    # No --work: an E- id there would seed the allocator past the row _park_on publishes.
+    assert env.run("ask", "--actor", "jr-dev-1", "--urgency", "waiting",
+                   "--question", "tarball or loose?", "--default", "tarball per run") == 0
+    if verb == "apply":
+        assert env.run("answer", "--actor", "dev-manager", "--id", "Q-0001",
+                       "--answer", "tarball", "--by", "dev-manager") == 0
+    return "Q-0001"
+
+
+def _consume(env, verb: str, id_: str) -> int:
+    extra = ("--reason", "premise died") if verb == "retract" else ()
+    return env.run(verb, "--actor", "jr-dev-1", "--id", id_, *extra)
+
+
+def _park_on(env, id_: str) -> None:
+    assert env.run("publish", "--actor", "lead-dev", "--slug", "otherproj-export",
+                   "--title", "otherproj export", "--lane", "jr-dev-1") == 0
+    assert env.run("claim", "--actor", "jr-dev-1", "--id", _WAITED_ROW) == 0
+    assert env.run("release", "--actor", "jr-dev-1", "--id", _WAITED_ROW,
+                   "--state", "parked", "--waiting-on", id_) == 0
+
+
+def _validate(env) -> int:
+    return main(["validate", "--file", str(env.registry_path)])
+
+
+_CONSUMING_VERBS = ("apply", "retract", "resolve-blocker")
+
+
+@pytest.mark.parametrize("verb", _CONSUMING_VERBS)
+def test_consuming_an_id_a_parked_row_waits_on_is_refused(env, capsys, verb):
+    """Consuming the id would orphan the parked row, and the next `validate` - every lane's wake
+    gate - would fail closed on it. Refused before any write, naming the row and its claimant."""
+    id_ = _make_referent(env, verb)
+    _park_on(env, id_)
+    before = env.registry_path.read_bytes()
+    capsys.readouterr()
+    assert _consume(env, verb, id_) == 2
+    err = capsys.readouterr().err
+    assert "waited_on_live" in err, err
+    assert _WAITED_ROW in err and "jr-dev-1" in err, err
+    assert env.registry_path.read_bytes() == before, "a refusal must leave the board byte-unchanged"
+
+
+@pytest.mark.parametrize("verb", _CONSUMING_VERBS)
+def test_consuming_succeeds_once_the_row_is_unparked(env, capsys, verb):
+    """The documented order: unpark (release --state building), THEN consume. `validate` stays
+    valid afterwards, which is the property the refusal exists to protect."""
+    id_ = _make_referent(env, verb)
+    _park_on(env, id_)
+    assert env.run("release", "--actor", "jr-dev-1", "--id", _WAITED_ROW, "--state", "building") == 0
+    assert _consume(env, verb, id_) == 0
+    assert id_ not in registry._live_ids(env.reg())
+    capsys.readouterr()
+    assert _validate(env) == 0, capsys.readouterr().err
+
+
+@pytest.mark.parametrize("verb", _CONSUMING_VERBS)
+def test_consuming_succeeds_when_nothing_waits_on_the_id(env, capsys, verb):
+    id_ = _make_referent(env, verb)
+    assert _consume(env, verb, id_) == 0
+    assert id_ not in registry._live_ids(env.reg())
+    capsys.readouterr()
+    assert _validate(env) == 0, capsys.readouterr().err
+
+
+def test_a_padded_waiting_on_cell_is_still_refused(env, capsys):
+    """A hand-padded cell still names the id: `validate` and the refusal read it one way
+    (`_queue_ref`), so padding cannot slip past the write path and then fail the wake gate."""
+    id_ = _make_referent(env, "resolve-blocker")
+    _park_on(env, id_)
+    text = env.text()
+    row = next(line for line in text.splitlines() if line.startswith(f"| {_WAITED_ROW} "))
+    padded = row.replace(f"| {id_} |", f"|   {id_}   |")
+    assert padded != row
+    env.registry_path.write_text(text.replace(row, padded), encoding="utf-8")
+    before = env.registry_path.read_bytes()
+    capsys.readouterr()
+    assert _consume(env, "resolve-blocker", id_) == 2
+    err = capsys.readouterr().err
+    assert "waited_on_live" in err and _WAITED_ROW in err, err
+    assert env.registry_path.read_bytes() == before
+
+
+def test_a_blocker_owned_by_another_seat_waits_for_the_claimant(env, capsys):
+    """The cross-owner handoff: the steward owns the Blocker, jr-dev-1 owns the parked row. The
+    owner is refused, naming the claimant to route a Note to; once the claimant resumes, the
+    owner consumes the Blocker and the board stays valid."""
+    assert env.run("raise-blocker", "--actor", "jr-dev-1", "--owner", "steward",
+                   "--description", "otherproj staging unreachable") == 0
+    _park_on(env, "B-0001")
+    capsys.readouterr()
+    assert env.run("resolve-blocker", "--actor", "steward", "--id", "B-0001") == 2
+    err = capsys.readouterr().err
+    assert "waited_on_live" in err and "claimed_by jr-dev-1" in err, err
+    assert env.reg().blockers["B-0001"].state == "open"
+    assert env.run("release", "--actor", "jr-dev-1", "--id", _WAITED_ROW, "--state", "building") == 0
+    assert env.run("resolve-blocker", "--actor", "steward", "--id", "B-0001") == 0
+    assert env.reg().blockers["B-0001"].state == "resolved"
+    capsys.readouterr()
+    assert _validate(env) == 0, capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# A row the parser drops for its KEY is a validate finding, not a silent loss
+# --------------------------------------------------------------------------- #
+def _add_table_row(env, section: str, row: str) -> None:
+    """Append `row` as the last line of `## <section>`'s table, written raw (no verb would)."""
+    text = env.text()
+    s, e = _section_bounds(text)[section]
+    lines = text[s:e].split("\n")
+    last = max(i for i, ln in enumerate(lines) if ln.lstrip().startswith("|"))
+    lines.insert(last + 1, row)
+    env.registry_path.write_text(text[:s] + "\n".join(lines) + text[e:], encoding="utf-8", newline="")
+
+
+_OFF_PATTERN_QUEUE_ROW = "| Q-0007 | gh#5 fix the thing | jr-dev-1 | jr-dev-1 | building | - | - |"
+_UNKNOWN_AGENT_ROW = "| ghost-dev | building | E-0001 | fixing gh#5 | - | - | - |"
+
+
+def test_validate_refuses_an_off_pattern_queue_id_and_names_the_row(env, capsys):
+    """The parser keeps only E-NNNN Queue rows, so this one vanished from every reader while
+    `validate` passed the board -- and its gh#5 read as free work."""
+    _add_table_row(env, "Queue", _OFF_PATTERN_QUEUE_ROW)
+    assert "Q-0007" not in env.reg().queue, "fixture precondition: the parser drops the row"
+    rc = env.run("validate")
+    err = capsys.readouterr().err
+    assert rc == 2, f"validate passed an off-pattern Queue id; stderr={err!r}"
+    assert "Queue: bad id 'Q-0007'" in err, err
+
+
+def test_validate_refuses_an_unknown_agent_name_and_names_the_row(env, capsys):
+    _add_table_row(env, "Agents", _UNKNOWN_AGENT_ROW)
+    assert "ghost-dev" not in env.reg().agents, "fixture precondition: the parser drops the row"
+    rc = env.run("validate")
+    err = capsys.readouterr().err
+    assert rc == 2, f"validate passed an unknown agent row; stderr={err!r}"
+    assert "Agents: bad agent 'ghost-dev'" in err, err
+
+
+_OFF_PATTERN_BLOCKER_ROW = "| B-1 | jr-dev-1 | lead-dev | E-0001 | open | fake staging down |"
+
+
+def test_validate_refuses_an_off_pattern_blocker_id_and_names_the_row(env, capsys):
+    """The parser keeps only B-NNN Blockers rows, so this one vanished from BLOCKED ON YOU and
+    from every owner's view while `validate` passed the board."""
+    _add_table_row(env, "Blockers", _OFF_PATTERN_BLOCKER_ROW)
+    assert "B-1" not in env.reg().blockers, "the parser still drops an off-pattern Blockers id"
+    rc = env.run("validate")
+    err = capsys.readouterr().err
+    assert rc == 2, f"validate passed an off-pattern Blockers id; stderr={err!r}"
+    assert "Blockers: bad id 'B-1'" in err, err
+
+
+@pytest.mark.parametrize("key", [
+    "B-0001", "B-001", "B-12345", "B-1", "B-01", "b-0001", "Q-0001", "E-0001", "B-0001-x", "x",
+])
+def test_validate_and_the_parser_judge_a_blocker_key_the_same_way(env, key):
+    _add_table_row(env, "Blockers", f"| {key} | jr-dev-1 | lead-dev | - | open | x |")
+    kept = key in env.reg().blockers
+    flagged = any(p.startswith(f"Blockers: bad id {key!r}")
+                  for p in registry.validate_violations(env.text()))
+    assert kept != flagged, f"{key!r}: parser kept={kept}, validate flagged={flagged}"
+
+
+def test_a_well_formed_blocker_board_stays_valid(env, capsys):
+    assert env.run("raise-blocker", "--actor", "jr-dev-2", "--description", "x",
+                   "--owner", "lead-dev") == 0
+    capsys.readouterr()
+    assert registry.validate_violations(env.text()) == []
+    assert "B-0001" in env.reg().blockers
+
+
+def test_the_checked_read_refuses_a_blocker_row_the_parser_would_drop(env):
+    _add_table_row(env, "Blockers", _OFF_PATTERN_BLOCKER_ROW)
+    with pytest.raises(RegistryError) as exc:
+        registry.read_registry_checked(env.registry_path, rows=("Blockers",))
+    assert exc.value.rule_key == "file_damaged", str(exc.value)
+    assert "Blockers: bad id 'B-1'" in str(exc.value), str(exc.value)
+
+
+def test_an_off_pattern_blocker_row_stays_deletable(env, capsys):
+    """Like a bad-id Queue row: no owning verb and no cull can address it, so a blank
+    --new-line must clear it, or the new finding would wedge every wake gate."""
+    _add_table_row(env, "Blockers", _OFF_PATTERN_BLOCKER_ROW)
+    assert env.run("validate") == 2, "fixture precondition: the row is a finding"
+    capsys.readouterr()
+    rc = _repair(env, "Blockers", _OFF_PATTERN_BLOCKER_ROW, "")
+    assert rc == 0, capsys.readouterr().err
+    assert _OFF_PATTERN_BLOCKER_ROW not in env.text()
+    assert env.run("validate") == 0, capsys.readouterr().err
+
+
+def test_the_blockers_parse_and_repair_guard_read_the_shared_key_rule(env, capsys, monkeypatch):
+    """ONE rule: loosening `_ROW_KEY_RULES['Blockers']` moves the parse, validate and the guard
+    together. A private `_B_ID` check left in any of them keeps rejecting B-1."""
+    _add_table_row(env, "Blockers", _OFF_PATTERN_BLOCKER_ROW)
+    monkeypatch.setitem(registry._ROW_KEY_RULES, "Blockers", (lambda key: True, "bad id", "x"))
+    assert "B-1" in env.reg().blockers, "parse_registry does not read the shared Blockers rule"
+    assert not any("bad id" in p for p in registry.validate_violations(env.text()))
+    # The row now reads as a well-formed blocker, so the guard must refuse rewriting it.
+    cells = registry._cells(_OFF_PATTERN_BLOCKER_ROW)
+    cells[2] = "steward"
+    rc = _repair(env, "Blockers", _OFF_PATTERN_BLOCKER_ROW, registry._fmt_row(cells))
+    err = capsys.readouterr().err
+    assert rc == 2 and "repair_blocker_owned" in err, err
+
+
+def test_registry_doc_names_every_key_rule_finding_validate_prints():
+    """docs/REGISTRY.md once said a malformed-key row "still prints `registry valid`". The doc must
+    name the finding validate prints for each table in `_ROW_KEY_RULES` (derived from the code, so
+    a new table needs a doc line) and must not bring the old claim back."""
+    doc = (Path(__file__).resolve().parents[3] / "docs" / "REGISTRY.md").read_text(encoding="utf-8")
+    flat = " ".join(doc.split())
+    assert "_ROW_KEY_RULES" in flat
+    for section, (_, label, _) in registry._ROW_KEY_RULES.items():
+        assert f"`{section}: {label} '...'`" in flat, f"docs/REGISTRY.md omits {section}: {label}"
+    assert "which still prints `registry valid`" not in flat
+
+
+@pytest.mark.parametrize("key", [
+    "E-0200", "E-0201-some-name", "E-1234-a-b-c", "Q-0007", "B-0001", "E-01", "e-0200",
+    "E-0200-Bad_Case", "E-0200-", "x",
+])
+def test_validate_and_the_parser_judge_a_queue_key_the_same_way(env, key):
+    """ONE predicate: a key the parser keeps raises no bad-id finding, and one it drops does."""
+    _add_table_row(env, "Queue", f"| {key} | work | jr-dev-1 | - | ready | - | - |")
+    kept = key in env.reg().queue
+    flagged = any(p.startswith(f"Queue: bad id {key!r}")
+                  for p in registry.validate_violations(env.text()))
+    assert kept != flagged, f"{key!r}: parser kept={kept}, validate flagged={flagged}"
+
+
+@pytest.mark.parametrize("name", [*AGENTS, "ghost-dev", "Lead-Dev", "jr-dev-9", "-"])
+def test_validate_and_the_parser_judge_an_agent_name_the_same_way(env, name):
+    text = env.text()
+    if name in AGENTS:
+        # Every loop already has a row on an initialised board; judge that row.
+        assert name in env.reg().agents
+        assert not any(f"bad agent {name!r}" in p for p in registry.validate_violations(text))
+        return
+    _add_table_row(env, "Agents", f"| {name} | idle | - | - | - | - | - |")
+    kept = name in env.reg().agents
+    flagged = any(p.startswith(f"Agents: bad agent {name!r}")
+                  for p in registry.validate_violations(env.text()))
+    assert kept != flagged, f"{name!r}: parser kept={kept}, validate flagged={flagged}"
+
+
+@pytest.mark.parametrize("section, row, problem", [
+    ("Queue", _OFF_PATTERN_QUEUE_ROW, "Queue: bad id 'Q-0007'"),
+    ("Agents", _UNKNOWN_AGENT_ROW, "Agents: bad agent 'ghost-dev'"),
+], ids=["off-pattern-queue-id", "unknown-agent"])
+def test_the_held_set_read_refuses_a_row_the_parser_would_drop_for_its_key(env, section, row, problem):
+    """The checked read is the held set's door: a dropped row would offer its gh#5 as free."""
+    from agentflow import issue_intake
+
+    _add_table_row(env, section, row)
+    with pytest.raises(RegistryError) as exc:
+        registry.read_registry_checked(env.registry_path, rows=("Agents", "Queue"))
+    assert exc.value.rule_key == "file_damaged" and problem in str(exc.value), str(exc.value)
+    with pytest.raises(issue_intake.IssueIntakeError) as exc2:
+        issue_intake.read_held_set(env.registry_path)
+    assert problem in str(exc2.value), str(exc2.value)
+
+
+_MISSING_SECTION_ADVICE = ("required section/table is missing", "re-add the heading")
+
+
+def _row_damage(env, kind: str) -> str:
+    if kind == "duplicate":
+        env.run("publish", "--actor", "lead-dev", "--slug", "x", "--title", "x", "--lane", "jr-dev-1")
+        _duplicate_first_queue_row(env)
+        return "appears on 2 rows"
+    if kind == "short":
+        _add_table_row(env, "Queue", "| E-0009 | work | jr-dev-1 | - | ready | - |")
+        return "row has 6 cells, expected 7"
+    _add_table_row(env, "Queue", _OFF_PATTERN_QUEUE_ROW)
+    return "Queue: bad id 'Q-0007'"
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "short", "off-pattern"])
+def test_a_row_damage_refusal_names_the_defect_without_the_missing_section_advice(env, kind):
+    """Telling an operator to re-add a heading that is right there sends them hunting a defect
+    the board does not have. The refusal must name the row it found instead."""
+    problem = _row_damage(env, kind)
+    with pytest.raises(RegistryError) as exc:
+        registry.read_registry_checked(env.registry_path, rows=("Agents", "Queue"))
+    msg = str(exc.value)
+    assert exc.value.rule_key == "file_damaged", msg
+    assert problem in msg, msg
+    for advice in _MISSING_SECTION_ADVICE:
+        assert advice not in msg, f"row damage carried the missing-section advice {advice!r}: {msg}"
+
+
+def test_a_missing_section_refusal_keeps_its_restore_advice(env, capsys):
+    text = env.text()
+    env.registry_path.write_text(text.replace("## Blockers", "## Blockerz"), encoding="utf-8", newline="")
+    with pytest.raises(RegistryError) as exc:
+        registry.read_registry_checked(env.registry_path)
+    msg = str(exc.value)
+    assert exc.value.rule_key == "file_damaged" and "## Blockers" in msg, msg
+    for advice in _MISSING_SECTION_ADVICE:
+        assert advice in msg, f"the missing-section refusal lost {advice!r}: {msg}"
+    assert "never `init`" in msg, msg
+    assert env.run("validate") == 2
+    assert "re-add the heading" in capsys.readouterr().err
+
+
+def test_a_lost_table_refusal_keeps_its_restore_advice(env):
+    _strip_whole_table(env, "Queue")
+    with pytest.raises(RegistryError) as exc:
+        registry.read_registry_checked(env.registry_path)
+    msg = str(exc.value)
+    assert exc.value.rule_key == "file_damaged" and "## Queue" in msg, msg
+    assert "required section/table is missing" in msg and "never `init`" in msg, msg
+
+
+
+# --------------------------------------------------------------------------- #
+# The Queue's cell-scoped rule on Blockers and Agents too, and on all three tables a mended
+# owner-held cell may only be CLEARED to its neutral value. Before: a Blockers or Agents row the
+# row checks rejected was rewritable in every cell, and a flagged Queue waiting_on or claimed_by
+# could be pointed at any live referent or agent -- a cell its claimant owns.
+# --------------------------------------------------------------------------- #
+def _assert_owned_refusal(env, capsys, section: str, key: str, old: str, new: str) -> str:
+    before = env.text()
+    rc = _repair(env, section, old, new)
+    err = capsys.readouterr().err
+    assert rc == 2, f"expected refusal (2), got {rc}; stderr={err!r}"
+    assert key in err, err
+    assert env.text() == before, "a refused repair must leave the board byte-identical"
+    return err
+
+
+def _assert_repaired(env, capsys, section: str, old: str, new: str) -> None:
+    rc = _repair(env, section, old, new)
+    assert rc == 0, capsys.readouterr().err
+    assert env.run("validate") == 0, capsys.readouterr().err
+    assert "repaired ## " + section in env.text()
+
+
+def _raised_blocker(env, capsys, **bad) -> tuple[list[str], str]:
+    """B-0001 raised by jr-dev-2, owned by lead-dev, corrupted cell by cell (`c<col>=value`)."""
+    assert env.run("raise-blocker", "--actor", "jr-dev-2", "--description", "x",
+                   "--owner", "lead-dev") == 0
+    old = _blocker_line(env, "B-0001")
+    good = registry._cells(old)
+    cells = list(good)
+    for col, value in bad.items():
+        cells[int(col[1:])] = value
+    broken = registry._fmt_row(cells)
+    if broken != old:
+        _replace_line(env, old, broken)
+    capsys.readouterr()
+    return good, broken
+
+
+def _broken_agent(env, capsys, status: str = "zombie") -> tuple[list[str], str]:
+    good = _agent_line(env, "jr-dev-3")
+    cells = registry._cells(good)
+    cells[1] = status
+    broken = registry._fmt_row(cells)
+    _replace_line(env, good, broken)
+    assert env.run("validate") == 2
+    capsys.readouterr()
+    return registry._cells(good), broken
+
+
+# -- Queue: owner-held cells (claimed_by, waiting_on) may only be cleared ----------------------
+def test_queue_dead_waiting_on_mended_to_dash_is_accepted(env, capsys):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    _, broken = _break_queue_row(env, capsys, rid, c3="jr-dev-1", c4="building", c5="Q-0999")
+    cells = registry._cells(broken)
+    cells[5] = "-"
+    _assert_repaired(env, capsys, "Queue", broken, registry._fmt_row(cells))
+    assert registry._cells(_queue_line(env, rid)) == cells
+    # Still the claimant's: its owning verb moves the mended row.
+    assert env.run("release", "--actor", "jr-dev-1", "--id", rid, "--state", "ready") == 0
+
+
+@pytest.mark.parametrize("referent", ["question", "blocker"])
+def test_queue_dead_waiting_on_repointed_at_a_live_referent_is_refused(env, capsys, referent):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    _, broken = _break_queue_row(env, capsys, rid, c3="jr-dev-1", c4="building", c5="Q-0999")
+    if referent == "question":
+        live = _ask_one(env)
+    else:
+        assert env.run("raise-blocker", "--actor", "jr-dev-1", "--description", "x") == 0
+        live = "B-0001"
+    capsys.readouterr()
+    cells = registry._cells(broken)
+    cells[5] = live
+    err = _assert_owned_refusal(env, capsys, "Queue", "repair_queue_owned", broken,
+                                registry._fmt_row(cells))
+    assert f"waiting_on to {live!r}" in err and "may only clear" in err, err
+    assert "`release`" in err and "`reap`" in err, err
+
+
+def test_queue_bad_claimed_by_mended_to_dash_is_accepted(env, capsys):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, c3="nobody")
+    _assert_repaired(env, capsys, "Queue", broken, registry._fmt_row(good))
+    assert env.run("claim", "--actor", "jr-dev-1", "--id", rid) == 0
+
+
+def test_queue_bad_claimed_by_mended_to_a_live_agent_is_refused(env, capsys):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, c3="nobody")
+    cells = list(good)
+    cells[3] = "jr-dev-1"
+    err = _assert_owned_refusal(env, capsys, "Queue", "repair_queue_owned", broken,
+                                registry._fmt_row(cells))
+    assert "claimed_by to 'jr-dev-1'" in err and "`claim`" in err, err
+
+
+# -- Blockers: cell-scoped mends, and owner/state may only be cleared --------------------------
+def test_blockers_rejected_row_flagged_cell_alone_is_accepted(env, capsys):
+    good, broken = _raised_blocker(env, capsys, c1="nobody")
+    _assert_repaired(env, capsys, "Blockers", broken, registry._fmt_row(good))
+    assert registry._cells(_blocker_line(env, "B-0001")) == good
+
+
+@pytest.mark.parametrize("col, value, name", [
+    (2, "steward", "owner"),
+    (3, "E-0042", "work"),
+    (5, "rewritten by repair", "description"),
+])
+def test_blockers_rejected_row_with_an_unflagged_cell_changed_is_refused(env, capsys, col, value,
+                                                                        name):
+    good, broken = _raised_blocker(env, capsys, c4="opne")
+    cells = list(good)
+    cells[col] = value
+    err = _assert_owned_refusal(env, capsys, "Blockers", "repair_blocker_owned", broken,
+                                registry._fmt_row(cells))
+    assert "may only mend the flagged cell(s): state." in err, err
+    assert f"would also change: {name}," in err, err
+    assert registry._cells(_blocker_line(env, "B-0001"))[4] == "opne"
+
+
+def test_blockers_deleting_a_rejected_row_is_refused(env, capsys):
+    _, broken = _raised_blocker(env, capsys, c4="opne")
+    err = _assert_owned_refusal(env, capsys, "Blockers", "repair_blocker_owned", broken, "")
+    assert "Deleting the row would also remove: id, raised_by, owner, work, description" in err
+
+
+@pytest.mark.parametrize("shape", ["bad-id", "short"])
+def test_blockers_unreachable_row_is_wholly_repairs(env, capsys, shape):
+    """A row no verb can reach -- an id the parser drops, a line without the six cells -- takes
+    any rewrite (owner and state included) and a deletion."""
+    good, old = _raised_blocker(env, capsys)
+    broken = (old.replace("| B-0001 |", "| B-OOO1 |") if shape == "bad-id"
+              else registry._fmt_row(good[:5]))
+    _replace_line(env, old, broken)
+    assert "B-0001" not in env.reg().blockers
+    cells = list(good)
+    cells[2], cells[4], cells[5] = "steward", "resolved", "rewritten"
+    _assert_repaired(env, capsys, "Blockers", broken, registry._fmt_row(cells))
+    assert env.reg().blockers["B-0001"].owner == "steward"
+    rewritten = _blocker_line(env, "B-0001")
+    _replace_line(env, rewritten, broken)
+    _assert_repaired(env, capsys, "Blockers", broken, "")
+    assert broken not in env.text()
+
+
+@pytest.mark.parametrize("col, bad, neutral", [(2, "nobody", "-"), (4, "opne", "open")])
+def test_blockers_owner_held_cell_mended_to_neutral_is_accepted(env, capsys, col, bad, neutral):
+    good, broken = _raised_blocker(env, capsys, **{f"c{col}": bad})
+    cells = list(good)
+    cells[col] = neutral
+    _assert_repaired(env, capsys, "Blockers", broken, registry._fmt_row(cells))
+    assert registry._cells(_blocker_line(env, "B-0001")) == cells
+    # The owning verbs still reach the mended row.
+    assert env.run("assign-blocker", "--actor", "dev-manager", "--id", "B-0001",
+                   "--owner", "lead-dev") == 0
+    assert env.run("resolve-blocker", "--actor", "lead-dev", "--id", "B-0001") == 0
+
+
+@pytest.mark.parametrize("col, bad, live, verb", [
+    (2, "nobody", "steward", "`assign-blocker`"),
+    (2, "nobody", "lead-dev", "`assign-blocker`"),
+    (4, "opne", "resolved", "`resolve-blocker`"),
+])
+def test_blockers_owner_held_cell_mended_to_a_live_value_is_refused(env, capsys, col, bad, live,
+                                                                   verb):
+    good, broken = _raised_blocker(env, capsys, **{f"c{col}": bad})
+    cells = list(good)
+    cells[col] = live
+    err = _assert_owned_refusal(env, capsys, "Blockers", "repair_blocker_owned", broken,
+                                registry._fmt_row(cells))
+    assert f"to {live!r}" in err and "may only clear" in err and verb in err, err
+
+
+# -- Agents: cell-scoped mends, and status may only be cleared to idle -------------------------
+@pytest.mark.parametrize("col, value, name", [
+    (2, "E-0042", "work"),
+    (3, "rewritten", "phase"),
+    (4, "2026-10-03T07:40Z", "heartbeat"),
+    (5, "2026-10-03T12:00Z", "eta"),
+    (6, "Q-0001", "waiting_on"),
+])
+def test_agents_rejected_row_with_an_unflagged_cell_changed_is_refused(env, capsys, col, value,
+                                                                      name):
+    good, broken = _broken_agent(env, capsys)
+    cells = list(good)
+    cells[col] = value
+    err = _assert_owned_refusal(env, capsys, "Agents", "repair_agents_owned", broken,
+                                registry._fmt_row(cells))
+    assert "may only mend the flagged cell(s): status." in err, err
+    assert f"would also change: {name}," in err and "`status`" in err, err
+
+
+def test_agents_deleting_a_rejected_row_is_refused(env, capsys):
+    _, broken = _broken_agent(env, capsys)
+    err = _assert_owned_refusal(env, capsys, "Agents", "repair_agents_owned", broken, "")
+    assert "Deleting the row would also remove: agent, work, phase, heartbeat, eta" in err, err
+
+
+@pytest.mark.parametrize("shape", ["unknown-agent", "short"])
+def test_agents_unreachable_row_is_wholly_repairs(env, capsys, shape):
+    good = _agent_line(env, "jr-dev-3")
+    cells = registry._cells(good)
+    broken = (good.replace("| jr-dev-3 |", "| jr-dev-E |") if shape == "unknown-agent"
+              else registry._fmt_row(cells[:6]))
+    _replace_line(env, good, broken)
+    assert "jr-dev-3" not in env.reg().agents
+    capsys.readouterr()
+    cells[1], cells[4], cells[5] = "building", "2026-10-03T07:40Z", "2026-10-03T12:00Z"
+    _assert_repaired(env, capsys, "Agents", broken, registry._fmt_row(cells))
+    assert env.reg().agents["jr-dev-3"].status == "building"
+    rewritten = _agent_line(env, "jr-dev-3")
+    _replace_line(env, rewritten, broken)
+    _assert_repaired(env, capsys, "Agents", broken, "")
+    assert broken not in env.text()
+
+
+@pytest.mark.parametrize("live", ["building", "halted", "waiting"])
+def test_agents_status_mended_to_a_live_value_is_refused(env, capsys, live):
+    good, broken = _broken_agent(env, capsys)
+    cells = list(good)
+    cells[1] = live
+    err = _assert_owned_refusal(env, capsys, "Agents", "repair_agents_owned", broken,
+                                registry._fmt_row(cells))
+    assert f"status to {live!r}" in err and "may only clear" in err and "`status`" in err, err
+
+
+def test_agents_status_mended_to_idle_is_accepted(env, capsys):
+    good, broken = _broken_agent(env, capsys, status="buildng")
+    assert good[1] == "idle"
+    _assert_repaired(env, capsys, "Agents", broken, registry._fmt_row(good))
+    assert registry._cells(_agent_line(env, "jr-dev-3")) == good
+    # The lane's own `status` still owns the mended row.
+    assert env.run("status", "--actor", "jr-dev-3", "--state", "building", "--work", "E-0042",
+                   "--phase", "implement", "--eta", "2026-09-01T12:00Z") == 0
+
+
+# --------------------------------------------------------------------------- #
+# Clearing a flagged owner-held Queue cell ALONE can strand the row where no verb moves it: a
+# parked row with a dead waiting_on (its claimant's wake gate fails closed on the invalid board)
+# and an in-flight row whose claimed_by is cleared (claim, release, withdraw and reap all skip
+# it, and validate flags it). There the mend is pinned to the owning verb's own write.
+# --------------------------------------------------------------------------- #
+def _parked_claim(env, capsys, rid: str) -> str:
+    assert env.run("claim", "--actor", "jr-dev-1", "--id", rid) == 0
+    q = _ask_one(env)
+    assert env.run("release", "--actor", "jr-dev-1", "--id", rid, "--state", "parked",
+                   "--waiting-on", q) == 0
+    capsys.readouterr()
+    return q
+
+
+def _with(cells: list[str], **vals) -> str:
+    out = list(cells)
+    for col, value in vals.items():
+        out[int(col[1:])] = value
+    return registry._fmt_row(out)
+
+
+def test_a_parked_row_on_a_dead_referent_takes_release_buildings_write(env, capsys):
+    """The live claimant parked on Q-0001, the cell then corrupted to Q-0999. Every other mend is
+    refused; state `building` + waiting_on '-' is accepted, keeps the claim, passes validate,
+    and the claimant can re-park."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    q = _parked_claim(env, capsys, rid)
+    good, broken = _break_queue_row(env, capsys, rid, c5="Q-0999")
+    # Re-pointing (even at the true referent) chooses the claimant's park: refused.
+    err = _assert_queue_owned_refusal(env, capsys, broken, _with(good, c5=q))
+    assert "may only clear" in err, err
+    # '-' alone: parked on nothing; the refusal names the one accepted mend.
+    err = _assert_queue_owned_refusal(env, capsys, broken, _with(good, c5="-"))
+    assert "waiting on nothing" in err, err
+    assert "`release --state building` writes: state 'building', waiting_on '-'" in err, err
+    # Another state: pinned to building.
+    err = _assert_queue_owned_refusal(env, capsys, broken, _with(good, c4="review", c5="-"))
+    assert "state 'review', waiting_on '-'" in err and "exactly one mend" in err, err
+    # Dropping the live claim is reap's, not this mend's.
+    err = _assert_queue_owned_refusal(env, capsys, broken,
+                                      _with(good, c3="-", c4="ready", c5="-"))
+    assert "would also change: claimed_by," in err, err
+    assert "(with state coupled to that mend)" in err, err
+    _assert_repaired(env, capsys, "Queue", broken, _with(good, c4="building", c5="-"))
+    assert registry._cells(_queue_line(env, rid))[3:6] == ["jr-dev-1", "building", "-"]
+    assert env.run("release", "--actor", "jr-dev-1", "--id", rid, "--state", "parked",
+                   "--waiting-on", q) == 0
+
+
+def test_an_unclaimed_parked_row_on_a_dead_referent_takes_reaps_write(env, capsys):
+    """With no claim to keep, `building` would be an orphan: the mend is reap's write."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    _parked_claim(env, capsys, rid)
+    good, broken = _break_queue_row(env, capsys, rid, c3="-", c5="Q-0999")
+    # `building` with no claimant is validate's own finding, and names the one accepted mend.
+    err = _assert_repair_refused_unchanged(env, capsys, broken, _with(good, c3="-",
+                                                                      c4="building", c5="-"))
+    assert "no claimant" in err and "reap's write: claimed_by '-', state 'ready'" in err, err
+    err = _assert_queue_owned_refusal(env, capsys, broken, _with(good, c3="-", c4="done",
+                                                                 c5="-"))
+    assert "`reap` writes: claimed_by '-', state 'ready', waiting_on '-'" in err, err
+    _assert_repaired(env, capsys, "Queue", broken, _with(good, c3="-", c4="ready", c5="-"))
+    assert env.run("claim", "--actor", "jr-dev-1", "--id", rid) == 0
+
+
+@pytest.mark.parametrize("state", ["building", "parked", "review"])
+def test_a_bad_claimant_on_an_in_flight_row_takes_reaps_write(env, capsys, state):
+    """'-' alone would leave an unclaimed in-flight row that validate refuses and no verb moves;
+    restoring an agent picks the claimant. Only reap's write is accepted, and then `claim`."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    if state == "parked":
+        _parked_claim(env, capsys, rid)
+    else:
+        assert env.run("claim", "--actor", "jr-dev-1", "--id", rid) == 0
+        if state == "review":
+            assert env.run("release", "--actor", "jr-dev-1", "--id", rid,
+                           "--state", "review") == 0
+        capsys.readouterr()
+    good, broken = _break_queue_row(env, capsys, rid, c3="jr-dev-l")
+    assert good[3:5] == ["jr-dev-1", state]
+    err = _assert_queue_owned_refusal(env, capsys, broken, registry._fmt_row(good))
+    assert "may only clear" in err, err
+    # '-' alone is an unclaimed in-flight row, which validate itself refuses.
+    err = _assert_repair_refused_unchanged(env, capsys, broken, _with(good, c3="-"))
+    assert f"state {state!r} with claimed_by '-'" in err and "no claimant" in err, err
+    assert "reap's write: claimed_by '-', state 'ready', waiting_on '-'" in err, err
+    # A settled state that is not reap's: the coupled mend is pinned.
+    err = _assert_queue_owned_refusal(env, capsys, broken, _with(good, c3="-", c4="done",
+                                                                 c5="-"))
+    assert f"With claimed_by flagged on a `{state}` row" in err, err
+    assert "`reap` writes: claimed_by '-', state 'ready', waiting_on '-'" in err, err
+    # Coupled cells move only together with the flagged one, never alone or elsewhere.
+    err = _assert_queue_owned_refusal(env, capsys, broken, _with(good, c3="-", c4="ready",
+                                                                 c5="-", c6="steward"))
+    assert "would also change: notes," in err, err
+    _assert_repaired(env, capsys, "Queue", broken, _with(good, c3="-", c4="ready", c5="-"))
+    assert env.run("claim", "--actor", "jr-dev-1", "--id", rid) == 0
+
+
+@pytest.mark.parametrize("state", ["done", "withdrawn", "ready"])
+def test_a_bad_claimant_on_a_settled_row_is_only_cleared(env, capsys, state):
+    """No verb would move these rows on the claimant's behalf: '-' is the whole mend, and the
+    state stays put."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    _, broken = _break_queue_row(env, capsys, rid, c3="jr-dev-l", c4=state)
+    settled = registry._cells(broken)
+    settled[3] = "-"
+    # Another settled state, so the result is one validate accepts and ownership judges it.
+    err = _assert_queue_owned_refusal(env, capsys, broken,
+                                      _with(settled, c4="done" if state == "ready" else "ready"))
+    assert "would also change: state," in err, err
+    _assert_repaired(env, capsys, "Queue", broken, registry._fmt_row(settled))
+    assert registry._cells(_queue_line(env, rid))[3:5] == ["-", state]
+
+
+def test_a_mended_state_may_not_leave_an_in_flight_row_unclaimed(env, capsys):
+    """A flagged state on an unclaimed row mended to an in-flight one is the same orphan."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, c4="shiped")
+    assert good[3] == "-"
+    for st in ("building", "review"):
+        # validate's own rule now refuses it first, naming the mend.
+        err = _assert_repair_refused_unchanged(env, capsys, broken, _with(good, c4=st))
+        assert f"state {st!r} with claimed_by '-'" in err and "state 'ready'" in err, err
+    _assert_repaired(env, capsys, "Queue", broken, registry._fmt_row(good))
+    assert env.run("claim", "--actor", "jr-dev-1", "--id", rid) == 0
+
+
+def test_a_mend_beside_an_existing_unclaimed_in_flight_row_must_also_return_it(env, capsys):
+    """A row already in flight with no claimant is itself a violation, so mending only its other
+    flagged cell keeps it and is refused; the mend that also takes reap's write is accepted, and
+    the board is not wedged on a shape repair did not make."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    good, broken = _break_queue_row(env, capsys, rid, c2="nobody", c4="building")
+    assert good[3] == "-"
+    err = _assert_repair_refused_unchanged(env, capsys, broken, _with(good, c4="building"))
+    assert "leaves the target line's own violation" in err and "no claimant" in err, err
+    _assert_repaired(env, capsys, "Queue", broken, _with(good, c4="ready"))
+    assert registry._cells(_queue_line(env, rid))[2:6] == ["jr-dev-1", "-", "ready", "-"]
+
+
+# --------------------------------------------------------------------------- #
+# validate flags an in-flight Queue row with no claimant: nothing resumes it (claim takes only
+# `ready`, release only the claimant's row, reap matches an agent), so every reader fails closed
+# and the board routes to the steward's repair, whose one mend is reap's write.
+# --------------------------------------------------------------------------- #
+def _plant_queue_cells(env, rid: str, **vals) -> str:
+    """Rewrite *rid*'s Queue row in place (column index -> value); return the new line."""
+    old = _queue_line(env, rid)
+    new = _with(registry._cells(old), **vals)
+    _replace_line(env, old, new)
+    return new
+
+
+def _validate_err(env, capsys) -> tuple[int, str]:
+    capsys.readouterr()
+    rc = env.run("validate")
+    return rc, capsys.readouterr().err
+
+
+@pytest.mark.parametrize("claimant", ["-", ""])
+@pytest.mark.parametrize("state", ["building", "parked", "review"])
+def test_validate_flags_an_in_flight_row_with_no_claimant(env, capsys, state, claimant):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    # A live referent, so a parked row carries no other finding and this rule alone fires.
+    ref = _ask_one(env) if state == "parked" else "-"
+    _plant_queue_cells(env, rid, c3=claimant, c4=state, c5=ref)
+    rc, err = _validate_err(env, capsys)
+    assert rc == 2, err
+    hit = [ln for ln in err.split("\n") if f"Queue[{rid}]:" in ln]
+    assert len(hit) == 1, err
+    assert f"state {state!r}" in hit[0] and f"claimed_by {claimant!r}" in hit[0], hit[0]
+    assert "no claimant" in hit[0], hit[0]
+    # Same shape as the neighbouring Queue findings, and the one row it names.
+    assert registry.validate_violations(env.text()) == [hit[0].strip().removeprefix("- ")]
+
+
+@pytest.mark.parametrize("state", ["ready", "done", "withdrawn"])
+def test_validate_passes_a_settled_row_with_no_claimant(env, capsys, state):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    _plant_queue_cells(env, rid, c3="-", c4=state)
+    rc, err = _validate_err(env, capsys)
+    assert rc == 0, err
+
+
+@pytest.mark.parametrize("state", ["building", "parked", "review"])
+def test_validate_passes_an_in_flight_row_its_claimant_holds(env, capsys, state):
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    if state == "parked":
+        _parked_claim(env, capsys, rid)
+    else:
+        assert env.run("claim", "--actor", "jr-dev-1", "--id", rid) == 0
+        if state == "review":
+            assert env.run("release", "--actor", "jr-dev-1", "--id", rid,
+                           "--state", "review") == 0
+    assert registry._cells(_queue_line(env, rid))[3:5] == ["jr-dev-1", state]
+    rc, err = _validate_err(env, capsys)
+    assert rc == 0, err
+
+
+def test_every_queue_verb_leaves_no_unclaimed_in_flight_row(env, capsys):
+    """Walk every verb that writes a Queue row's state or claimed_by; the board validates after
+    each, so the rule never fails a board a legitimate verb produced."""
+    def ok():
+        rc, err = _validate_err(env, capsys)
+        assert rc == 0, err
+
+    a = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    ok()
+    assert env.run("relane", "--actor", "lead-dev", "--id", a, "--lane", "jr-dev-2",
+                   "--reason", "balance") == 0
+    ok()
+    assert env.run("relane", "--actor", "lead-dev", "--id", a, "--lane", "jr-dev-1",
+                   "--reason", "balance") == 0
+    assert env.run("claim", "--actor", "jr-dev-1", "--id", a) == 0
+    ok()
+    for st in ("review", "building"):
+        assert env.run("release", "--actor", "jr-dev-1", "--id", a, "--state", st) == 0
+        ok()
+    q = _ask_one(env)
+    assert env.run("release", "--actor", "jr-dev-1", "--id", a, "--state", "parked",
+                   "--waiting-on", q) == 0
+    ok()
+    assert env.run("release", "--actor", "jr-dev-1", "--id", a, "--state", "ready") == 0
+    ok()
+    assert env.run("claim", "--actor", "jr-dev-1", "--id", a) == 0
+    assert env.run("release", "--actor", "jr-dev-1", "--id", a, "--state", "done") == 0
+    ok()
+    b = _pub(env, "beta-thing-two", lane="jr-dev-1")
+    assert env.run("withdraw", "--actor", "lead-dev", "--id", b, "--reason", "superseded") == 0
+    ok()
+    c = _claimed(env, "gamma-thing-three", "jr-dev-1")
+    assert _reap_stale(env, "jr-dev-1") == 0
+    assert registry._cells(_queue_line(env, c))[3:5] == ["-", "ready"]
+    ok()
+    capsys.readouterr()
+    assert env.run("cull", "--actor", "steward") == 0
+    ok()
+
+
+@pytest.mark.parametrize("state", ["building", "parked", "review"])
+def test_repair_returns_an_unclaimed_in_flight_row_with_reaps_write(env, capsys, state):
+    """The fix is reap's write; restoring a claimant, staying in flight, or any other state is
+    refused, and the 'no new problems' comparison does not refuse the fix."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    ref = _ask_one(env) if state == "parked" else "-"
+    broken = _plant_queue_cells(env, rid, c3="-", c4=state, c5=ref)
+    cells = registry._cells(broken)
+    assert env.run("validate") == 2
+    capsys.readouterr()
+    # Restoring a claimant chooses one: claimed_by is owner-held, repair may only clear it.
+    err = _assert_queue_owned_refusal(env, capsys, broken, _with(cells, c3="jr-dev-1"))
+    assert "may only clear" in err, err
+    # Another in-flight state is still unclaimed: validate's own rule refuses it.
+    other = "review" if state != "review" else "building"
+    _assert_repair_refused_unchanged(env, capsys, broken, _with(cells, c4=other, c5="-"))
+    # A settled state other than reap's is not the coupled mend.
+    err = _assert_queue_owned_refusal(env, capsys, broken, _with(cells, c4="done", c5="-"))
+    assert "`reap` writes: claimed_by '-', state 'ready', waiting_on '-'" in err, err
+    _assert_repaired(env, capsys, "Queue", broken, _with(cells, c4="ready", c5="-"))
+    assert registry._cells(_queue_line(env, rid))[3:6] == ["-", "ready", "-"]
+    assert env.run("claim", "--actor", "jr-dev-1", "--id", rid) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Every Queue / Blockers key check reads `_row_key_ok`, and every id is ASCII digits
+# --------------------------------------------------------------------------- #
+def _loosen_key_rule(monkeypatch, section: str, extra: str) -> None:
+    """Make `_ROW_KEY_RULES[section]` also accept *extra*. A check that still matches a private
+    regex keeps refusing it, which is how each test below tells a routed check from a raw one."""
+    strict, label, why = registry._ROW_KEY_RULES[section]
+    monkeypatch.setitem(
+        registry._ROW_KEY_RULES, section, (lambda key: key == extra or strict(key), label, why)
+    )
+
+
+def _queue_row(key: str, claimant: str = "-", state: str = "ready") -> str:
+    return f"| {key} | fake work | jr-dev-1 | {claimant} | {state} | - | - |"
+
+
+_LOOSE_BLOCKER_ROW = "| B-1 | jr-dev-1 | lead-dev | - | {state} | fake staging down |"
+
+
+@pytest.mark.parametrize("state", ["done", "withdrawn"])
+def test_cull_drops_queue_rows_by_the_shared_key_rule(env, capsys, monkeypatch, state):
+    row = _queue_row("Q-0007", state=state)
+    _add_table_row(env, "Queue", row)
+    _loosen_key_rule(monkeypatch, "Queue", "Q-0007")
+    assert "Q-0007" in env.reg().queue, "fixture precondition: the loosened rule keeps the row"
+    assert env.run("cull", "--actor", "steward") == 0, capsys.readouterr().err
+    assert row not in env.text(), "cull still filters Queue rows with a private id regex"
+
+
+def test_cull_drops_blocker_rows_by_the_shared_key_rule(env, capsys, monkeypatch):
+    row = _LOOSE_BLOCKER_ROW.format(state="resolved")
+    _add_table_row(env, "Blockers", row)
+    _loosen_key_rule(monkeypatch, "Blockers", "B-1")
+    assert "B-1" in env.reg().blockers, "fixture precondition: the loosened rule keeps the row"
+    assert env.run("cull", "--actor", "steward") == 0, capsys.readouterr().err
+    assert row not in env.text(), "cull still filters Blockers rows with a private id regex"
+
+
+def test_cull_keeps_rows_the_shared_key_rule_drops(env, capsys):
+    """Unchanged on the strict rule: a row the parser cannot see is repair's, never cull's."""
+    q_row, b_row = _queue_row("Q-0007", state="done"), _LOOSE_BLOCKER_ROW.format(state="resolved")
+    _add_table_row(env, "Queue", q_row)
+    _add_table_row(env, "Blockers", b_row)
+    env.run("cull", "--actor", "steward")
+    capsys.readouterr()
+    assert q_row in env.text() and b_row in env.text()
+
+
+def test_reap_scans_queue_rows_by_the_shared_key_rule(env, capsys, monkeypatch):
+    _add_table_row(env, "Queue", _queue_row("Q-0007", claimant="jr-dev-1", state="building"))
+    _loosen_key_rule(monkeypatch, "Queue", "Q-0007")
+    assert _reap_stale(env, "jr-dev-1") == 0, capsys.readouterr().err
+    row = env.reg().queue["Q-0007"]
+    assert (row.claimed_by, row.state) == ("-", "ready"), "reap still scans with a private regex"
+
+
+def test_queue_row_findings_read_the_shared_key_rule(env, monkeypatch):
+    _add_table_row(env, "Queue", _queue_row("Q-0007"))
+    strict_cells = registry._cells(_queue_row("Q-0007"))
+    flagged = registry._queue_row_findings("Q-0007", registry.QueueRow(*strict_cells), env.reg())
+    assert any(col == 0 for col, _ in flagged), "the strict rule must flag the id"
+    _loosen_key_rule(monkeypatch, "Queue", "Q-0007")
+    reg = env.reg()
+    findings = registry._queue_row_findings("Q-0007", reg.queue["Q-0007"], reg)
+    assert not any(col == 0 for col, _ in findings), findings
+
+
+def test_the_queue_repair_guard_reads_the_shared_key_rule(env, capsys, monkeypatch):
+    """A row the shared rule accepts is a healthy row, so its owner-held lane is not repair's."""
+    old = _queue_row("Q-0007")
+    _add_table_row(env, "Queue", old)
+    _loosen_key_rule(monkeypatch, "Queue", "Q-0007")
+    assert env.run("validate") == 0, capsys.readouterr().err
+    capsys.readouterr()
+    new = old.replace("| jr-dev-1 |", "| jr-dev-2 |", 1)
+    _assert_queue_owned_refusal(env, capsys, old, new)
+
+
+def test_queue_id_arguments_read_the_shared_key_rule(env, capsys, monkeypatch):
+    """claim / release / withdraw --id and status / ask / raise-blocker --work all name a Queue
+    row, so they accept exactly the keys the Queue table keeps."""
+    _add_table_row(env, "Queue", _queue_row("Q-0007"))
+    _loosen_key_rule(monkeypatch, "Queue", "Q-0007")
+
+    def ok(*args):
+        assert env.run(*args) == 0, capsys.readouterr().err
+
+    ok("claim", "--actor", "jr-dev-1", "--id", "Q-0007")
+    ok("status", "--actor", "jr-dev-1", "--state", "building", "--work", "Q-0007", "--phase", "p",
+       "--eta", _eta())
+    ok("ask", "--actor", "jr-dev-1", "--urgency", "advisory", "--work", "Q-0007",
+       "--question", "q?", "--default", "d", "--assumption", "a")
+    ok("raise-blocker", "--actor", "jr-dev-1", "--owner", "lead-dev", "--work", "Q-0007",
+       "--description", "x")
+    ok("release", "--actor", "jr-dev-1", "--id", "Q-0007", "--state", "ready")
+    ok("withdraw", "--actor", "lead-dev", "--id", "Q-0007", "--reason", "superseded")
+
+
+def test_blocker_id_arguments_read_the_shared_key_rule(env, capsys, monkeypatch):
+    _add_table_row(env, "Blockers", _LOOSE_BLOCKER_ROW.format(state="open"))
+    _loosen_key_rule(monkeypatch, "Blockers", "B-1")
+    registry._require_live_waiting_on(env.reg(), "B-1")
+    assert env.run("assign-blocker", "--actor", "dev-manager", "--id", "B-1",
+                   "--owner", "steward") == 0, capsys.readouterr().err
+    assert env.run("resolve-blocker", "--actor", "steward", "--id", "B-1") == 0, (
+        capsys.readouterr().err
+    )
+    assert env.reg().blockers["B-1"].state == "resolved"
+
+
+_DIGIT_SETS = {
+    "arabic-indic": 0x0660,
+    "fullwidth": 0xFF10,
+    "devanagari": 0x0966,
+}
+
+
+def _spell(text: str, base: int) -> str:
+    """*text* with every ASCII digit replaced by the same digit from the block at *base*."""
+    return text.translate({ord("0") + i: base + i for i in range(10)})
+
+
+_NON_ASCII = [pytest.param(base, id=name) for name, base in _DIGIT_SETS.items()]
+
+
+@pytest.mark.parametrize("base", _NON_ASCII)
+@pytest.mark.parametrize("section,key", [
+    ("Queue", "E-0200"), ("Queue", "E-0200-some-name"), ("Blockers", "B-0001"),
+])
+def test_row_keys_accept_ascii_digits_only(section, key, base):
+    assert registry._row_key_ok(section, key)
+    assert not registry._row_key_ok(section, _spell(key, base))
+
+
+@pytest.mark.parametrize("base", _NON_ASCII)
+def test_validate_refuses_non_ascii_digit_row_ids(env, base):
+    qid, bid = _spell("E-0200", base), _spell("B-0001", base)
+    _add_table_row(env, "Queue", _queue_row(qid))
+    _add_table_row(env, "Blockers", f"| {bid} | jr-dev-1 | lead-dev | - | open | x |")
+    assert qid not in env.reg().queue and bid not in env.reg().blockers
+    problems = registry.validate_violations(env.text())
+    assert any(p.startswith(f"Queue: bad id {qid!r}") for p in problems), problems
+    assert any(p.startswith(f"Blockers: bad id {bid!r}") for p in problems), problems
+
+
+@pytest.mark.parametrize("base", _NON_ASCII)
+def test_id_arguments_refuse_non_ascii_digits(env, capsys, base):
+    """The ASCII spelling of each id is live, so a check that folded digits would act on it."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    assert env.run("ask", "--actor", "lead-dev", "--urgency", "advisory", "--work", "E-0001",
+                   "--question", "q?", "--default", "d", "--assumption", "a") == 0
+    assert env.run("raise-blocker", "--actor", "jr-dev-1", "--owner", "lead-dev",
+                   "--description", "x") == 0
+    capsys.readouterr()
+    before = env.text()
+    wid, qid, bid = _spell(rid, base), _spell("Q-0001", base), _spell("B-0001", base)
+    for args in (
+        ("claim", "--actor", "jr-dev-1", "--id", wid),
+        ("release", "--actor", "jr-dev-1", "--id", wid, "--state", "ready"),
+        ("withdraw", "--actor", "lead-dev", "--id", wid, "--reason", "x"),
+        ("status", "--actor", "jr-dev-1", "--state", "building", "--work", wid, "--phase", "p",
+         "--eta", _eta()),
+        ("ask", "--actor", "jr-dev-1", "--urgency", "advisory", "--work", wid,
+         "--question", "q?", "--default", "d", "--assumption", "a"),
+        ("raise-blocker", "--actor", "jr-dev-1", "--owner", "lead-dev", "--work", wid,
+         "--description", "x"),
+        ("answer", "--actor", "dev-manager", "--id", qid, "--answer", "yes", "--by", "dev-manager"),
+        ("retract", "--actor", "lead-dev", "--id", qid, "--reason", "x"),
+        ("resolve-blocker", "--actor", "lead-dev", "--id", bid),
+        ("assign-blocker", "--actor", "dev-manager", "--id", bid, "--owner", "steward"),
+    ):
+        _assert_refused(env, capsys, "id_format", *args)
+    _assert_refused(env, capsys, "agent_waiting_on", "status", "--actor", "jr-dev-1",
+                    "--state", "halted", "--work", rid, "--phase", "p", "--waiting-on", bid)
+    assert env.text() == before, "a refused id must leave the board byte-identical"
+
+
+@pytest.mark.parametrize("base", _NON_ASCII)
+def test_the_allocator_does_not_fold_non_ascii_digits_into_a_number(base):
+    """int() reads any Unicode digit, so a scan that matched one counted B-0009 as allocated."""
+    text = f"| {_spell('B-0009', base)} | x |\n| B-0003 | x |\n"
+    assert registry._max_id("B", text) == 3
+    assert registry._mentioned_ids("B", text) == {"B-0003"}
+    assert registry._max_id("Q", f"### {_spell('Q-0009', base)}\n### Q-0003\n") == 3
+
+
+#: ASCII strings shaped like each registry id site. A module pattern that names an id prefix must
+#: match at least one of them, so a new id pattern fails here until a sample covers it.
+_ID_SAMPLES = (
+    "E-0200", "E-0200-some-name", "Q-0001", "B-0001", "### Q-0001",
+    "| B-0001 | x |", "| E-0200 | x |", "| E-0200-some-name | x |",
+)
+_ID_PREFIX_IN_SOURCE = re.compile(r"(?:^|[^A-Za-z])(?:[EQB]|\[[EQB]+\])-")
+
+
+def _module_patterns():
+    for name, value in vars(registry).items():
+        if isinstance(value, re.Pattern):
+            yield name, value
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                if isinstance(v, re.Pattern):
+                    yield f"{name}[{k!r}]", v
+
+
+def test_every_module_id_pattern_refuses_non_ascii_digits():
+    id_patterns = [(n, p) for n, p in _module_patterns() if _ID_PREFIX_IN_SOURCE.search(p.pattern)]
+    names = {n for n, _ in id_patterns}
+    assert {"_E_ID", "_Q_ID", "_B_ID", "_ANY_ID", "_QBLOCK_RE"} <= names, names
+    for name, pat in id_patterns:
+        hits = [s for s in _ID_SAMPLES if pat.search(s)]
+        assert hits, f"{name} matches no ASCII id sample; add one to _ID_SAMPLES"
+        for sample in hits:
+            for base in _DIGIT_SETS.values():
+                assert not pat.search(_spell(sample, base)), (name, _spell(sample, base))
+
+
+def test_no_registry_regex_uses_a_unicode_digit_class():
+    r"""`\d` is any Unicode decimal digit. Every pattern in the module, compiled or inline,
+    function-local included, spells digits `[0-9]` or carries re.ASCII."""
+    for name, pat in _module_patterns():
+        assert "\\d" not in pat.pattern or pat.flags & re.ASCII, name
+    # The module's own source, read without naming `__file__`: a name bound from `__file__` marks
+    # every `ast.walk` on that name in this module as a repo-rooted corpus walk.
+    for node in ast.walk(ast.parse(inspect.getsource(registry))):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "re"
+                and node.args):
+            continue
+        src = node.args[0]
+        parts = src.values if isinstance(src, ast.JoinedStr) else [src]
+        text = "".join(p.value for p in parts
+                       if isinstance(p, ast.Constant) and isinstance(p.value, str))
+        if "\\d" in text:
+            assert "re.ASCII" in ast.unparse(node), f"line {node.lineno}: {ast.unparse(node)}"
+
+
+def _append_to_questions(env, block: str) -> None:
+    text = env.text()
+    _, e = _section_bounds(text)["Questions"]
+    env.registry_path.write_text(text[:e].rstrip("\n") + "\n\n" + block + "\n\n" + text[e:],
+                                 encoding="utf-8", newline="")
+
+
+_STRAY_BLOCK = "### {hdr}\n- state: applied\n- answer: fake\n"
+
+
+@pytest.mark.parametrize("hdr", [
+    pytest.param(_spell("Q-10002", base), id=name) for name, base in _DIGIT_SETS.items()
+] + [pytest.param("Q-10002x", id="ascii-mangled"), pytest.param("Q-10002", id="hashes-dropped")])
+def test_validate_flags_a_question_header_the_parser_cannot_read(env, capsys, hdr):
+    """Fields are last-wins and a block ends only at the next READABLE header, so an unreadable
+    one hands its fields to the live question above it. validate must fail on the header."""
+    assert env.run("ask", "--actor", "jr-dev-1", "--urgency", "halted", "--question", "q?",
+                   "--default", "d") == 0
+    capsys.readouterr()
+    assert registry.validate_violations(env.text()) == []
+    block = _STRAY_BLOCK.format(hdr=hdr)
+    _append_to_questions(env, block if hdr != "Q-10002" else block.removeprefix("### "))
+    problems = registry.validate_violations(env.text())
+    assert any(p.startswith("Questions: unreadable block header") for p in problems), problems
+    assert env.run("validate") != 0
+    capsys.readouterr()
+
+
+def test_cull_never_sweeps_a_live_question_an_unreadable_header_follows(env, capsys):
+    """cull reads a block's FIRST state line, so the stray `applied` below the live one's own
+    state never makes it consumed -- the live block survives byte-for-byte."""
+    assert env.run("ask", "--actor", "jr-dev-1", "--urgency", "halted", "--question", "q?",
+                   "--default", "d") == 0
+    _append_to_questions(env, _STRAY_BLOCK.format(hdr=_spell("Q-10002", 0x0660)))
+    before = registry._get_body(env.text(), "Questions")
+    env.run("cull", "--actor", "steward")
+    capsys.readouterr()
+    assert registry._get_body(env.text(), "Questions") == before
+
+
+def test_validate_reads_a_well_formed_questions_section_as_clean(env, capsys):
+    """The header check must not fire on the template comment or on readable headers."""
+    for _ in range(2):
+        assert env.run("ask", "--actor", "jr-dev-1", "--urgency", "advisory", "--question", "q?",
+                       "--default", "d", "--assumption", "a") == 0
+    capsys.readouterr()
+    assert registry.validate_violations(env.text()) == []
+
+
+@pytest.mark.parametrize("brk", ["\n", "\r", "\r\n"])
+def test_id_arguments_refuse_a_trailing_line_break(env, capsys, brk):
+    """The id rules end in `$`, which also matches before a trailing newline."""
+    rid = _pub(env, "alpha-thing-one", lane="jr-dev-1")
+    assert env.run("ask", "--actor", "lead-dev", "--urgency", "advisory", "--work", rid,
+                   "--question", "q?", "--default", "d", "--assumption", "a") == 0
+    assert env.run("raise-blocker", "--actor", "jr-dev-1", "--owner", "lead-dev",
+                   "--description", "x") == 0
+    capsys.readouterr()
+    before = env.text()
+    for args in (
+        ("claim", "--actor", "jr-dev-1", "--id", rid + brk),
+        ("answer", "--actor", "dev-manager", "--id", "Q-0001" + brk, "--answer", "y",
+         "--by", "dev-manager"),
+        ("resolve-blocker", "--actor", "lead-dev", "--id", "B-0001" + brk),
+    ):
+        _assert_refused(env, capsys, "id_format", *args)
+    assert env.text() == before
+
+
+
+# --------------------------------------------------------------------------- #
+# gh#1126: REGISTRY.md names the ship order for adding a seat
+# --------------------------------------------------------------------------- #
+def test_registry_doc_orders_adding_a_seat_before_its_first_row():
+    """A lane on older code drops an Agents row whose name is not in its `AGENTS` and its wake
+    `validate` exits 2, so the doc must put the AGENTS merge, the skill deploy and the lane
+    fast-forward BEFORE the new seat's first registry row."""
+    doc = (_SHARED.parents[1] / "docs" / "REGISTRY.md").read_text(encoding="utf-8")
+    assert "**Adding a seat.**" in doc, "REGISTRY.md lost its 'Adding a seat' paragraph"
+    start = doc.index("**Adding a seat.**")
+    end = doc.find("\n\n", start)
+    para = " ".join(doc[start:end if end != -1 else len(doc)].split())
+    # Anchor on the merge step itself, not the paragraph's first mention of AGENTS, so a
+    # reordering that moves the merge after the first row fails here.
+    steps = ["adds it to `AGENTS`", "--deploy-only", "fast-forward", "first registry row"]
+    at = [para.find(s) for s in steps]
+    assert -1 not in at, f"the paragraph must name every step {steps}: {para!r}"
+    assert at == sorted(at), f"the steps must appear in ship order {steps}: {para!r}"
+    assert "bad agent" in para and "exits 2" in para, f"the paragraph must say why: {para!r}"
+
+
+# --------------------------------------------------------------------------- #
+# The edit-lock is named by the board it guards, not by how the caller spelled the path
+# --------------------------------------------------------------------------- #
+def _hold_lock(lock_dir: Path, name: str) -> Path:
+    """A fresh, live-looking hold on ``<name>-registry.lock`` (no PID line, so age alone judges)."""
+    lock = lock_dir / f"{name}-registry.lock"
+    lock.mkdir()
+    (lock / "holder").write_text("jr-dev-1\n2099-01-01T00:00Z\n", encoding="utf-8")
+    return lock
+
+
+def _release_held(lock: Path) -> None:
+    (lock / "holder").unlink()
+    lock.rmdir()
+
+
+def _note_via(board: str, lock_dir: Path, *extra: str) -> int:
+    return main(["note", "--file", board, "--lock-dir", str(lock_dir), "--timeout", "0.3",
+                 *extra, "--actor", "lead-dev", "--text", "same board, same lock"])
+
+
+def _link_dir(target: Path, link: Path) -> None:
+    """A directory junction on Windows (the shape a real install uses), a symlink elsewhere."""
+    if sys.platform == "win32":
+        try:
+            import _winapi
+            _winapi.CreateJunction(str(target), str(link))
+            return
+        except (ImportError, OSError) as exc:
+            junction_error = exc
+        try:
+            os.symlink(target, link, target_is_directory=True)
+            return
+        except OSError as exc:
+            pytest.skip(f"neither a junction ({junction_error}) nor a symlink ({exc}) can be made here")
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"no directory symlink can be made here: {exc}")
+
+
+def test_edit_lock_name_follows_a_board_reached_through_a_junction(env):
+    link = env.registry_path.parent.parent.parent.parent / "loop-state"
+    _link_dir(env.registry_path.parent, link)
+    held = _hold_lock(env.lock_dir, "demo")
+    before = env.text()
+    try:
+        assert _note_via(str(link / "registry.md"), env.lock_dir) == 3
+    finally:
+        _release_held(held)
+    assert env.text() == before
+    assert sorted(p.name for p in env.lock_dir.iterdir()) == []
+
+
+def test_edit_lock_name_follows_a_board_reached_by_a_relative_path(env, monkeypatch):
+    monkeypatch.chdir(env.registry_path.parent)
+    held = _hold_lock(env.lock_dir, "demo")
+    before = env.text()
+    try:
+        assert _note_via("registry.md", env.lock_dir) == 3
+    finally:
+        _release_held(held)
+    assert env.text() == before
+    assert sorted(p.name for p in env.lock_dir.iterdir()) == []
+
+
+def test_edit_lock_name_follows_a_board_named_by_the_env_var_through_a_junction(env, monkeypatch):
+    """$AGENTFLOW_REGISTRY is the other route a caller never sees on its command line: a junction
+    there, with no --project, used to name the lock after the junction's grandparent."""
+    link = env.registry_path.parent.parent.parent.parent / "loop-state"
+    _link_dir(env.registry_path.parent, link)
+    monkeypatch.setenv("AGENTFLOW_REGISTRY", str(link / "registry.md"))
+    held = _hold_lock(env.lock_dir, "demo")
+    before = env.text()
+    try:
+        rc = main(["note", "--lock-dir", str(env.lock_dir), "--timeout", "0.3",
+                   "--actor", "lead-dev", "--text", "same board, same lock"])
+    finally:
+        _release_held(held)
+    assert rc == 3
+    assert env.text() == before
+    assert sorted(p.name for p in env.lock_dir.iterdir()) == []
+
+
+def test_init_stamps_the_boards_own_lock_into_the_header_not_the_project_flag(tmp_path):
+    """Every later write to this board takes `demo-registry.lock`, so the header comment that
+    tells a reader which lock guards the board must say that, whatever --project init got."""
+    board = tmp_path / "projects" / "demo" / "status" / "registry.md"
+    assert main(["init", "--file", str(board), "--lock-dir", str(tmp_path / "locks"),
+                 "--project", "other"]) == 0
+    text = board.read_text(encoding="utf-8")
+    assert "<lock_dir>/demo-registry.lock" in text, text[:600]
+    assert "other-registry.lock" not in text
+    assert "# Fleet Registry — other" in text  # init's own project naming is unchanged
+
+
+def test_init_refuses_a_board_with_no_project_directory_before_creating_it(tmp_path, monkeypatch, capsys):
+    """A board no write could ever lock is refused at init, not created and then refused."""
+    created: list[Path] = []
+    monkeypatch.setattr(registry, "_do_init", lambda path, *rest: created.append(path) or 0)
+    board = Path(tmp_path.anchor) / "registry.md"
+    rc = main(["init", "--file", str(board), "--lock-dir", str(tmp_path / "locks")])
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "refused [lock_name_empty]" in err, err
+    assert created == []
+
+
+def test_edit_lock_name_follows_the_board_not_a_mismatched_project(env):
+    """--project names one project, --file another's board: the lock is the BOARD's, and the
+    mismatch is not refused (drills point --file at scratch boards under any --project)."""
+    held = _hold_lock(env.lock_dir, "demo")
+    before = env.text()
+    try:
+        assert _note_via(str(env.registry_path), env.lock_dir, "--project", "other") == 3
+    finally:
+        _release_held(held)
+    assert env.text() == before
+    assert not (env.lock_dir / "other-registry.lock").exists()
+    # Unheld, the same mismatched call writes, and under the board's lock alone.
+    assert _note_via(str(env.registry_path), env.lock_dir, "--project", "other") == 0
+    assert "same board, same lock" in env.text()
+
+
+def test_edit_lock_name_refuses_a_board_with_no_project_directory(tmp_path, monkeypatch, capsys):
+    """A board whose resolved grandparent is a filesystem root has no project name, and an
+    empty name would be a lock (`-registry.lock`) shared by every such board."""
+    lock_dir = tmp_path / "locks"
+    board = Path(tmp_path.anchor) / "registry.md"
+    # The board need not exist: the name is refused before anything reads it.
+    monkeypatch.setattr(registry, "_require_readable_registry", lambda path: None)
+    rc = main(["note", "--file", str(board), "--lock-dir", str(lock_dir), "--timeout", "0.3",
+               "--actor", "lead-dev", "--text", "x"])
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "refused [lock_name_empty]" in err, err
+    assert not lock_dir.exists() or list(lock_dir.iterdir()) == []
+
+
+def test_edit_lock_name_is_unchanged_for_every_documented_project_call(cfg, monkeypatch):
+    """`--project <name>` reaches <data_root>/projects/<name>/status/registry.md, so the board's
+    own project directory IS <name>: the lock a live fleet already takes keeps its name."""
+    taken: list[str] = []
+    real = registry.acquire_edit_lock
+
+    def spy(lock_dir, project, actor, **kw):
+        taken.append(project)
+        return real(lock_dir, project, actor, **kw)
+
+    monkeypatch.setattr(registry, "acquire_edit_lock", spy)
+    assert main(["init", "--project", "toy"]) == 0
+    assert main(["note", "--project", "toy", "--actor", "lead-dev", "--text", "pinned"]) == 0
+    assert main(["status", "--project", "toy", "--actor", "lead-dev", "--state", "idle",
+                 "--eta", _eta()]) == 0
+    assert taken == ["toy", "toy"]
+    assert registry._edit_lock_name(cfg.board("toy")) == "toy"
+    held = _hold_lock(cfg.data.parent / "locks", "toy")
+    try:
+        assert main(["note", "--project", "toy", "--timeout", "0.3", "--actor", "lead-dev",
+                     "--text", "blocked"]) == 3
+    finally:
+        _release_held(held)

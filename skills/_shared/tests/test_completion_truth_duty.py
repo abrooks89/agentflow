@@ -26,7 +26,7 @@ worse than none:
 * It CAN prove each merging lane's SKILL.md still STATES the duty; that it states it in a chunk
   that also carries merge wording AND same-pass timing wording, rather than only as an
   after-the-fact repair; that it carries the duty as a checklist box and not prose alone; and
-  that lead-dev's completion-truth prose still names both junior lanes nearby.
+  that lead-dev's completion-truth prose still names every junior lane nearby.
 * It CANNOT prove any lane PERFORMS the write. Nothing in this repo observes a live wake; a pass
   here means the instruction is present and worded at the merge, not that an epic's frontmatter
   is current.
@@ -43,7 +43,7 @@ from agentflow.tracked_paths import only_tracked
 SKILLS_ROOT = Path(__file__).resolve().parents[2]
 
 # The loops that merge an epic's PR, and therefore each need the reconcile write at their own
-# merge point. Deliberately NOT all six loops:
+# merge point. Deliberately NOT every loop:
 #   dev-manager  - the human's seat. It promotes specs to approved-for-autonomous and reviews;
 #                  it does not build or merge epics, so it has no merge point to hang this on.
 #   auditor      - read-only against the product. It reviews already-done epics and drafts new
@@ -52,7 +52,7 @@ SKILLS_ROOT = Path(__file__).resolve().parents[2]
 #                  sweep reconciles frontmatter against merged shas on a timer; requiring the
 #                  merge-time wording of it would misdescribe what it does.
 #   orchestrator - it DOES run the merge (substep 7d squash-merges the PR and sets
-#                  state.status = "done"), and all three lanes above reach their merge THROUGH it
+#                  state.status = "done"), and every lane in MERGING_LOOPS reaches its merge THROUGH it
 #                  via /project. It is out of this set because 7d already discharges the
 #                  status.md half of completion truth, while the spec-frontmatter half belongs to
 #                  the DISPATCHING lane - the one that owns the spec and its lane's registry row,
@@ -140,7 +140,10 @@ def _states_duty(chunk: str) -> bool:
 
 
 def _checklist_section(skill: str) -> str:
-    text = _skill_text(skill)
+    return _checklist_section_of(_skill_text(skill), skill)
+
+
+def _checklist_section_of(text: str, skill: str) -> str:
     head = _CHECKLIST_HEADING[skill]
     start = text.find(head)
     assert start != -1, (
@@ -172,17 +175,86 @@ def test_every_merging_loop_states_the_completion_truth_reconcile(skill: str) ->
 # pass") drops that lane to zero matching chunks and reds this.
 
 
+#
+# It reads only the text outside the end-of-firing checklist: each lane's checklist box carries
+# the duty, merge and same-pass words too, so with the box in scope the box alone satisfied this
+# and the prose beside the merge could be deleted with the gate still green.
+#
+# The chunk must also name the WRITE (`current_state: done`, or reconciling the frontmatter), not
+# only the phrase "completion truth": lead-dev's selection step names the concept and points at
+# the lanes that "write the reconcile in the same pass as the merge", which is a cross-reference,
+# not the duty, and on its own it kept lead-dev green with its merge prose deleted.
+
+_WRITE_PATTERNS = _DUTY_PATTERNS[1:]
+
+# The opening words of each lane's merge-time duty prose. The mutation control below anchors its
+# deletion on this; if the prose is reworded the control fails loudly rather than deleting nothing.
+_MERGE_DUTY_ANCHOR = "**Reconcile completion truth in the SAME pass as the merge"
+
+
+def _is_merge_duty_chunk(chunk: str) -> bool:
+    return bool(
+        any(p.search(chunk) for p in _WRITE_PATTERNS)
+        and _MERGE_PATTERN.search(chunk)
+        and _SAME_PASS.search(chunk)
+    )
+
+
+def _merge_duty_chunks(text: str, skill: str) -> list[str]:
+    return [b for b in _blocks(_outside_checklist(text, skill)) if _is_merge_duty_chunk(b)]
+
+
+def _delete_merge_duty_prose(text: str) -> str:
+    """Cut the duty prose from its anchor to the end of the paragraph or list item holding it.
+
+    In the junior lanes the duty is the tail of a longer claim step, so the cut starts at the
+    anchor rather than at the item's marker and leaves the claim instructions in place.
+    """
+    start = text.find(_MERGE_DUTY_ANCHOR)
+    assert start != -1, f"anchor {_MERGE_DUTY_ANCHOR!r} not found - the control has nothing to delete"
+    assert text.find(_MERGE_DUTY_ANCHOR, start + 1) == -1, "anchor is not unique"
+    line_end = text.find("\n", start)
+    end = len(text)
+    while line_end != -1:
+        next_end = text.find("\n", line_end + 1)
+        line = text[line_end + 1 : len(text) if next_end == -1 else next_end]
+        if not line.strip() or _LIST_ITEM.match(line):
+            end = line_end
+            break
+        line_end = next_end
+    return text[:start] + text[end:]
+
+
 @pytest.mark.parametrize("skill", MERGING_LOOPS)
 def test_reconcile_duty_is_stated_beside_the_merge(skill: str) -> None:
-    matching = [
-        b
-        for b in _blocks(_skill_text(skill))
-        if _states_duty(b) and _MERGE_PATTERN.search(b) and _SAME_PASS.search(b)
-    ]
+    matching = _merge_duty_chunks(_skill_text(skill), skill)
     assert matching, (
         f"{skill}/SKILL.md states the reconcile, but no single bullet or paragraph of it carries "
         f"the duty, a merge and same-pass timing together - so the write is scheduled for some "
         f"later wake, and until it lands {_CONSEQUENCE}"
+    )
+
+
+@pytest.mark.parametrize("skill", MERGING_LOOPS)
+def test_beside_the_merge_check_rejects_a_lane_left_with_only_its_checklist_box(
+    skill: str,
+) -> None:
+    text = _skill_text(skill)
+    mutated = _delete_merge_duty_prose(text)
+    removed = len(text) - len(mutated)
+    assert removed > 200, f"the mutation removed only {removed} chars from {skill} - not the duty prose"
+    assert _MERGE_DUTY_ANCHOR not in mutated
+    # The box must survive and still carry every word the check looks for; otherwise this control
+    # would not be testing the box-alone case at all.
+    box = _checklist_section_of(mutated, skill)
+    assert box == _checklist_section(skill), f"the mutation touched {skill}'s checklist"
+    assert any(_is_merge_duty_chunk(b) for b in _blocks(box)), (
+        f"{skill}'s checklist box no longer carries the duty words, so this control is vacuous"
+    )
+    assert _merge_duty_chunks(text, skill), f"the check rejects {skill}'s unmutated SKILL.md"
+    assert not _merge_duty_chunks(mutated, skill), (
+        f"with {skill}'s merge-time duty prose deleted the check still passes - something other "
+        "than that prose satisfies it"
     )
 
 
@@ -201,13 +273,96 @@ def test_reconcile_duty_is_a_checklist_step_not_only_prose(skill: str) -> None:
     )
 
 
+# --- the issue-sourced branch of the duty is stated, not only the spec-backed one -----------
+# A row lead-dev published from an issue has no spec, so the frontmatter write above cannot
+# apply to it; its completion truth is the PR's Source line plus `release --state done`, with
+# the phase saying so. The generic patterns above match a lane that states only the spec-backed
+# half, so on their own they pass vacuously for an issue-sourced merge. These two tests require
+# the issue-origin branch in the same chunk as the duty, in prose beside the merge and as a
+# checklist box. Like the rest of this file they read the instruction, not a live wake: they
+# cannot show a lane runs the release. Re-reds if any one of the three markers below is dropped
+# from a lane's merge prose, or from its checklist box, independently of the other.
+#
+# The markers are literal on purpose: `Source: gh#N` is the PR-body line the auditor's
+# fixed-issue pass reads, and the phase string is what the board shows, so a rewording of either
+# is a change to the contract rather than to the prose.
+
+_ISSUE_ORIGIN_PATTERNS = (
+    re.compile(r"no spec: issue-published", re.I),
+    re.compile(r"release --state done", re.I),
+    re.compile(r"Source: gh#N"),
+)
+
+# The spec-only wording a lane carried before the issue-sourced branch was added. It states the
+# duty beside the merge in the same pass, so every older check accepts it; the origin check must
+# not.
+_SPEC_ONLY_DUTY = (
+    "3. **Completion truth at your merge.** For every epic whose PR you merged this firing, write "
+    "`current_state: done` plus a `completion-truth:` note into its spec frontmatter and its "
+    "status board with `status_writer mark-done`, in the same pass as the merge."
+)
+
+
+def _states_issue_origin(chunk: str) -> bool:
+    return _states_duty(chunk) and all(p.search(chunk) for p in _ISSUE_ORIGIN_PATTERNS)
+
+
+def _text_outside_checklist(skill: str) -> str:
+    # The checklist box also carries merge and same-pass wording, so leaving it in would let the
+    # box alone satisfy the prose assertion and the two halves would stop being independent.
+    return _outside_checklist(_skill_text(skill), skill)
+
+
+def _outside_checklist(text: str, skill: str) -> str:
+    return text.replace(_checklist_section_of(text, skill), "", 1)
+
+
+def test_spec_only_wording_passes_the_older_checks_but_not_the_origin_check() -> None:
+    chunk = _flat(_SPEC_ONLY_DUTY)
+    assert _states_duty(chunk) and _MERGE_PATTERN.search(chunk) and _SAME_PASS.search(chunk), (
+        "the spec-only control no longer satisfies the older checks - it has stopped proving "
+        "that they pass vacuously for an issue-sourced row"
+    )
+    assert not _states_issue_origin(chunk), (
+        "the issue-origin check accepts spec-only wording, so it cannot tell a lane that dropped "
+        "the issue-sourced branch from one that kept it"
+    )
+
+
+@pytest.mark.parametrize("skill", MERGING_LOOPS)
+def test_issue_sourced_completion_truth_is_stated_at_the_merge_and_in_the_checklist(
+    skill: str,
+) -> None:
+    prose = [
+        b
+        for b in _blocks(_text_outside_checklist(skill))
+        if _states_issue_origin(b) and _MERGE_PATTERN.search(b) and _SAME_PASS.search(b)
+    ]
+    assert prose, (
+        f"{skill}/SKILL.md states completion truth at the merge for spec-backed rows only - no "
+        "chunk carrying the duty, a merge and same-pass timing also names the issue-sourced "
+        "branch (Source: gh#N, release --state done, 'no spec: issue-published' in the phase), "
+        "so a merged issue-sourced row has no completion-truth record"
+    )
+    boxes = [
+        b
+        for b in _blocks(_checklist_section(skill))
+        if b.lstrip().startswith("- [ ]") and _states_issue_origin(b)
+    ]
+    assert boxes, (
+        f"{skill}/SKILL.md has no end-of-firing checklist box for the issue-sourced branch of the "
+        "completion-truth duty - prose alone is the fakeable half"
+    )
+
+
 # --- gh#75: lead-dev's completion-truth prose keeps the junior lanes in view ----------------
 # The falsified reading is that lead-dev's selection-time cross-check covers everything; it
 # covers the epics lead-dev selects, and the junior lanes cover their own merges. What the
-# assertion below actually checks is narrower than that reading: it requires the literals
-# "jr-dev-1" and "jr-dev-2" to occur within +-700 characters of at least one completion-truth
-# match. It re-reds if the lane names are dropped from that neighbourhood; it CANNOT detect a
-# rewrite that keeps the names nearby while going back to implying full coverage.
+# assertion below actually checks is narrower than that reading: it requires every junior lane
+# in MERGING_LOOPS to occur within +-700 characters of at least one completion-truth match. It
+# re-reds if any lane name is dropped from that neighbourhood, so a junior added to
+# MERGING_LOOPS but not to the prose fails here; it CANNOT detect a rewrite that keeps the names
+# nearby while going back to implying full coverage.
 
 
 def test_lead_dev_scopes_its_cross_check_and_names_the_junior_lanes() -> None:
@@ -217,9 +372,13 @@ def test_lead_dev_scopes_its_cross_check_and_names_the_junior_lanes() -> None:
         for pattern in _DUTY_PATTERNS
         for m in pattern.finditer(flat)
     ]
-    assert any("jr-dev-1" in w and "jr-dev-2" in w for w in windows), (
-        "lead-dev/SKILL.md discusses completion truth without naming jr-dev-1 and jr-dev-2 "
-        "alongside it - unscoped, the cross-check reads as full coverage when it only sees epics "
+    juniors = [loop for loop in MERGING_LOOPS if loop != "lead-dev"]
+    assert juniors, "MERGING_LOOPS names no junior lane - this gate would pass vacuously"
+    missing = [j for j in juniors if not any(j in w for w in windows)]
+    assert any(all(j in w for j in juniors) for w in windows), (
+        "lead-dev/SKILL.md discusses completion truth without naming every junior lane "
+        f"alongside it (absent from every window: {missing or 'none, but never all in one'}) - "
+        "unscoped, the cross-check reads as full coverage when it only sees epics "
         f"lead-dev itself selects, and a junior-shipped epic left approved means {_CONSEQUENCE}"
     )
 

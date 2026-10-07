@@ -23,6 +23,7 @@ import fnmatch
 import importlib.util
 import io
 import json
+import os
 import re
 import sys
 import tokenize
@@ -306,8 +307,8 @@ def test_the_dry_run_plan_marks_step_8_skipped(tmp_path):
 
 
 def test_the_flag_survives_the_venv_handover(tmp_path, monkeypatch):
-    """Modelled on test_provision_venv_handover's argv test. `_INVOKED_ARGV` already carries
-    every flag to the child; this pins it for `--no-auto-allow`, whose loss would install the
+    """Modelled on test_provision_venv_handover's argv test. `Options.invoked_argv` already
+    carries every flag to the child; this pins it for `--no-auto-allow`, whose loss would install the
     very hooks the operator declined, in the child, after the parent's plan said it would not."""
     monkeypatch.setattr(sys, "argv", ["provision.py"])
     monkeypatch.delenv(provision._REEXEC_MARKER, raising=False)
@@ -349,3 +350,161 @@ def test_the_flag_survives_the_venv_handover(tmp_path, monkeypatch):
     with mock.patch.object(provision, "build_steps", spy), redirect_stdout(io.StringIO()):
         assert provision.main([*child_args, "--dry-run"]) == 0
     assert seen["auto_allow"] is False
+
+
+# --------------------------------------------------------------------------- #
+# The settings write
+# --------------------------------------------------------------------------- #
+def _run_bootstrap_main(monkeypatch, settings: Path) -> int:
+    """bootstrap.main() in-process against *settings*, with the env patterns cleared."""
+    monkeypatch.delenv("AGENTFLOW_EXTRA_AUTO_ALLOW", raising=False)
+    monkeypatch.setenv("CLAUDE_SETTINGS_FILE", str(settings))
+    monkeypatch.setattr(sys, "argv", ["bootstrap.py"])
+    with redirect_stdout(io.StringIO()):
+        return _load_bootstrap().main()
+
+
+def _shared_atomic_io():
+    """The atomic_io module bootstrap imports: the installed agentflow package, imported the
+    same way, so a patch here is the one bootstrap's lazy import picks up."""
+    from agentflow import atomic_io
+    return atomic_io
+
+
+def test_bootstrap_without_the_package_refuses_loudly_and_writes_nothing(tmp_path, monkeypatch):
+    # A None entry in sys.modules makes the import raise ModuleNotFoundError for that name,
+    # which is what a bare interpreter without the package raises.
+    monkeypatch.setitem(sys.modules, "agentflow.atomic_io", None)
+    settings = tmp_path / "s.json"
+    settings.write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit) as caught:
+        _run_bootstrap_main(monkeypatch, settings)
+    msg = str(caught.value.code)
+    assert "agentflow package is not importable" in msg and "Nothing was written" in msg, msg
+    assert isinstance(caught.value.__cause__, ModuleNotFoundError)
+    assert settings.read_text(encoding="utf-8") == "{}"
+
+
+def test_bootstrap_with_a_package_too_old_for_it_refuses_loudly_and_writes_nothing(tmp_path,
+                                                                                   monkeypatch):
+    """An installed agentflow that predates the shared settings writer: the module imports
+    but the name does not, which raises a plain ImportError rather than ModuleNotFoundError.
+    It must still end in the remediation, not a traceback, with the file untouched."""
+    monkeypatch.delattr(_shared_atomic_io(), "write_settings_json")
+    settings = tmp_path / "s.json"
+    settings.write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit) as caught:
+        _run_bootstrap_main(monkeypatch, settings)
+    msg = str(caught.value.code)
+    assert "older than this script" in msg and "Nothing was written" in msg, msg
+    cause = caught.value.__cause__
+    assert isinstance(cause, ImportError) and not isinstance(cause, ModuleNotFoundError)
+    assert settings.read_text(encoding="utf-8") == "{}"
+
+
+def test_bootstrap_keeps_non_ascii_settings_unescaped(tmp_path, monkeypatch):
+    settings = tmp_path / "s.json"
+    settings.write_text(json.dumps({"env": {"NOTE": "Zo\u00eb \u2713"}}, ensure_ascii=False),
+                        encoding="utf-8")
+    assert _run_bootstrap_main(monkeypatch, settings) == 0
+    text = settings.read_bytes().decode("utf-8")
+    assert "Zo\u00eb \u2713" in text, "the operator's non-ASCII value must survive as UTF-8"
+    assert "\\u00eb" not in text and "\\u2713" not in text, "rewritten as escapes"
+    after = json.loads(text)
+    assert after["env"]["NOTE"] == "Zo\u00eb \u2713"
+    assert after["hooks"]["PreToolUse"], "control: the hooks were actually written"
+    assert b"\r\n" not in settings.read_bytes(), "provision writes LF; CRLF here flip-flops"
+
+
+@pytest.mark.parametrize("raw_json", [
+    '{"env": {"NOTE": "Zoë ✓"}}',
+    # A lone surrogate parses as JSON but cannot be written as UTF-8.
+    '{"env": {"NOTE": "\\ud800"}}',
+], ids=["non-ascii", "lone-surrogate"])
+def test_bootstrap_writes_what_provision_writes(tmp_path, monkeypatch, raw_json):
+    """Byte-for-byte what provision's own settings write produces for the same settings, so
+    the two writers of this one file never flip-flop it. Provision's write is driven for real
+    (its step 9 over a settings file), never re-spelled here."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    by_provision = tmp_path / "provision.json"
+    by_provision.write_bytes(raw_json.encode("utf-8"))
+    with redirect_stdout(io.StringIO()):
+        provision._do_sessionstart_hook(_opts(tmp_path, settings_file=by_provision))
+    written = by_provision.read_bytes()
+    assert written != raw_json.encode("utf-8"), "control: provision did not rewrite the file"
+
+    by_bootstrap = tmp_path / "bootstrap.json"
+    _load_bootstrap().write_settings(by_bootstrap, json.loads(written.decode("utf-8")))
+    assert by_bootstrap.read_bytes() == written
+
+
+def test_bootstrap_writes_a_lone_surrogate_losslessly(tmp_path):
+    settings = tmp_path / "s.json"
+    _load_bootstrap().write_settings(settings, {"env": {"NOTE": "\ud800"}})
+    raw = settings.read_bytes()
+    assert b"\\ud800" in raw, "the escaped form is the only lossless spelling"
+    assert json.loads(raw.decode("utf-8"))["env"]["NOTE"] == "\ud800"
+
+
+def test_bootstrap_writes_through_a_symlink_to_its_target(tmp_path):
+    target = tmp_path / "real.json"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "link.json"
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"this platform cannot create a symlink here: {e}")
+    _load_bootstrap().write_settings(link, {"env": {"NOTE": "Zoë"}})
+    assert link.is_symlink(), "the link was replaced by a regular file"
+    assert json.loads(target.read_text(encoding="utf-8")) == {"env": {"NOTE": "Zoë"}}
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["link.json", "real.json"]
+
+
+def test_bootstrap_leaves_an_up_to_date_file_untouched(tmp_path, monkeypatch):
+    settings = tmp_path / "s.json"
+    settings.write_text("{}", encoding="utf-8")
+    assert _run_bootstrap_main(monkeypatch, settings) == 0
+    # Spelled differently from bootstrap's own output, so a needless rewrite changes bytes.
+    settings.write_text(json.dumps(json.loads(settings.read_text(encoding="utf-8")), indent=4),
+                        encoding="utf-8")
+    before = settings.read_bytes()
+    past = 1_000_000_000
+    os.utime(settings, (past, past))
+    assert _run_bootstrap_main(monkeypatch, settings) == 0
+    assert settings.read_bytes() == before, "nothing to add, yet the file was rewritten"
+    assert os.stat(settings).st_mtime == past, "nothing to add, yet the file was touched"
+
+
+def test_bootstrap_writes_through_the_shared_atomic_helper(tmp_path, monkeypatch):
+    atomic_io = _shared_atomic_io()
+    calls = []
+    real = atomic_io.atomic_write
+
+    def spy(path, text, *a, **kw):
+        calls.append((Path(path), text))
+        return real(path, text, *a, **kw)
+
+    monkeypatch.setattr(atomic_io, "atomic_write", spy)
+    settings = tmp_path / "s.json"
+    settings.write_text("{}", encoding="utf-8")
+    assert _run_bootstrap_main(monkeypatch, settings) == 0
+    assert len(calls) == 1, f"expected one atomic write, got {len(calls)}"
+    assert calls[0][0] == settings.resolve()
+    assert settings.read_bytes() == calls[0][1].encode("utf-8")
+
+
+def test_a_failed_bootstrap_write_leaves_the_original_and_no_temp(tmp_path, monkeypatch):
+    atomic_io = _shared_atomic_io()
+
+    def refuse(a, b):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(atomic_io.os, "replace", refuse)
+    settings = tmp_path / "s.json"
+    original = json.dumps({"env": {"KEEP": "me"}}).encode("utf-8")
+    settings.write_bytes(original)
+    with pytest.raises(OSError):
+        _run_bootstrap_main(monkeypatch, settings)
+    assert settings.read_bytes() == original
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["s.json"], "a temp was left behind"

@@ -188,13 +188,30 @@ def test_dry_run_still_exits_0_and_writes_nothing_with_the_file_missing(tmp_path
     assert f"settings file exists: {missing}" in step1
 
 
+def _json_error_fragment(raw: bytes) -> str:
+    """The message and position provision reports for *raw*, from the running interpreter.
+
+    json's wording and position for the same bad bytes differ by version (3.13+ names an
+    illegal trailing comma at the comma; 3.11/3.12 report the closing brace), so pinning
+    one version's text fails on the others. Decoded as provision reads the file (text mode,
+    so CRLF becomes LF), so a CRLF fixture would still report the same position.
+    """
+    try:
+        json.loads(raw.decode("utf-8").replace("\r\n", "\n"))
+    except json.JSONDecodeError as e:
+        return f"{e.msg} at line {e.lineno}, column {e.colno}"
+    raise AssertionError(f"{raw!r} parsed as JSON; the invalid-json case needs bytes that do not")
+
+
+_INVALID_JSON = b'{\n  "a": 1,\n}'
+
 # (id, file bytes, fragments the refusal must carry). Each is a shape that passed the gh#743
 # existence check and then crashed step 8 or 9's json.loads / setdefault after steps 2-7 wrote.
 _BAD_SETTINGS = [
     ("bom", b"\xef\xbb\xbf{}", ["byte-order mark (BOM)", "UTF8Encoding($false)"]),
     ("empty", b"", ["settings file is empty", "echo '{}' >"]),
     ("whitespace-only", b" \r\n\t\n", ["settings file is whitespace only", "echo '{}' >"]),
-    ("invalid-json", b'{\n  "a": 1,\n}', ["not valid JSON", "at line 3, column 1"]),
+    ("invalid-json", _INVALID_JSON, ["not valid JSON", _json_error_fragment(_INVALID_JSON)]),
     ("top-level-list", b"[]", ["not a JSON object", "top level is an array"]),
     ("top-level-string", b'"x"', ["not a JSON object", "top level is a string"]),
     ("not-utf8", b'{"a": "\xff"}', ["not UTF-8 text", "byte 0xff at offset 7"]),

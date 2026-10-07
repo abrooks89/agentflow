@@ -16,7 +16,11 @@ when the kept set is empty.
 
 Honesty contract (success criterion 8): every scored community and its score
 ships in ``communities_scored`` with a ``kept`` flag, so a wrong answer is
-debuggable to the report that caused it.
+debuggable to the report that caused it. Each kept report also carries
+``stale``: whether the code under it moved after it was written, judged at
+query time by the leaf/parent rules `graph reports-stale` uses (membership-only
+churn is invisible here; see ``stale_live_reports``). autodoc-update does not
+re-summarize reports, so an answer drawn from one must say so.
 """
 
 from __future__ import annotations
@@ -26,9 +30,10 @@ from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
 from typing import Any
 
+from autodoc_graph.records import stale_live_reports
 from autodoc_graph.vocab import AGENT_DEFAULT_CONFIDENCE
 
-from .local import Budget, cross_tiers
+from .local import Budget, cross_tiers, tier_ref_reason
 from .tuning import (
     DEFAULT_GLOBAL_BUDGET_MS,
     DEFAULT_MAX_ENTITIES,
@@ -222,6 +227,14 @@ def run_global(
     timings["score_ms"] = (perf_counter() - t0) * 1000.0
 
     row_by_id = {r["id"]: r for rows in with_reports.values() for r in rows}
+    # Only the kept reports are judged: the answer is drawn from them alone,
+    # and the check reads every member entity, so judging all would spend the
+    # wall-clock budget on reports nobody will see.
+    t0 = perf_counter()
+    stale_ids = stale_live_reports(
+        adapter, levels, [e["community_id"] for e in kept_entries]
+    )
+    timings["stale_check_ms"] = (perf_counter() - t0) * 1000.0
     reports_out: list[dict[str, Any]] = []
     items: list[ContextItem] = []
     seen: set[str] = set()
@@ -235,6 +248,7 @@ def run_global(
             "score": entry["score"],
             "summary": payload["summary"],
             "findings": payload.get("findings") or [],
+            "stale": cid in stale_ids,
             # finding 9: skipped citations are visible, never silent
             "unresolved_entities": [],
         }
@@ -266,6 +280,7 @@ def run_global(
                     community={
                         "community_id": cid, "level": entry["level"],
                         "label": entry["label"], "score": entry["score"],
+                        "stale": cid in stale_ids,
                     },
                 ))
 
@@ -283,6 +298,8 @@ def run_global(
         items = [i for i in items if i.tier == "symbol"]
     elif expand_tiers == "concepts_only":
         items = [i for i in items if i.tier == "concept"]
+    if (reason := tier_ref_reason(items)) is not None:
+        reasons.append(reason)
 
     timings["total_ms"] = budget.elapsed_ms()
     return QueryResult(

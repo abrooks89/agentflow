@@ -238,8 +238,10 @@ def test_scaffold_seeds_an_empty_residue_baseline_that_measures(tmp_path: Path):
     assert baseline.pages_scanned == 0
     assert baseline.recorded == datetime.date.today().isoformat()
 
-    ns = argparse.Namespace(project=None, wiki_root=None, person_name="Tester", ci_yml=None,
-                            update_baseline=None, accept_worsening=False)
+    # wiki_root names where the extra pattern is looked for: with no source at all the run
+    # cannot measure for that reason instead of the one under test.
+    ns = argparse.Namespace(project=None, wiki_root=str(wiki), person_name="Tester",
+                            ci_yml=None, update_baseline=None, accept_worsening=False)
     assert pr.run(ns, wiki) == 0
 
 
@@ -271,8 +273,10 @@ def test_no_baseline_is_seeded_into_a_pillar_that_already_has_pages(tmp_path: Pa
     provision._seed_wiki_pillar(tmp_path, "alpha")
 
     assert not pr.baseline_path(wiki).exists()
-    ns = argparse.Namespace(project=None, wiki_root=None, person_name="Tester", ci_yml=None,
-                            update_baseline=None, accept_worsening=False)
+    # wiki_root names where the extra pattern is looked for: with no source at all the run
+    # cannot measure for that reason instead of the one under test.
+    ns = argparse.Namespace(project=None, wiki_root=str(wiki), person_name="Tester",
+                            ci_yml=None, update_baseline=None, accept_worsening=False)
     assert pr.run_cli(ns, wiki) == 2
 
 
@@ -287,3 +291,28 @@ def test_a_page_only_in_a_terminal_partition_still_gets_the_seed(tmp_path: Path)
     provision._seed_wiki_pillar(tmp_path, "alpha")
 
     assert pr.load_baseline(pr.baseline_path(wiki)).pages == {}
+
+
+# --------------------------------------------------------------------------- #
+# Step selection: a full install still scaffolds; --deploy-only never reaches it
+# --------------------------------------------------------------------------- #
+def test_full_install_runs_the_scaffold_and_seeds_every_project(tmp_path: Path):
+    """Seeding every configured project stays a full-install job (SCHEMA §6's exception)."""
+    opts, data_root = _make_suite(tmp_path, ["homeproj", "otherproj"])
+    selected = provision.select_steps(opts, provision.build_steps(opts))
+    scaffold = next(s for s in selected if s.n == 11)
+    assert scaffold.run is provision._do_scaffold_data_root
+
+    fake_env = SimpleNamespace(data_root=str(data_root))
+    with mock.patch("agentflow.config.load_environment", return_value=fake_env):
+        scaffold.run(opts)
+
+    for name in ("homeproj", "otherproj"):
+        assert (data_root / "projects" / name / "wiki" / "hot.md").is_file(), name
+
+
+def test_deploy_only_selects_no_step_that_writes_project_data(tmp_path: Path):
+    opts, _ = _make_suite(tmp_path, ["homeproj", "otherproj"])
+    opts.deploy_only = True
+    selected = provision.select_steps(opts, provision.build_steps(opts))
+    assert [(s.n, s.run) for s in selected] == [(7, provision._do_deploy_skills)]

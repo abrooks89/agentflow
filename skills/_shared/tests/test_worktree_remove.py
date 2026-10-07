@@ -283,6 +283,180 @@ def test_an_unregistered_directory_refuses(fleet):
     assert _keys(_check(fleet, worktree=stray)) == ["worktree_not_registered"]
 
 
+def _deregister(fleet) -> Path:
+    """`git worktree remove` on the fixture's tree, as the printed command would run it."""
+    checkout, _, wt, _ = fleet
+    _git(checkout, "worktree", "remove", str(wt))
+    assert not wt.exists(), "precondition: an unheld tree is removed whole"
+    return wt
+
+
+#: Recursive or forcing deletes. The hint must never print one: each can take content, and
+#: `Remove-Item` on a junction is how Windows PowerShell 5.1 empties the junction's target.
+_DANGEROUS = ("rm -r", "rm -f", "rmdir /s", "rd /s", "Remove-Item", "-Recurse", "-Force", "rmtree")
+
+#: Shown only beside a removal step.
+_EMPTY_STEP = ('rmdir "', "[IO.Directory]::Delete(")
+
+
+def _not_registered_text(fleet, worktree=None) -> str:
+    v, cmd = _report(fleet, worktree=worktree)
+    assert _keys(v) == ["worktree_not_registered"], [str(r) for r in v.refusals]
+    assert cmd == []
+    text = str(v.refusals[0])
+    assert text.startswith(
+        f"refused [worktree_not_registered]: {wr.RULES['worktree_not_registered']}"
+    )
+    for bad in _DANGEROUS:
+        assert bad not in text, f"the hint prints a delete that can take content: {bad!r}"
+    return text
+
+
+def test_a_deregistered_empty_directory_still_on_disk_is_named_as_residue(fleet):
+    """The Windows shape: git deregistered the tree, but a process held the directory, so the
+    delete failed and an empty directory stayed. The refusal says what it is and how to clear it."""
+    wt = _deregister(fleet)
+    wt.mkdir()
+    text = _not_registered_text(fleet)
+    # Measured facts as facts; the history as a condition the guard never checked.
+    assert "Git does not list it; if it was a worktree of this checkout" in text
+    assert "It is empty" in text and "already deregistered" not in text
+    # Addressed to a human: the steward reads this and must not take it as its own step.
+    assert "A human clears it by closing any shell or process" in text
+    p = str(wt.absolute())
+    assert f'`rmdir "{p}"` in bash' in text
+    assert f'`[IO.Directory]::Delete("{p}")` in PowerShell' in text
+    assert wt.is_dir(), "report-only: the residue stays"
+
+
+def test_the_residue_step_never_claims_rmdir_refuses_in_every_shell(fleet):
+    """PowerShell's `rmdir` is `Remove-Item`: it prompts and, on a yes, deletes the contents. The
+    refuse-when-not-empty claim may stand only beside forms for which it is true."""
+    wt = _deregister(fleet)
+    wt.mkdir()
+    text = _flat(_not_registered_text(fleet))
+    assert "rmdir" not in text.split("in bash", 1)[1].split("(not PowerShell's `rmdir`", 1)[0]
+    assert "not PowerShell's `rmdir`" in text
+    assert "Both refuse a directory that is not empty" in text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="checks Windows PowerShell's own rmdir")
+def test_powershell_rmdir_is_the_recursive_delete_the_hint_steers_away_from():
+    """The fact the hint's wording rests on, measured on this host rather than remembered."""
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         "(Get-Alias rmdir).Definition"],
+        capture_output=True, text=True, check=True,
+    )
+    assert proc.stdout.strip() == "Remove-Item"
+
+
+def test_the_powershell_form_refuses_a_directory_that_is_not_empty(tmp_path):
+    """`[IO.Directory]::Delete(path)` is the non-recursive overload, as `os.rmdir` is."""
+    d = tmp_path / "left"
+    (d / "nested").mkdir(parents=True)
+    with pytest.raises(OSError):
+        os.rmdir(d)
+    assert (d / "nested").is_dir()
+    if sys.platform == "win32":
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"[IO.Directory]::Delete('{d}')"],
+            capture_output=True, text=True,
+        )
+        assert proc.returncode != 0 and "not empty" in (proc.stderr + proc.stdout)
+        assert (d / "nested").is_dir()
+
+
+def test_a_deregistered_directory_that_is_gone_gets_no_residue_hint(fleet):
+    _deregister(fleet)
+    text = _not_registered_text(fleet)
+    assert "is not in `git -C" in text
+    assert "a directory is at that path" not in text
+    assert not any(s in text for s in _EMPTY_STEP)
+
+
+def test_an_unregistered_directory_that_is_not_empty_gets_no_removal_step(fleet):
+    """A leftover with nested directories (the holding shell sat in `wt/src`), or a full tree
+    copied in: not residue, so no `rmdir`, and what is inside is named for the human."""
+    wt = _deregister(fleet)
+    (wt / "src" / "deep").mkdir(parents=True)
+    (wt / "notes.txt").write_text("keep me\n", encoding="utf-8")
+    text = _not_registered_text(fleet)
+    assert "It is not empty: it holds 2 entries ('notes.txt', 'src')" in text
+    assert "residue" not in text.replace(str(wt), "").replace(str(wt.absolute()), "")
+    assert "It is empty" not in text
+    assert not any(s in text for s in _EMPTY_STEP)
+    assert "a human checks what is inside before deleting anything by hand" in text
+    assert (wt / "notes.txt").is_file()
+
+
+def test_a_long_leftover_listing_is_elided(fleet):
+    wt = _deregister(fleet)
+    wt.mkdir()
+    for i in range(wr._RESIDUE_PREVIEW + 2):
+        (wt / f"f{i}").write_text("x", encoding="utf-8")
+    text = _not_registered_text(fleet)
+    assert f"holds {wr._RESIDUE_PREVIEW + 2} entries" in text and ", ...)" in text
+    assert f"'f{wr._RESIDUE_PREVIEW}'" not in text
+
+
+def test_a_live_tree_of_another_repository_is_named_and_not_called_residue(fleet, tmp_path):
+    """A worktree of a DIFFERENT checkout under the root: git here does not list it, but its
+    `.git` file says what it is, and it gets no removal step."""
+    _, root, _, _ = fleet
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-b", "master", str(other)], check=True, capture_output=True)
+    _identity(other)
+    (other / "g.txt").write_text("g\n", encoding="utf-8")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-m", "g")
+    theirs = root / PROJECT / "e0999-another-repos-tree"
+    _git(other, "worktree", "add", str(theirs), "-b", "theirs", "master")
+    text = _not_registered_text(fleet, worktree=theirs)
+    assert "A `.git` entry is there" in text and "another repository" in text
+    assert not any(s in text for s in _EMPTY_STEP)
+    assert (theirs / "g.txt").is_file()
+
+
+def test_a_link_leaf_onto_an_unregistered_directory_gets_no_command(fleet, tmp_path):
+    """`is_dir()` follows the link, so the hint fires; deleting through a junction is what can
+    empty its target, so the hint names the link and prints nothing to run."""
+    _, root, _, _ = fleet
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    leaf = root / PROJECT / "e0999-a-link"
+    _link(leaf, target)
+    text = _not_registered_text(fleet, worktree=leaf)
+    assert "symlink or junction" in text
+    assert "It is empty" not in text and not any(s in text for s in _EMPTY_STEP)
+    assert target.is_dir() and leaf.is_dir()
+
+
+def test_a_residue_path_the_shell_would_expand_gets_no_command(fleet):
+    """The hint's commands are double-quoted like the removal pair, so the same paths go without."""
+    _, root, _, _ = fleet
+    stray = root / PROJECT / "e0787-a$HOME-left"
+    stray.mkdir()
+    text = _not_registered_text(fleet, worktree=stray)
+    assert "It is empty" in text and f"quoting {str(stray.absolute())!r} for the shell" in text
+    assert f'rmdir "{stray.absolute()}"' not in text and 'rmdir "<path>"' in text
+    assert '[IO.Directory]::Delete("<path>")' in text
+
+
+def test_an_unsafe_checkout_path_does_not_withhold_the_residue_step(fleet, tmp_path):
+    """The hint's commands name only the leftover directory, so only its path is judged."""
+    checkout, root, _, reg = fleet
+    odd = tmp_path / "a$odd-checkout"
+    subprocess.run(["git", "clone", str(checkout), str(odd)], check=True, capture_output=True)
+    stray = root / PROJECT / "e0999-never-added"
+    stray.mkdir()
+    v = wr.check(odd, root, PROJECT, stray, reg)
+    assert _keys(v) == ["worktree_not_registered"]
+    text = str(v.refusals[0])
+    assert f'`rmdir "{stray.absolute()}"` in bash' in text and "<path>" not in text
+
+
 def test_a_tree_naming_no_epic_refuses(fleet):
     checkout, root, _, _ = fleet
     wt = root / PROJECT / "scratch"
@@ -293,6 +467,25 @@ def test_a_tree_naming_no_epic_refuses(fleet):
 def test_an_unreadable_registry_refuses(fleet):
     fleet[3].unlink()
     assert _keys(_check(fleet)) == ["worktree_registry_unreadable"]
+
+
+@pytest.mark.parametrize("header", ["| agent |", "| id | work item |"])
+def test_a_template_missing_an_owner_header_names_the_restore_remedy(fleet, monkeypatch, header):
+    """`file_damaged`'s rule text no longer carries the restore advice (row damage names its row
+    instead), so a missing-structure detail must carry it itself. The damaged file is the shipped
+    template, not the live board, so the detail names the template and never tells the lane to
+    re-add a heading by hand, which on an intact live registry would be a wrong edit."""
+    real = _registry._template_text
+    monkeypatch.setattr(
+        _registry, "_template_text", lambda project: real(project).replace(header, "| gone |", 1)
+    )
+    v = _check(fleet)
+    assert _keys(v) == ["worktree_registry_unreadable"], [str(r) for r in v.refusals]
+    detail = v.refusals[0].detail
+    assert "file_damaged" in detail, detail
+    assert "templates/registry.md" in detail and "git history" in detail, detail
+    assert "live registry is not the damaged file" in detail, detail
+    assert _registry._MISSING_STRUCTURE_ADVICE not in detail, detail
 
 
 def test_refusals_print_in_the_suites_shape():
@@ -389,6 +582,42 @@ def test_cli_prints_the_manual_command_only_for_a_removable_tree(fleet, monkeypa
     assert "worktree remove" not in out and "worktree prune" not in out
 
 
+def test_cli_tells_the_human_to_free_the_tree_and_then_check_it_is_gone(fleet, monkeypatch, capsys):
+    """Git deregisters a tree even when a process holding it makes the delete fail, so the pair
+    can half-succeed silently: the report says so around the command, and only around it."""
+    _, _, wt, reg = fleet
+    _patch_config(monkeypatch, fleet)
+    assert _cli(reg, wt) == 0
+    out = capsys.readouterr().out
+    flat = _flat(out)
+    assert "close any shell or process whose working directory is inside the tree" in flat
+    assert "check the directory itself is gone" in flat
+    assert "git worktree list" in flat and "deregisters" in flat
+    # Before the command, and the check after it.
+    assert out.index("close any shell") < out.index("worktree remove") < out.index("itself is gone")
+
+    _set_agent(reg, "jr-dev-2", "building", EPIC_ID)
+    assert _cli(reg, wt) == 1
+    out = capsys.readouterr().out
+    assert "close any shell or process whose working directory" not in _flat(out)
+    assert "itself is gone" not in out
+
+
+def test_cli_refuses_residue_with_exit_1_and_the_hint(fleet, monkeypatch, capsys):
+    _, _, wt, reg = fleet
+    _patch_config(monkeypatch, fleet)
+    _deregister(fleet)
+    wt.mkdir()
+    assert _cli(reg, wt) == 1
+    out = capsys.readouterr().out
+    # Not "residue" alone: pytest's tmp_path carries this test's name, which holds that word.
+    assert "refused [worktree_not_registered]" in out and "It is empty" in out
+    assert "A human clears it" in _flat(out)
+    # The hint names the earlier `git worktree remove`; the removal pair itself is not printed.
+    assert "worktree prune" not in out and "itself is gone" not in out
+    assert wt.is_dir()
+
+
 def _norm_text(text: str) -> str:
     return text.replace("\\", "/").lower()
 
@@ -427,6 +656,15 @@ def test_the_steward_names_every_refusal_key_the_guard_can_raise():
     text = _flat(STEWARD_SKILL.read_text(encoding="utf-8"))
     missing = [k for k in wr.RULES if f"`{k}`" not in text]
     assert not missing, f"steward/SKILL.md does not name these worktree_remove refusals: {missing}"
+
+
+def test_the_steward_runs_no_refusal_named_command_and_verifies_the_directory_is_gone():
+    """A refusal's remedy is a human's to run too, and an empty `worktree list` is not proof:
+    `remove` deregisters a tree whose directory survived a shell still inside it."""
+    text = _flat(STEWARD_SKILL.read_text(encoding="utf-8"))
+    assert "run none of it" in text
+    assert "DIRECTORY is gone" in text
+    assert "deregisters" in text
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -886,7 +1124,7 @@ def test_a_done_row_repeating_a_live_rows_id_refuses_as_unreadable(fleet):
 def test_the_steward_fetches_before_the_guard():
     """The squash check reads the LOCAL origin/<base> ref; a stale one refuses a landed tree."""
     text = _flat(STEWARD_SKILL.read_text(encoding="utf-8"))
-    assert "fetch origin <base_branch>" in text
+    assert "fetch origin <base-branch>" in text
     # Pruning refs is agentflow.refs' job (gh#116); the guard needs only a fresh base ref.
     assert "fetch --prune" not in text
 

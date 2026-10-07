@@ -213,8 +213,8 @@ def test_status_without_eta_is_refused_for_every_state_that_declares_a_wake(env,
 
     assert rc == 2, f"expected refusal (2), got {rc}; stderr={err!r}"
     assert "eta_required" in err, err
-    # The message must be ACTIONABLE, not merely correct: five live loops meet this guard the
-    # moment it ships, and an error that only says "no" wedges them instead of telling them
+    # The message must be ACTIONABLE, not merely correct: the five live loops of the time met
+    # this guard the moment it shipped, and an error that only says "no" wedges them instead of telling them
     # what to send. It must name the flag AND carry a usable example value.
     assert "--eta" in err, err
     assert re.search(r"--eta \d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z", err), err
@@ -805,7 +805,7 @@ def test_a_blank_reason_is_refused(env, capsys):
 
 
 def test_a_pipe_in_the_reason_cannot_corrupt_the_table(env, capsys):
-    """The reason lands in a markdown cell read by all six loops."""
+    """The reason lands in a markdown cell read by every loop."""
     capsys.readouterr()
     assert _mark(env, reason="stopped | for the migration") == 2
     assert "inline_only" in capsys.readouterr().err
@@ -872,7 +872,7 @@ def test_standing_down_the_deploy_lock_holder_warns_and_does_not_release_it(env,
     """The one thing stand-down deliberately leaves dangerous.
 
     It does not release the lock, because releasing could step on a half-applied merge -- but the
-    lock serializes every merge for all three builders, so a stood-down holder wedges the fleet
+    lock serializes every merge for every builder, so a stood-down holder wedges the fleet
     with no other signal. The warning is that signal, and a failure it prevents is invisible by
     definition, so prose alone would not hold it.
     """

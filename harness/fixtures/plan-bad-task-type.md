@@ -34,7 +34,8 @@ tasks:
 
 # Toy calc.py single-task plan (BROKEN - bad task type)
 
-Identical to `plan-single-task.md` with task 1's `type` set to a value outside
+Identical to `plan-single-task.md` (minus `project:`; parse-only fixtures are never
+launched) with task 1's `type` set to a value outside
 `{standard, tdd}`. `parse_plan` must hard-fail loudly, naming the offending key,
 rather than warn-and-continue. Used by Scenario C to prove the loud-fail behavior.
 

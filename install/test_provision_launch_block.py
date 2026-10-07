@@ -23,7 +23,7 @@ import provision  # noqa: E402
 
 
 def _closing_output(tmp_path: Path, settings_file: Path) -> str:
-    doctor = mock.Mock(diagnose=lambda *_a: [], render=lambda _d: "(stubbed)\n",
+    doctor = mock.Mock(diagnose=lambda *_a, **_k: [], render=lambda _d: "(stubbed)\n",
                        examined_a_project=lambda _f: False,
                        unexamined_verdict=lambda r, _dir: r)
     steps = [provision.Step(n=5, title="step 5", run=lambda _o: None)]

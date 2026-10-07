@@ -23,6 +23,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from autodoc_graph.adapter import AdapterError
 from autodoc_graph.embedder import OllamaEmbedder
 from autodoc_graph.sqlite_backend import SqliteGraphAdapter
 
@@ -147,10 +148,10 @@ def main(argv: list[str] | None = None) -> int:
 
     adapter = SqliteGraphAdapter(args.db)
     try:
-        adapter.open(args.corpus)
+        adapter.open(args.corpus, create=False)  # an eval run reads; it never makes a corpus
         summary = evaluate(adapter, load_queries(args.queries),
                            embedder=embedder, routing_only=args.routing_only)
-    except QueryError as e:
+    except (QueryError, AdapterError) as e:
         print(f"run_eval FAILED: {e}", file=sys.stderr)
         return 1
     finally:

@@ -37,6 +37,10 @@ export const meta = {
 //                     unit's files but another unit owns, shown read-only; a symbols row
 //                     may carry coveredBy, the one of those pages that cites its file } ],
 //   deletedFiles: [repoRelPath],
+//   checkRecordsCmd: optional — `graph check-records --db <store> --corpus <id>`;
+//                refresh and audit agents append `--records <their file>` and re-run it
+//                until it exits 0, so a bad documents citation is fixed when it is
+//                written rather than refusing `graph records` after the fan-out (gh#465),
 //   auditPages: [ { page: autodocRelPath, source_paths: [repoRelPath], finding?: string } ]
 //                (optional — skill Step 3.7 rolling sample of diff-untouched pages; entries drawn
 //                from a Review Backlog file carry the parked finding text as `finding`;
@@ -51,7 +55,7 @@ const {
   runDir,
   repoPath, autodocPath, repoName, fromSha, toSha, date, taxonomyDocPath,
   changedCommunities, deletedFiles, auditPages, backlogFile, ucAttachments,
-  prompts,
+  prompts, checkRecordsCmd,
 } = (typeof args === 'string' ? JSON.parse(args) : args)  // driver may deliver args stringified (live-smoke 2026-08-07)
 // epic 706: refresh agents emit RECORDS to disk instead of editing the live
 // tree, so a run without a records directory has nowhere to put its output.
@@ -221,6 +225,7 @@ function refreshPrompt(a) {
     symbolCount: a.symbolCount || 0,
     deletedFiles: deletedFiles || [],
     date,
+    checkRecordsCmd: checkRecordsCmd || '',
   })
 }
 
@@ -320,7 +325,15 @@ READ-ONLY to you — the renderer owns that tree, and an edit made there is undo
 render. Do not emit records for index.md / _index.md / overview.md (Reconcile's job; and
 'graph records' rejects a record claiming a reserved basename outright). Never write
 tool-call/XML wrapper syntax (</content>, </invoke>, <parameter, etc.) into a body.
-
+${checkRecordsCmd ? `
+CHECK the file you just wrote, before returning:
+    ${checkRecordsCmd} --records "${recordsPath}"
+Exit 0 means every record is well-formed and every 'documents' citation resolves. A non-zero exit
+prints one PROBLEM line per defect (wrong kind, absent symbol, or a kind never indexed at all).
+Fix every one, rewrite the file, and re-run until it exits 0. A non-zero exit that prints NO
+PROBLEM line is not a defect in your file (a missing store, a wrong corpus, a crash): do NOT re-run
+it. Stop checking, and put "CHECK-RECORDS FAILED: <its error output, verbatim>" first in 'findings'.
+` : ''}
 ${backlogFile ? `BACKLOG BOOKKEEPING: the parked findings above live in ${autodocPath}/${backlogFile}.
 That file is NOT a rendered page and holds no record — it is one of the human-owned files the
 renderer never produces. Report each one you resolved (fixed OR refuted) in 'findings' as

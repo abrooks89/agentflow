@@ -167,7 +167,7 @@ import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .plan_parser import files_section
+from .plan_parser import _read_frontmatter_text, files_section
 
 #: An entry naming one exact path. The only kind whose completeness is decidable.
 FILE = "file"
@@ -227,13 +227,25 @@ def _git(repo: Path, *args: str) -> str:
     not a repository. And an empty stdout from a failed `git diff` is indistinguishable from a
     commit that touched nothing - which would report every declared entry over-declared and
     nothing undeclared, the most confident wrong answer this module can give.
+
+    Decoded as UTF-8 explicitly, not with the locale codec: git writes path bytes as they are
+    stored, and a cp1252 console decode turns a non-ASCII name into one no tree contains.
+    `surrogateescape` keeps a path that is not valid UTF-8 distinct rather than raising.
     """
     proc = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+        ["git", "-C", str(repo), *args], capture_output=True, text=True,
+        encoding="utf-8", errors="surrogateescape", check=False,
     )
     if proc.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed in {repo}: {(proc.stderr or '').strip()}")
     return proc.stdout
+
+
+def _nul_names(out: str) -> tuple[str, ...]:
+    """Split `-z` output into names. Never `splitlines`: without `-z` git C-quotes any path
+    holding a non-ASCII byte, a quote, a backslash, a tab or a newline, and the quoted string
+    names no path in any tree."""
+    return tuple(name for name in out.split("\0") if name)
 
 
 def range_expr(base: str, head: str) -> str:
@@ -318,8 +330,8 @@ def touched_paths(repo: Path, base: str, head: str) -> tuple[str, ...]:
     (`undeclared` is a tuple a report prints and a test pins), so the order is fixed at this
     seam and nowhere else.
     """
-    out = _git(repo, "diff", "--name-only", "--no-renames", range_expr(base, head))
-    return tuple(sorted({line.strip() for line in out.splitlines() if line.strip()}))
+    out = _git(repo, "diff", "--name-only", "-z", "--no-renames", range_expr(base, head))
+    return tuple(sorted(set(_nul_names(out))))
 
 
 def commit_range(sha: str) -> tuple[str, str]:
@@ -343,9 +355,30 @@ class AmbiguousEpicBranch(RuntimeError):
     """
 
 
+class OffConventionEpicBranch(AmbiguousEpicBranch):
+    """A branch carries the epic's id behind a prefix the claim contract does not allow.
+
+    `fix-e0734-x` is plainly about E-0734, and it is not `e0734-<short>`. Returning `None` for it
+    used to send the caller to the declaration with the work sitting on disk unread, and nothing
+    said the fallback had fired: the census that first hit it got the right answer only because
+    that row's declaration happened to match its diff. A naming slip is repaired by renaming the
+    branch, so it refuses and names the branch rather than downgrading to the weaker source.
+
+    A SUBCLASS of `AmbiguousEpicBranch` on purpose. The repair is the same (fix the naming, not
+    the publish) and so is the reader's instruction, so every caller that already refuses on
+    ambiguity refuses here too without learning a fourth answer.
+    """
+
+
 #: `E-0734-gh293-live-seam` -> `0734`; the legacy bare `E-0220` -> `0220`. Digits are taken
-#: VERBATIM - see `epic_branch_prefix` for why they are never re-padded or stripped.
-_EPIC_ID_RE = re.compile(r"^E-(\d+)(?:-|$)", re.IGNORECASE)
+#: VERBATIM - see `epic_branch_prefix` for why they are never re-padded or stripped. ASCII
+#: digits only (gh#1123): `\d` takes any Unicode decimal digit, so an id spelled in Arabic-Indic
+#: digits derived a branch prefix no ASCII-named branch could ever carry.
+_EPIC_ID_RE = re.compile(r"^E-([0-9]+)(?:-|$)", re.IGNORECASE)
+
+#: A branch-name segment on the claim contract for SOME epic (`e0932-...`). Such a name belongs
+#: to that epic even when its slug mentions another one.
+_CONVENTIONAL_LEAF_RE = re.compile(r"^e[0-9]+(?:-|$)", re.IGNORECASE)
 
 
 def epic_branch_prefix(epic_id: str) -> str:
@@ -376,7 +409,7 @@ def epic_branch_prefix(epic_id: str) -> str:
     return f"e{m.group(1)}"
 
 
-def resolve_epic_branch(repo: Path, epic_id: str) -> str | None:
+def resolve_epic_branch(repo: Path, epic_id: str, base: str | None = None) -> str | None:
     """The FULL refname of `epic_id`'s branch in `repo`, or `None` when it has none yet.
 
     `None` IS A THIRD ANSWER AND CALLERS MUST TREAT IT AS ONE. "No branch" and "a branch that
@@ -392,15 +425,60 @@ def resolve_epic_branch(repo: Path, epic_id: str) -> str | None:
 
     WHEN ONE NAME EXISTS ON BOTH SIDES, THE LOCAL REF WINS, and the reason is the fleet's
     topology rather than a general rule: the builders here are worktrees off one checkout, so
-    the local ref is the one their newest commits are on and a remote ref lags it by a push. The
-    residual is stated rather than solved - if the two have genuinely diverged (a lane pushed
-    from a different clone), this reports the local side only and does not merge the ranges.
+    the local ref is the one their newest commits are on and a remote ref lags it by a push.
+    This function still returns ONE ref; a caller that measures the work must not read only it,
+    because the two can genuinely diverge (a lane pushed from a different clone).
+    `epic_touched_paths` reads every live ref of the name and unions them (gh#1065).
 
     A full refname is returned rather than a short one so the answer says WHICH side won and
     cannot later collide with a tag of the same name.
+
+    A LANE NAMESPACE RESOLVES. The match is on the branch name's LAST `/` segment, so
+    `jr2/e0767-x` is E-0767's branch exactly as `e0767-x` is. The two together are two candidates
+    and raise `AmbiguousEpicBranch`, which is the right answer when one epic has two branches.
+
+    ANY OTHER PLACEMENT OF THE ID REFUSES. A name carrying the prefix as a whole token anywhere
+    else (`fix-e0734-x`, `e0734-x/sub`) raises `OffConventionEpicBranch` naming it, even beside a
+    conventional candidate (live ones, given a base; see below): the stray name may be where the work is, so no single answer is a
+    measurement. "Whole token" is bounded on both sides by any character that is not a letter or
+    digit, so `e0734_fix`, `e0734.wip` and `fix-e0734_x` refuse too, while `e07341-...` and
+    `xe0734-...` are still not E-0734's and still resolve to nothing. A name whose last segment
+    is ANOTHER epic's conventional branch is that epic's, never a slip:
+    `e0932-review-e0925-fixes` mentions E-0925 in its slug and must not wedge E-0925's seam read
+    for as long as it lives.
+
+    CASE-INSENSITIVE throughout: `jr2/E0734-x` is E-0734's branch, and a mixed-case slip
+    refuses rather than slipping past to `None`.
+
+    GIVEN `base`, SPENT CANDIDATES DROP OUT BEFORE THE AMBIGUITY COUNT (see `_is_spent`): a
+    leftover branch whose work already reached `base` is not a second claim on the epic, so it
+    neither raises beside a live branch nor resolves on its own - with every candidate spent the
+    answer is `None`. Without `base` nothing is filtered and every conventional candidate counts.
+    Off-convention names take the same filter: given `base`, a spent off-convention leftover (a
+    squash-merged `fix-e0734-x`) drops out, because its work is already in `base` and so the
+    stray name cannot be where the work is; only a LIVE off-convention name refuses. Without
+    `base` every off-convention name refuses, spent or not. A NAME IS SPENT ONLY WHEN EVERY ONE
+    OF ITS REFS IS: a spent local `fix-e0734-x` beside a live `origin/fix-e0734-x` is live, so
+    it still refuses, and a conventional name in the same position still counts. Given `base`,
+    the ref returned is the name's first LIVE ref - the local one when it is live, else the
+    first live remote - since returning a spent local ref would measure the spent copy and
+    leave the live remote work unread. Without `base` the local ref is returned as before.
+    """
+    refs = _epic_branch_refs(repo, epic_id, base)
+    return refs[0] if refs else None
+
+
+def _epic_branch_refs(repo: Path, epic_id: str, base: str | None) -> list[str] | None:
+    """Every ref of `epic_id`'s ONE branch name, local first, or `None` when it has none.
+
+    The resolution `resolve_epic_branch` documents, returning all of the winning name's refs
+    rather than its first: given `base`, only the LIVE ones (spent refs already dropped). Raises
+    exactly as `resolve_epic_branch` does.
     """
     prefix = epic_branch_prefix(epic_id)
-    candidates: dict[str, str] = {}
+    token = re.compile(rf"(?:^|[^a-z0-9]){re.escape(prefix)}(?:[^a-z0-9]|$)", re.IGNORECASE)
+    candidates: dict[str, list[str]] = {}
+    off_convention: dict[str, list[str]] = {}
     for line in _git(repo, "for-each-ref", "--format=%(refname)",
                      "refs/heads", "refs/remotes").splitlines():
         ref = line.strip()
@@ -413,12 +491,28 @@ def resolve_epic_branch(repo: Path, epic_id: str) -> str | None:
             name = "/".join(parts[3:])
         else:
             continue
-        if not name or not (name == prefix or name.startswith(prefix + "-")):
+        if not name:
             continue
-        # Heads are walked before remotes by `for-each-ref`'s own argument order, so the first
-        # writer of a name is the local ref and `setdefault` is what makes local win.
-        candidates.setdefault(name, ref)
+        leaf = name.rsplit("/", 1)[-1].lower()
+        if leaf == prefix or leaf.startswith(prefix + "-"):
+            # `for-each-ref` sorts its output by refname by default, whatever order the
+            # patterns were given in, and `refs/heads/` sorts before `refs/remotes/`, so a
+            # name's first ref is its local one: returned without `base` (local wins), and
+            # with `base` whenever it is live (see `_live`).
+            candidates.setdefault(name, []).append(ref)
+        elif token.search(name) and not _CONVENTIONAL_LEAF_RE.match(leaf):
+            off_convention.setdefault(name, []).append(ref)
 
+    if base is not None:
+        off_convention = _live(repo, base, off_convention)
+        candidates = _live(repo, base, candidates)
+    if off_convention:
+        raise OffConventionEpicBranch(
+            f"{epic_id} is carried by off-convention branch name(s) in {repo}: "
+            + ", ".join(sorted(set(off_convention) | set(candidates)))
+            + f" - the claim contract names the branch {prefix}-<short>; rename it rather than "
+            "reading the declaration in its place"
+        )
     if not candidates:
         return None
     if len(candidates) > 1:
@@ -427,6 +521,51 @@ def resolve_epic_branch(repo: Path, epic_id: str) -> str | None:
             + ", ".join(sorted(candidates)) + " - refusing to guess which one is the epic's"
         )
     return next(iter(candidates.values()))
+
+
+def _live(repo: Path, base: str, names_to_refs: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Each name's LIVE refs, order kept; a name drops out only when EVERY ref of it is spent.
+
+    Judging a name by its first (local) ref alone would let a spent local copy hide live work
+    on a remote ref of the same name, and the name would drop out unread - a fail-open. Spent
+    refs are removed from a surviving name too, so the ref the caller reads is a live one.
+    """
+    live = {n: [r for r in refs if not _is_spent(repo, base, r)]
+            for n, refs in names_to_refs.items()}
+    return {n: refs for n, refs in live.items() if refs}
+
+
+def _is_spent(repo: Path, base: str, ref: str) -> bool:
+    """True when `ref` holds no work that `base` lacks. Local git only, no network.
+
+    SPENT is either of two facts. `ref` has no commits off `base` (cut and never committed, or
+    merged with a merge commit), or every path `ref` touched off the merge base already has the
+    same content in `base` - which is what a squash merge leaves behind, since the squashed
+    commit carries the branch's bytes but none of its commits. A path the branch deleted counts
+    as reached when `base` lacks it too. The comparison is one tip-to-tip diff intersected with
+    the touched paths, so a path only `base` changed is never consulted - and no path is ever
+    passed on the command line, where a large branch would overrun the Windows length limit.
+
+    TIP TO TIP, SO SPENT IS NOT PERMANENT. Once `base` edits one of a merged leftover's paths
+    again, the tips differ there and the leftover reads as live; delete merged branches rather
+    than relying on this to ignore them.
+
+    Spent means "read the declared `## Files`", never "the seam is free". And only commits are
+    measured: uncommitted changes in a lane's worktree are invisible here either way.
+
+    A branch with commits that touched NO path is NOT spent. Containment of an empty set is
+    vacuous, and calling it spent would erase the `()` answer `epic_touched_paths` keeps for
+    "commits exist and none touched a path". A branch whose content only partly reached `base`
+    is not spent either: the paths that did not are still live work.
+    """
+    _, ahead = range_commits(repo, base, ref)
+    if ahead == 0:
+        return True
+    touched = touched_paths(repo, base, ref)
+    if not touched:
+        return False
+    differing = _nul_names(_git(repo, "diff", "--name-only", "-z", "--no-renames", base, ref))
+    return not set(differing) & set(touched)
 
 
 def epic_touched_paths(repo: Path, base: str, epic_id: str) -> tuple[str, ...] | None:
@@ -444,12 +583,33 @@ def epic_touched_paths(repo: Path, base: str, epic_id: str) -> tuple[str, ...] |
     caller that cannot tell those apart would read an unstarted epic as one that touches
     nothing and publish straight through its seam.
 
-    Propagates `AmbiguousEpicBranch` rather than degrading to `None` - see that exception.
+    A SPENT BRANCH IS ALSO `None`, not `()` - one with no commits off `base`, or one whose every
+    touched path already has the same content in `base` (see `_is_spent`). The fleet cuts its
+    branch first and commits when a slice is green, so a live branch can sit at `base`'s commit
+    for hours while the lane edits a worktree; and a leftover branch whose work was merged
+    (merge commit or squash) holds nothing `base` lacks. Neither diff is evidence about the
+    seam, and `()` would tell a publisher the seam is free in exactly the window it is occupied.
+    So `()` keeps one meaning - commits exist and none touched a path - and a spent branch reads
+    the declaration the same way an absent one does. Spent candidates are dropped inside
+    `_epic_branch_refs`, before its ambiguity count, so a merged leftover beside the live
+    branch does not raise - until `base` changes one of the leftover's paths again, when it
+    reads as live (see `_is_spent`); delete merged leftover branches.
+
+    EVERY LIVE REF OF THE NAME IS READ, AND THEIR PATHS ARE UNIONED (gh#1065). A local ref and a
+    remote ref of one branch name are one candidate, but they are not always one history: a lane
+    that pushed from another clone leaves them diverged, and reading the local ref alone left
+    the remote's paths out of the seam - narrower than the real work, the same fail-open E-1052
+    closed for a spent local ref. The union can only widen the seam, never narrow it, which is
+    the safe direction for a seam read. Spent refs are already gone (see `_epic_branch_refs`),
+    so a merged leftover copy contributes nothing, as before.
+
+    Propagates `AmbiguousEpicBranch` (and its `OffConventionEpicBranch` subclass) rather than
+    degrading to `None` - see those exceptions.
     """
-    branch = resolve_epic_branch(repo, epic_id)
-    if branch is None:
+    refs = _epic_branch_refs(repo, epic_id, base)
+    if refs is None:
         return None
-    return touched_paths(repo, base, branch)
+    return tuple(sorted({p for ref in refs for p in touched_paths(repo, base, ref)}))
 
 
 def _tree(repo: Path, rev: str) -> tuple[frozenset[str], frozenset[str]]:
@@ -460,8 +620,7 @@ def _tree(repo: Path, rev: str) -> tuple[frozenset[str], frozenset[str]]:
     bare mention that names no repo-relative path at all).
     """
     files = frozenset(
-        line.strip() for line in _git(repo, "ls-tree", "-r", "--name-only", rev).splitlines()
-        if line.strip()
+        _nul_names(_git(repo, "ls-tree", "-r", "--name-only", "-z", rev))
     )
     dirs = set()
     for f in files:
@@ -1044,8 +1203,10 @@ def main(argv=None) -> int:
 
     spec_path = Path(args.spec).expanduser()
     try:
-        text = spec_path.read_text(encoding="utf-8")
-    except OSError as exc:
+        # The same utf-8-sig read plan_parser and epic_survey use: a BOM left in the text hides a
+        # `## Files` heading on line 1, and the readers would disagree on the same bytes.
+        text = _read_frontmatter_text(spec_path)
+    except (OSError, UnicodeDecodeError) as exc:
         print(f"could not read spec: {exc}")
         return 2
 

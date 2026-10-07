@@ -7,11 +7,14 @@ contention.
 """
 
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from agentflow import config
 from agentflow.lock_file import LockHeldError
 from agentflow.use_case_id import allocate
 
@@ -139,3 +142,95 @@ def test_acquire_times_out_when_lock_held(tmp_path: Path, monkeypatch) -> None:
 
     with pytest.raises(LockHeldError):
         allocate(tmp_path, 1, epic_slug="e", titles=["t"], date="d")
+
+
+# --- The mint command documented in refine/SKILL.md -------------------------------------------
+#
+# THE DEFECT. The documented command pasted `<data_root>/projects/<name>` into an ordinary Python
+# string inside a `python -c "..."` shell argument. A Windows data root carries `\U` (a unicode
+# escape) and `\n`, so the command failed to compile or wrote to a mangled path; and an apostrophe
+# in a title closed the single-quoted literal. WHAT THIS PINS: the command is a quoted python
+# heredoc, and its body -- filled in the way a seat fills it -- compiles and, run against a
+# backslash data root and hostile titles, allocates into the resolved project's registry with the
+# titles verbatim. WHAT IT CANNOT PROVE: that a seat copies the command rather than retyping it.
+
+_SKILL_NAME = "refine"  # a skill directory, not a data-root bucket
+_REFINE_SKILL = Path(__file__).resolve().parents[2] / _SKILL_NAME / "SKILL.md"
+_FENCE = re.compile(r"^```[^\n]*\n(.*?)^```[ \t]*$", re.S | re.M)
+_HEREDOC = re.compile(r"<<'PY'[^\n]*\n(.*?)^PY[ \t]*$", re.S | re.M)
+_PLACEHOLDER = re.compile(r"<([^<>\n]+)>")
+
+_NAME = "agentflow"
+_EPIC = "some-epic"
+_DATE = "2026-01-02"
+#: Two titles: an apostrophe, double quotes, `\U`/`\n` escapes, and a trailing backslash.
+_TITLES = ["It's the seat's C:\\Users\\new story", 'A "quoted" title ending in \\']
+
+
+def _mint_command() -> str:
+    """The one fenced block in refine/SKILL.md that calls the allocator."""
+    text = _REFINE_SKILL.read_text(encoding="utf-8")
+    blocks = [b for b in _FENCE.findall(text) if "use_case_id import allocate" in b]
+    assert len(blocks) == 1, (
+        f"expected exactly one fenced mint command in refine/SKILL.md, found {len(blocks)}"
+    )
+    return blocks[0]
+
+
+def _python_source(command: str) -> str:
+    """What python receives: a quoted heredoc's body is passed through byte for byte."""
+    m = _HEREDOC.search(command)
+    return m.group(1) if m else command
+
+
+def _fill(src: str, data_root: str) -> str:
+    def value(m: re.Match) -> str:
+        ph = m.group(1)
+        if ph == "name":
+            return _NAME
+        if ph == "epic-slug":
+            return _EPIC
+        if ph == "YYYY-MM-DD":
+            return _DATE
+        if "data_root" in ph:
+            return data_root
+        return "\n".join(_TITLES)
+
+    return _PLACEHOLDER.sub(value, src)
+
+
+def test_refine_mint_command_is_a_quoted_python_heredoc() -> None:
+    """Quoted delimiter, so the shell expands nothing and an apostrophe closes no quote."""
+    command = _mint_command()
+    assert _HEREDOC.search(command), (
+        "refine/SKILL.md's mint command is not a `python - <<'PY'` heredoc; a title or data root "
+        f"pasted into a shell argument breaks on an apostrophe or a backslash:\n{command}"
+    )
+
+
+def test_refine_mint_command_compiles_with_a_windows_root_and_hostile_titles() -> None:
+    src = _fill(_python_source(_mint_command()), r"C:\Users\you\newroot\agentflow")
+    try:
+        compile(src, "<refine mint command>", "exec")
+    except SyntaxError as exc:
+        pytest.fail(
+            f"refine/SKILL.md's mint command does not compile once filled in ({exc.msg}). Build "
+            f"the root in code from config and hold titles in a raw triple-quoted string.\n{src}"
+        )
+
+
+def test_refine_mint_command_allocates_into_the_resolved_projects_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    # Backslash separators: real directories on Windows, one backslash-laden name on Linux.
+    # Either way a non-raw literal would read `\U` and `\n` as escapes.
+    data_root = f"{tmp_path}\\Users\\new\\agentflow"
+    monkeypatch.setattr(config, "load_environment", lambda: SimpleNamespace(data_root=data_root))
+    src = _fill(_python_source(_mint_command()), data_root)
+    exec(compile(src, "<refine mint command>", "exec"), {"__name__": "mint"})
+
+    assert capsys.readouterr().out.strip() == str(["UC-0001", "UC-0002"])
+    project_root = Path(data_root) / "projects" / _NAME
+    rows = _read_registry(project_root)
+    assert [r["title"] for r in rows] == _TITLES, "titles were altered on the way in"
+    assert {(r["epic"], r["minted"]) for r in rows} == {(_EPIC, _DATE)}

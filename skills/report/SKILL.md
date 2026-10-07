@@ -108,9 +108,9 @@ instance, which are the second half of the section that comes first.
 
 | section | render |
 |---|---|
-| `blocked` | `.questions` (each `.qid .age .urgency .raised_by .question`), `.blockers` (each `.bid .owner .work .description`), **`.stranded` whenever non-empty** (each `.agent .waiting_on .reason .fix`), `.drafted_awaiting_promotion` + `.drafted_slugs`, `.scan` |
-| `decided` | `.questions` (each `.qid .question .answer .answered_by .answered_at`), `.windowed`, `.window_start` |
-| `intake` | `.available` + `.reason`, **`.untriaged_count` AND `.selectable_count` together**, `.fix_claimed_count` beside them (open issues a merged PR or done spec claims fixed; print `.fix_claims_note` whenever it is non-empty, in place of the number when the count is `None`), `.untriaged`, `.selectable`, **`.awaiting_count` + `.awaiting` whenever non-zero** (bugs labelled `needs-decision`: a human call is owed before they are build work), `.capped` (+ `.limit`) |
+| `blocked` | `.questions` (each `.qid .subject .age .urgency .raised_by .question`), `.blockers` (each `.bid .subject .owner .work .description`), **`.stranded` whenever non-empty** (each `.agent .waiting_on_label .reason .fix`), `.drafted_awaiting_promotion` + `.drafted_slugs`, `.scan` |
+| `decided` | `.questions` (each `.qid .subject .question .answer .answered_by .answered_at`), `.windowed`, `.window_start`, **`.partial_note` whenever non-empty** (the window was not read whole; with no rows it replaces the empty-section line) |
+| `intake` | `.available` + `.reason`, **`.untriaged_count` AND `.selectable_count` together** (+ `.selectable_note` beside them whenever non-empty: the count is label-only), `.fix_claimed_count` beside them (open issues a merged PR or done spec claims fixed; print `.fix_claims_note` whenever it is non-empty, in place of the number when the count is `None`), `.untriaged`, `.selectable`, **`.awaiting_count` + `.awaiting` whenever non-zero** (bugs labelled `needs-decision`: a human call is owed before they are build work), `.capped` (+ `.limit`) |
 | `work` | **`.approved_claimable` AND `.claimable_now` together**, `.in_progress` (each `.slug .eta .lane`), `.parked_count`, **`.published_unclaimed` whenever non-empty** (each `.name .lane .kind`), **`.claim_ambiguous` + `.claim_note` whenever non-empty**, `.drafted_count`, `.shipped` + `.shipped_note`, `.scan`, **`.seam_blocked` AND `.seam_unknown_count` together**, `.seam_unknown_holders`, `.seam_partial`, `.seam_note` |
 | `lanes` | `.lanes` (Step 7), `.live_count .halted_count .reaped_count .silent_count **.dry_count .blocked_count .stood_down_count**`, **`.production_available` + `.production_window` + `.production_unattributed`** (Step 7) |
 | `health` | `.inert_promotions` (each with its `.reason`) + `.inert_count`, `.out_of_vocabulary` + `.out_of_vocabulary_count`, `.deploy_lock`, `.directives` + `.directive_count`, `.registry_bytes`, **`.notes_live`/`.notes_struck` (Step 7a)**, `.halt_events`, `.reap_events`, `.worktrees`, `.branches`, `.scan` |
@@ -201,28 +201,32 @@ cannot drift between the artifact, the vault page and the push.
 **Extend WORK; never add a ninth section.** The order above is locked at eight. Bugs are straightforwardly work, and they belong in the section named
 WORK.
 
-Bugs reach builders - `builder_selectable` is `triaged`, not `epic`, not `needs-decision`, and
-not `in-progress`, lead-dev picks from it - but without this a reader sees `20 untriaged / 3
-selectable` in INTAKE and still not *"three bugs are being worked right now"*. INTAKE counts what is waiting
-at the door; WORK shows what is being carried.
+Bugs reach builders - `builder_selectable` is `triaged`, not `epic`, not `needs-decision`, not
+`in-progress`, and not held on the board, lead-dev picks from it - but without this a reader sees
+`20 untriaged / 3 selectable` in INTAKE and still not *"three bugs are being worked right now"*.
+INTAKE counts what is waiting at the door; WORK shows what is being carried. INTAKE's selectable
+is the same set the `selectable` CLI prints and `work.bug_claimable` holds, over the same board.
+When the registry was not read, no held set was subtracted: `intake.selectable_note` then says the
+count is label-only, and is printed beside it.
 
 The four bug columns mirror the four epic states one for one, so the two read as one table rather
 than a table with an appendix:
 
 | epic state | bug field | means |
 |---|---|---|
-| claimable | `work.bug_claimable` | `triaged`, not `epic`, not `needs-decision`, nobody building it |
-| in progress | `work.bug_in_progress` | a `gh#N` named in a CLAIMED registry row, or the issue carrying `in-progress` |
+| claimable | `work.bug_claimable` | `triaged`, not `epic`, not `needs-decision`, not held - the set `issue_intake selectable` prints |
+| in progress | `work.bug_in_progress` | held: published to a lane or being built - a `gh#N` in the work item of a non-terminal Queue row or in an Agents row, or the issue carrying `in-progress` |
 | drafted | `work.bug_untriaged_count` | exists, cannot start yet |
 | shipped | `work.bug_shipped` | closed since the last report |
 
-**`work.bug_in_progress` honours both claim routes: the registry's own claims AND the
-`in-progress` marker on the issue.** A label is a second place to update and the copy is what
-goes stale, which is why the registry claim stays the *record* of who is building what. But
-`builder_selectable` is handed issues and nothing else, so a marker is the only thing that can
-stop a selector offering an issue someone already holds. The registry claim is the record; the
-marker is the gate. Reading only one of them is what would make the two disagree, because the
-selector already excludes the marker either way.
+**`work.bug_in_progress` is the held set, and the board is the gate.** An issue is held when its
+`gh#N` appears in the work item of a Queue row that is not `done` or `withdrawn` - claimed or
+still `ready`, because a published row has already handed its work out - or in an Agents row.
+Notes do not count. `issue_intake.held_refs` defines this once, and the `selectable` CLI, the bug
+mirror and this column all read it, so the three cannot disagree: a held bug is off the build
+list and still visible here. The `in-progress` marker on the issue is honoured beside it, but no
+loop runs `claim`/`release`, so nothing writes it on its own; lead-dev's own publish is what
+takes an issue off the list.
 
 **When `work.bug_note` is non-empty, print it and do not print zeros.** It carries INTAKE's reason
 - an unreachable tracker, no tracker configured - and *"no open bugs"* is a different fact from
@@ -230,8 +234,8 @@ selector already excludes the marker either way.
 section later.
 
 **When the registry could not be read, `work.bug_claimable` is empty and the selectable bugs are in
-`work.bug_claim_ambiguous` instead.** Only the `in-progress` marker was checked, so a bug a lane
-holds through a registry row alone cannot be told from a free one. `work.bug_note` says so; print
+`work.bug_claim_ambiguous` instead.** Only the `in-progress` marker was checked, so a bug held on
+the board alone cannot be told from a free one. `work.bug_note` says so; print
 the list beside it, as `claim_ambiguous` is printed for epics.
 
 ## Step 2b — WORK must NAME the no-work condition
@@ -295,10 +299,11 @@ stopped.
 **`work.published_unclaimed` is the state beside it, for epics and bugs alike.** A `ready`
 Queue row whose `claimed_by` is `-` has published its work into one builder's lane, and only that
 lane's owner may take it. It is not claimable now (lead-dev can neither select nor republish it),
-and nobody is building it yet, so it folds into neither number: it is out of `claimable_now` and
-`work.bug_claimable`, and lead-dev's LANES why never counts it as startable. Print each row with
-its `.lane`. The no-work sentence stays silent while this is non-empty, because work waiting in a
-lane is not an empty board. A published row whose id names more than one approved epic lands in
+and nobody is building it yet: it is out of `claimable_now` and `work.bug_claimable`, and
+lead-dev's LANES why never counts it as startable. An epic row folds into neither number; a bug
+row is also in `work.bug_in_progress`, whose held set is "published to a lane or being built".
+Print each row with its `.lane`. The no-work sentence stays silent while this is non-empty,
+because work waiting in a lane is not an empty board. A published row whose id names more than one approved epic lands in
 `claim_ambiguous` instead, by the same rule a claim follows.
 
 **WORK's bug totals count every selectable bug, not the rows INTAKE rendered.** `.total` on each
@@ -343,7 +348,7 @@ there is worse than no signal at all, and the cap is the COMMON case rather than
 the default is 10 rows.
 
 **This is REPORTED, NEVER ENFORCED, and the distinction is deliberate.** Nothing here relaxes
-seam disjointness or lets a lane build into an occupied seam: three builders in one seam produce
+seam disjointness or lets a lane build into an occupied seam: builders sharing one seam produce
 merge conflicts even with worktrees. The rule is right; this gives it a channel.
 
 **The signal UNDER-reports by construction.** Paths match as exact strings, so a directory named
@@ -364,12 +369,28 @@ Numbers still belong where they are the real identifier: **tracker issues** (`#5
 ids** (`Q-0009`, `B-0001`), **commits and PRs**. Those have no slug. Epics have one — use it. The
 collector already enforces this in its row types; do not reintroduce a number when you render.
 
-**But a bare number is unreadable whether or not it is the correct identifier**, which is the point
-the exemption above misses. **INTAKE renders `#N` AND the issue title, in the untriaged, the
-selectable and the awaiting-a-decision lists.** The data is already there — the rows are `issue_intake.Issue` objects
-carrying `.title` — so this costs nothing but the decision to print it. The general form:
+**But a bare number is unreadable whether or not it is the correct identifier.** Being the
+identifier earns a number its place; it does not excuse it from carrying a name. The general form:
 *the identifier and the human-readable name are different jobs, and a surface a human reads needs
-both.*
+both.* So:
+
+- **Tracker issues: `#N` AND the issue title**, everywhere the report prints one — INTAKE's
+  untriaged, selectable and awaiting-a-decision lists (the rows are `issue_intake.Issue` objects
+  carrying `.title`) and CHANGED SINCE's triaged numbers (`str(report.changed_since.named(n))`).
+- **Registry ids: the `Q-` / `B-` id plus a 3-6 word subject** (shorter only when the question
+  itself is) — `Q-0009 (Which repo does the auditor ground)`, never a bare `Q-0009`. The
+  collector derives the subject from the row's own text, its first words, and hands it over
+  beside the id: `QuestionRow.subject`, `BlockerRow.subject`, `DecidedRow.subject`,
+  `report.changed_since.named(qid)` for CHANGED SINCE, `LaneRow.resume_label` plus the
+  why-string for a halted lane, and `StrandedLaneRow.waiting_on_label` for BLOCKED ON YOU. Print what it gives you; do not
+  write a subject of your own. When the id is not on the board the collector says so in words —
+  `Q-0042 (no subject: not on the board)` — and that marker is printed as it is, never trimmed
+  back to the bare id.
+- **Commits and PRs: the sha or the number alone.** Here the number IS the identifier and no name
+  exists to pair with it.
+- **The Ntfy push is the one shorter form**: the lead id carries its subject and the tail of the
+  list rides as bare ids, because the push is length-sensitive and is a pointer into the report,
+  not the record (Step 5c).
 
 ## Step 4 — THE HARD RULE: never report a count without its skip count
 
@@ -414,7 +435,13 @@ Load `artifact-design` first (the Artifact tool requires it), then publish the p
   `report.changed_since.note` verbatim when it is set: with no prior it says
   **"first report - no prior to diff"** and you must not silently render the whole corpus as new;
   when nothing moved it says **"nothing changed since <stamp>"**, which is a real and useful
-  sentence the report can now *demonstrate* rather than assert.
+  sentence the report can now *demonstrate* rather than assert. It can also carry a
+  **"window partial: ..."** sentence beside a non-empty section, when part of the window could
+  not be read (for example an unreadable `registry-log.md`); render that too, never drop it.
+- **Every question id and triaged issue number in CHANGED SINCE prints as
+  `str(report.changed_since.named(x))`** — `Q-0012 (Which repo should the auditor ground)`,
+  `#51 (report omits archived epics)`. The id tuples stay bare because the next report diffs
+  against them; the names ride beside them in `changed_since.names` (Step 3).
 - **`changed_since.questions_retracted` gets its own line, never folded into "answered".** A
   retraction is a question its RAISER withdrew because the premise collapsed; nothing was
   decided. Rendered as an answer it would credit a decision nobody made, and omitted entirely the
@@ -490,6 +517,9 @@ from agentflow.ntfy import TriggerType, notify, to_ascii
 - **One line per fact, and a skip reason is one fact.** `SkippedFile.reason` is already folded to
   a single line by the collector; do not re-expand it.
 - **It ends with the single next action** — one imperative line, not a list.
+- **The lead id carries its subject; the tail rides as bare ids.** Name the one that blocks, as
+  Step 3 says, and let the rest of the list be ids: three subjects push the next action off the
+  end of the notification, and the report the push links to carries every subject.
 - Prefix with the resolved `<name>` from Step 0, not the session default. A push naming the wrong
   fleet sends the human to the wrong registry.
 
@@ -497,7 +527,7 @@ from agentflow.ntfy import TriggerType, notify, to_ascii
 question that is answered, applied or retracted, a blocker already resolved, an id that exists
 nowhere, or no id at all. The classifier is the one behind `registry read --stranded`, so the two
 never disagree. Nothing will ever answer such a lane, so it waits on you: print one row per lane
-with `.agent`, `.waiting_on`, `.reason` and `.fix` (relaunch or apply for a closed referent, a new
+with `.agent`, `.waiting_on_label`, `.reason` and `.fix` (relaunch or apply for a closed referent, a new
 question or a resume for a retracted one, repair for a missing id). The lane still counts as
 HALTED in LANES, and its why-string names the same reason and fix. A lane halted on a live open
 question is not listed here; its question already is.
@@ -508,12 +538,12 @@ a quiet report does not buzz like an alarm. Shape:
 
 ```
 <name> fleet report 2026-09-01T14:20Z
-blocked: 2 questions, oldest 3d1h - Q-0012 Q-0015
+blocked: 2 questions, oldest 3d1h - Q-0012 (Which repo should the auditor ground) Q-0015
 intake: 20 untriaged / 0 selectable
 work: 3 claimable, 1 running, 0 shipped since last report
-lanes: 2 live, 3 halted, 1 reaped, 0 silent, 0 stood down
+lanes: 3 live, 2 dry, 1 blocked, 0 halted, 0 reaped, 1 silent, 0 stood down
 skipped: 4 files the survey could not parse
-next: answer Q-0012
+next: answer Q-0012 (Which repo should the auditor ground)
 ```
 
 ### 5d. Chat — the link and the headline, nothing else
@@ -592,9 +622,10 @@ every crossing**, each as `<metric>: <now> (threshold <threshold>) — <directio
 - **`note_backlog` is the one to read first when it is over.** Live coordination Notes are
   drained by every seat striking what it consumed, so a standing backlog is not a busy fleet —
   it is a channel nobody is reading, and every routed finding in it is unread.
-- **Do not fold these into `changed_since.note`.** That field is set only when NOTHING changed,
-  so it is guaranteed empty on exactly the reports where a crossing exists. A renderer that
-  prints only `.note` prints nothing about health, forever.
+- **Do not fold these into `changed_since.note`.** That field carries only the no-prior,
+  nothing-changed and window-partial sentences, so on the reports where a crossing exists it is
+  empty or about something else. A renderer that prints only `.note` prints nothing about health,
+  forever.
 
 ## Step 7 — LANES renders as a diagram, not a table
 
@@ -614,6 +645,9 @@ styling preferences:
 - **Reaped ages out: burnt orange for the first 24h, grey after.** "Recent death is actionable; a
   week-old one is history and must stop competing for attention." `LaneRow.reaped_recent` picks the
   class.
+- **A halted node prints `LaneRow.resume_label`, not `resume_condition`.** The label is the same
+  `waiting_on` with a subject beside every `Q-` / `B-` id in it (Step 3); `resume_condition` is the
+  raw cell, kept for machines. Free text such as `gate green` names no id and comes back unchanged.
 - **Ages render in the node.** No separate table to cross-reference. `LaneRow.beat` is the
   formatted heartbeat age.
 - **Report the silent count explicitly** — `report.lanes.silent_count`, in a line beside the
@@ -621,7 +655,9 @@ styling preferences:
   categories exist beside it. Report `.dry_count` and `.blocked_count` in the same line: a seat with nothing to do
   is not a seat that is failing, and the two counts read very differently side by side. Report
   `.stood_down_count` there too: a lane a human stopped is counted nowhere else, and a paused fleet
-  must read as paused rather than as a fleet with nothing live.
+  must read as paused rather than as a fleet with nothing live. All seven counts go on ONE line,
+  in this order, and the Step 5c push carries the same line so the two never diverge:
+  `lanes: 3 live, 2 dry, 1 blocked, 0 halted, 0 reaped, 1 silent, 0 stood down`.
 - **PRODUCTION GOES IN THE NODE, BESIDE THE LIVENESS STAMP, AND IT IS NOT OPTIONAL.** Every
   other thing in this node answers *is it alive*. `LaneRow.merged_in_window` is the only one
   that answers *is it producing*, and a lane green on liveness and zero on production across
@@ -654,18 +690,20 @@ lane:
 ```mermaid
 %% source: <data_root>/projects/<name>/status/registry.md (## Agents table)
 flowchart TD
-    AU["auditor<br/>HALTED 13:14Z &middot; beat 1h51m<br/>holds: -<br/>waiting on Q-0009"]:::halted
+    AU["auditor<br/>HALTED 13:14Z &middot; beat 1h51m<br/>holds: -<br/>waiting on Q-0009 (Which repo does the auditor ground)"]:::halted
     ST["steward<br/>DRY &middot; beat 15m<br/>holds: -<br/>drained inbox, not idleness<br/>shipped: not measured here"]:::dry
     DM["dev-manager<br/>LIVE &middot; beat 1m<br/>holds: -<br/>shipped: not measured here"]:::live
     LD["lead-dev<br/>HALTED 13:12Z &middot; beat 1h56m<br/>holds: fleet-report<br/>resume: gate green<br/>shipped: 0"]:::halted
     J1["jr-dev-1<br/>REAPED 06:42Z &middot; 8h23m ago<br/>holds: -<br/>relaunch it"]:::reapedfresh
     J2["jr-dev-2<br/>SILENT &middot; beat unknown<br/>holds: intake-triage<br/>no heartbeat - diagnose"]:::silent
+    J3["jr-dev-3<br/>LIVE &middot; beat 2m<br/>holds: -<br/>shipped: 0"]:::live
 
     AU -->|escalates to| DM
     ST -->|escalates to| DM
     DM -->|promotes epics to| LD
     LD -->|publishes rows to| J1
     LD -->|publishes rows to| J2
+    LD -->|publishes rows to| J3
 
     classDef live fill:#1d6f4f,stroke:#2f9e6e,stroke-width:2px,color:#ffffff
     classDef halted fill:#7a5410,stroke:#c08a2e,stroke-width:2px,color:#ffffff
@@ -683,12 +721,14 @@ table had no fill for; a state with no class renders in the default grey-white, 
 neither alarming nor reassuring and is indistinguishable from a diagram that failed to style. The
 DRY fill is deliberately cool and quiet: nothing is wrong with a dry lane.
 
-**The topology above is the six known loops. A registry row for anything else still gets a node** —
+**The topology above is the seven known loops. A registry row for anything else still gets a node** —
 draw it unattached rather than dropping it, and say in the section that it is off the escalation
 topology. A lane the report does not draw is a lane nobody looks at.
 
-Escape the node text: `|` and `"` break a Mermaid label, and epic titles and `waiting_on` cells
-carry both. Truncate `why` to one short clause — the full text belongs in the section prose.
+Escape the node text: `|` and `"` break a Mermaid label, and epic titles, issue titles,
+registry subjects and `waiting_on` cells can carry them. Truncate `why` to one short clause — the
+full text belongs in the section prose — but never cut inside an id's parenthesised subject or
+marker: a halted node prints `resume_label` on its own line, whole, as the example node does.
 
 **Pre-flight is mandatory.** Never embed unvalidated Mermaid:
 
@@ -783,13 +823,21 @@ State these honestly rather than rendering an empty column as if it were a measu
 - **Every DECIDED row names the seat that decided it.** DECIDED carries every delegated answer,
   `answered_by: steward` and `answered_by: dev-manager` alike, and never `answered_by: human`.
   Print `.answered_by` on each row so the human can tell a steward decision from a dev-manager one.
+- **DECIDED reads the cull log as well as the board.** The steward culls an applied question to
+  `registry-log.md` within hours, so a windowed DECIDED (and CHANGED SINCE's answered and applied
+  lines) includes every question in that log answered at or after `.window_start`, deduped against
+  the live board by id. When `report.decided.partial_note` is non-empty the log could not be read
+  whole: print the note whenever it is non-empty, beside the rows when there are any and in place
+  of the empty-section line when there are none, never `no delegated decisions`.
 
 ## Run checklist
 
 - [ ] Project resolved from the argument, not assumed from the session default
 - [ ] ONE `collect()` call; no renderer re-read the registry, the survey or the tracker
 - [ ] All eight sections present, in the locked order, empties included
-- [ ] Every epic named by slug; numbers only on issues, registry ids, commits, PRs
+- [ ] Every epic named by slug; `#N` plus the issue title; `Q-` / `B-` ids plus a 3-6 word
+      subject (the Ntfy lead id carries its subject, the tail rides as bare ids); bare numbers
+      only on commits and PRs
 - [ ] `counted N, skipped M` on every scan-derived number — WORK, BLOCKED, HEALTH and the
       registry's own scan; non-zero skip rendered as a WARNING; skipped files named and not
       truncated

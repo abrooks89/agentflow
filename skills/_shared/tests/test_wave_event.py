@@ -164,3 +164,99 @@ def test_a_valid_note_still_lands(tmp_path):
         wave_event.main(["note", "--status", str(path), "--task", "2", "--summary", "hello"]) == 0
     )
     assert read_status(path).decisions[-1].summary == "hello"
+
+
+_REAL_UNLINK = Path.unlink
+
+
+def test_a_landed_write_whose_lock_release_fails_exits_0_with_a_warning(
+    tmp_path, capsys, monkeypatch
+):
+    """gh#912: a peer holding the lock open on Windows must not turn a landed write into a
+    failure - callers re-issue failed writes, so exit 1/2 here would duplicate it."""
+    from agentflow import lock_file
+
+    path = _board(tmp_path)
+    lock = Path(str(path) + ".wave-event.lock")
+    monkeypatch.setattr(lock_file, "_RELEASE_RETRY_TIMEOUT", 0.05)
+
+    def deny(self, *args, **kwargs):
+        if self == lock:
+            raise PermissionError(32, "The process cannot access the file", str(self))
+        return _REAL_UNLINK(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny)
+    assert wave_event.main(_task_state(path, "--state", "code_review")) == 0
+    err = capsys.readouterr().err
+    assert "wave-event warning: write landed; lock release failed" in err
+    assert str(lock) in err
+    assert read_status(path).tasks[1].state == "code_review"
+
+
+def test_a_clean_write_prints_no_warning(tmp_path, capsys):
+    path = _board(tmp_path)
+    assert wave_event.main(_task_state(path, "--state", "code_review")) == 0
+    assert capsys.readouterr().err == ""
+    assert not Path(str(path) + ".wave-event.lock").exists()
+
+
+def test_a_delete_pending_lock_on_acquire_is_waited_out(tmp_path, monkeypatch):
+    """On Windows a just-released lock a peer still has open refuses every open with
+    PermissionError until the peer closes it; that is contention, not a failed write."""
+    from agentflow import lock_file
+
+    real_acquire = lock_file.acquire
+    calls = {"n": 0}
+
+    def flaky(lock_path):
+        if calls["n"] < 2:
+            calls["n"] += 1
+            raise PermissionError(5, "Access is denied", str(lock_path))
+        return real_acquire(lock_path)
+
+    monkeypatch.setattr(lock_file, "acquire", flaky)
+    path = _board(tmp_path)
+    assert wave_event.report_note(path, task=1, summary="hi") is True
+    assert calls["n"] == 2
+
+
+def test_a_landed_write_whose_lock_was_taken_over_exits_0_with_a_warning(
+    tmp_path, capsys, monkeypatch
+):
+    """The lock no longer being ours is an unclean release too, never a failed write."""
+    from agentflow import lock_file
+
+    path = _board(tmp_path)
+    lock = Path(str(path) + ".wave-event.lock")
+    real_write_status = wave_event.write_status
+
+    def write_then_lose_the_lock(*args, **kwargs):
+        real_write_status(*args, **kwargs)
+        lock.write_text("PID=1\nNONCE=someone-else\n", encoding="utf-8")
+
+    monkeypatch.setattr(wave_event, "write_status", write_then_lose_the_lock)
+    assert wave_event.main(_task_state(path, "--state", "code_review")) == 0
+    err = capsys.readouterr().err
+    assert "the lock was no longer ours" in err
+    assert "wave-event warning: write landed; lock release failed" in err
+    assert read_status(path).tasks[1].state == "code_review"
+    assert lock_file.read_lock(lock).nonce == "someone-else"
+
+
+def test_a_lock_that_stays_unopenable_is_a_timeout_not_a_traceback(
+    tmp_path, capsys, monkeypatch
+):
+    from agentflow import lock_file
+
+    def denied(lock_path):
+        raise PermissionError(5, "Access is denied", str(lock_path))
+
+    monkeypatch.setattr(lock_file, "acquire", denied)
+    real_lock = wave_event._wave_lock
+    monkeypatch.setattr(
+        wave_event, "_wave_lock", lambda p: real_lock(p, timeout=0.05, poll=0.01)
+    )
+    path = _board(tmp_path)
+    err = _refused(capsys, _task_state(path, "--state", "code_review"))
+    assert "unopenable" in err
+    assert read_status(path).tasks[1].state == "in_flight"

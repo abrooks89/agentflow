@@ -6,14 +6,16 @@
 // Checks:
 //   (a) .manifest.json: pages non-empty; every key resolves to a file on disk;
 //       key count == on-disk content-page count (listPages excludeNav).
-//   (b) log.md contains an entry carrying the manifest's generated_at date AND
+//   (b) source_path names a clone inside autodocDir, and that clone has a .git:
+//       the next /autodoc-update fetches from it, so a cutover that lost it is not done.
+//   (c) log.md contains an entry carrying the manifest's generated_at date AND
 //       short last_sha.
-//   (c) hot.md states the manifest's short last_sha and satisfies the declared
+//   (d) hot.md states the manifest's short last_sha and satisfies the declared
 //       hot-cache contract: whole file <=400 words, "## Latest" section <=120 words.
 //
 // Usage: node run-complete.js <autodocDir>
 import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { listPages } from './graph-check.js';
 
 const [autodocDir] = process.argv.slice(2);
@@ -49,7 +51,22 @@ if (pageKeys.length !== onDisk.length) {
 const shortSha = String(manifest.last_sha || '').slice(0, 8);
 if (shortSha.length < 7) fail(`manifest last_sha missing/short: "${manifest.last_sha}"`);
 
-// (b) log.md
+// (b) source clone
+const sourcePath = manifest.source_path;
+if (typeof sourcePath !== 'string' || !sourcePath.trim()) {
+  fail('manifest source_path is missing - the next /autodoc-update has no clone to fetch from');
+}
+// Resolved, not pattern-matched: a stem like `a..b` is inside, and an absolute, drive or UNC
+// path is judged by where it lands.
+const sourceRel = relative(resolve(autodocDir), resolve(autodocDir, sourcePath));
+if (!sourceRel || isAbsolute(sourceRel) || sourceRel === '..' || sourceRel.startsWith(`..${sep}`)) {
+  fail(`manifest source_path escapes the autodoc dir (it must name a directory inside it): ${sourcePath}`);
+}
+if (!existsSync(join(autodocDir, sourcePath, '.git'))) {
+  fail(`manifest source_path ${sourcePath} has no .git - the clone did not reach the live tree`);
+}
+
+// (c) log.md
 const logPath = join(autodocDir, 'log.md');
 if (!existsSync(logPath)) fail('log.md missing');
 const log = readFileSync(logPath, 'utf8');
@@ -61,7 +78,7 @@ const dateRe = new RegExp(`^## \\[${manifest.generated_at}\\]`, 'm');
 if (!dateRe.test(log)) fail(`log.md has no entry for this run's date ${manifest.generated_at}`);
 if (!log.includes(shortSha)) fail(`log.md never mentions this run's short sha ${shortSha}`);
 
-// (c) hot.md
+// (d) hot.md
 const hotPath = join(autodocDir, 'hot.md');
 if (!existsSync(hotPath)) fail('hot.md missing');
 const hot = readFileSync(hotPath, 'utf8');

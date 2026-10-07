@@ -12,7 +12,9 @@ import { dirname, join } from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { computeStaleDiagrams, gitFreshness, shaMatches, MIN_SHA_PREFIX } from '../diagram-staleness.js';
+import {
+  computeStaleDiagrams, gitFreshness, parsePageFrontmatter, shaMatches, MIN_SHA_PREFIX,
+} from '../diagram-staleness.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CLI = join(__dirname, '..', 'diagram-staleness.js');
@@ -394,6 +396,69 @@ test('gh#533 (f): CLI with source_path naming a missing clone falls back and SAY
     const out = runCLI(root);
     assert.match(out, /Mode: FALLBACK \(source clone \.source\/missing not found\)/);
     assert.match(out, /1 stale of 1 diagrammed pages/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- gh#572: a flow/data-model page with no diagram is MISSING ----------------
+// Reconcile creates flow pages without ever drawing their diagram, and the detector
+// only looked at diagram: true pages, so those pages were invisible to it forever.
+test('gh#572: parsePageFrontmatter reads type, quoted or bare', () => {
+  assert.equal(parsePageFrontmatter('---\ntype: "flow"\n---\n').type, 'flow');
+  assert.equal(parsePageFrontmatter('---\ntype: data-model\n---\n').type, 'data-model');
+  assert.equal(parsePageFrontmatter('---\ntitle: x\n---\n').type, '');
+});
+
+test('gh#572: flow/data-model pages whose diagram is not true are MISSING; controls are not', () => {
+  const r = computeStaleDiagrams({
+    pages: [
+      { path: 'flows/Created.md', type: 'flow', diagram: false, diagram_source_sha: '', source_paths: ['src/a.py'] },
+      { path: 'data-models/Model.md', type: 'data-model', diagram: false, diagram_source_sha: '', source_paths: ['src/a.py'] },
+      { path: 'flows/Drawn.md', type: 'flow', diagram: true, diagram_source_sha: HEAD_SHORT, source_paths: ['src/a.py'] },
+      { path: 'services/Plain.md', type: 'service', diagram: false, diagram_source_sha: '', source_paths: ['src/a.py'] },
+    ],
+    headSourceShas: heads,
+  });
+  assert.deepEqual(r.missing.map((p) => p.path), ['flows/Created.md', 'data-models/Model.md']);
+  assert.deepEqual(r.fresh.map((p) => p.path), ['flows/Drawn.md']);
+  assert.deepEqual(r.stale, []);
+  assert.equal(r.budget.missingCount, 2);
+  assert.equal(r.budget.estRegenTokens, 2 * 8000, 'MISSING counts toward the regeneration budget');
+});
+
+function missingScaffold(root) {
+  mkdirSync(join(root, 'flows'), { recursive: true });
+  mkdirSync(join(root, 'services'), { recursive: true });
+  const fm = (type, extra = '') => `---\ntype: "${type}"\ntitle: "x"\n${extra}source_paths:\n  - "src/a.py"\n---\n`;
+  // Created by reconcile: no diagram field and no mermaid fence at all.
+  writeFileSync(join(root, 'flows', 'Created.md'), `${fm('flow')}\n# Created\n\nSteps in prose.\n`);
+  // The syntax gate gave up and left the callout instead of a diagram.
+  writeFileSync(join(root, 'flows', 'Omitted.md'),
+    `${fm('flow')}\n# Omitted\n\n> [!warning] diagram omitted: mermaid did not validate\n`);
+  // Controls.
+  writeFileSync(join(root, 'flows', 'Drawn.md'),
+    `${fm('flow', `diagram: true\ndiagram_source_sha: "${HEAD_SHORT}"\n`)}\n# Drawn\n\n\`\`\`mermaid\nflowchart LR\n  a --> b\n\`\`\`\n`);
+  writeFileSync(join(root, 'services', 'Plain.md'), `${fm('service')}\n# Plain\n`);
+  writeFileSync(join(root, 'manifest.json'), JSON.stringify({
+    source_repo: 'example-org/sample-repo',
+    last_sha: HEAD,
+    pages: { 'flows/Drawn.md': { source_paths: ['src/a.py'] } },
+  }));
+}
+
+test('gh#572: CLI prints MISSING beside STALE, budgets it, and still exits 0', () => {
+  const root = mkdtempSync(join(tmpdir(), 'diagram-staleness-missing-'));
+  try {
+    missingScaffold(root);
+    const out = runCLI(root);
+    assert.match(out, /^ {2}MISSING {2}flows\/Created\.md\b/m);
+    assert.match(out, /^ {2}MISSING {2}flows\/Omitted\.md\b/m);
+    assert.doesNotMatch(out, /MISSING {2}flows\/Drawn\.md/, 'a drawn flow page is not MISSING');
+    assert.doesNotMatch(out, /MISSING {2}services\/Plain\.md/, 'a service page needs no diagram');
+    assert.match(out, /0 stale of 1 diagrammed pages/);
+    assert.match(out, /2 missing/);
+    assert.match(out, /~16000 tokens/, 'two MISSING pages are priced like two stale ones');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

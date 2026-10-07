@@ -51,12 +51,21 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
-  # The nightly (nightly.yml) calls this file so both run the same jobs. No inputs, no
-  # secrets: inside a call github.event_name is the CALLER's event (schedule or
-  # workflow_dispatch), so every trim below reads it as a non-PR run and runs the full matrix.
-  # Repository variables need no plumbing either: a called workflow reads the caller
-  # repository's `vars`, so the sanitize gate's SANITIZE_EXTRA_PATTERN reaches the nightly too.
+  # The nightly (nightly.yml) calls this file so both run the same jobs. No inputs: inside a
+  # call github.event_name is the CALLER's event (schedule or workflow_dispatch), so every trim
+  # below reads it as a non-PR run and runs the full matrix. A called workflow sees none of the
+  # caller's secrets unless they are passed, so the nightly's call passes `secrets: inherit`;
+  # an inherited secret needs no `secrets:` declaration here, and the sanitize gate's
+  # SANITIZE_EXTRA_PATTERN repository secret reaches the nightly too.
   workflow_call:
+
+# Least privilege by default: without this block every job gets the repository's default token
+# scope, which can be read-write. Checkout needs only contents: read. A job that needs more
+# declares it itself (pr-provenance-gate reads issues and PRs). Third-party actions are pinned to
+# a full commit SHA, with the tag in a comment, so a moved tag cannot change what runs here;
+# skills/_shared/tests/test_workflow_permissions.py pins both rules.
+permissions:
+  contents: read
 
 # Cancel a superseded PR run (a new push or a description edit on the same PR). A non-PR
 # run keys on its own run id, so a push, the nightly or a dispatch never cancels another
@@ -90,8 +99,8 @@ jobs:
       run:
         working-directory: skills/autodoc-init/references/graph
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -99,7 +108,7 @@ jobs:
       # The extraction e2e tests (tests/test_end_to_end.py) drive the Node
       # tree-sitter inventory package through the JSONL seam, so the graph job
       # needs node + the inventory deps installed too.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: lts/*
           cache: npm
@@ -134,15 +143,15 @@ jobs:
       run:
         working-directory: skills/_shared
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: skills/_shared/pyproject.toml
       # For the README Evidence guard's orchestrator row (node --test, no npm install). The
       # guard fails under CI if node is missing, so dropping this step turns the job red.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: lts/*
       - name: Install agentflow package
@@ -154,10 +163,10 @@ jobs:
         shell: bash
         env:
           # The exempt words test_skill_call_sites.py guards (E-0380) belong to the
-          # install-specific alternatives, which live in this variable and not in the
-          # sanitize gate's shipped pattern (see that job). Empty - a public copy - the
+          # install-specific alternatives, which live in this repository secret and not in
+          # the sanitize gate's shipped pattern (see that job). Empty - a public copy - the
           # tests that derive from them skip and say why.
-          SANITIZE_EXTRA_PATTERN: ${{ vars.SANITIZE_EXTRA_PATTERN }}
+          SANITIZE_EXTRA_PATTERN: ${{ secrets.SANITIZE_EXTRA_PATTERN }}
         run: python -m pytest -q
       - name: Registry validate gate (seeded template must be schema-valid)
         shell: bash
@@ -183,8 +192,8 @@ jobs:
         include: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '[]' || '[{"os":"ubuntu-24.04","python":"3.12"}]') }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -209,8 +218,8 @@ jobs:
       run:
         working-directory: skills/autodoc-init/references/inventory
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: lts/*
           cache: npm
@@ -231,8 +240,8 @@ jobs:
         os: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '["ubuntu-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: lts/*
       - name: Run wave_group.js tests
@@ -258,8 +267,8 @@ jobs:
         include: ${{ fromJSON((github.event_name == 'pull_request' && github.event.repository.private) && '[]' || '[{"os":"ubuntu-24.04","python":"3.12"}]') }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -307,8 +316,8 @@ jobs:
     if: github.event_name != 'push' || !github.event.repository.private
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
       - name: Install ruff
@@ -329,7 +338,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # NFR-1 release gate: zero personal/product literals in first-party
       # files. Vendored third-party skills (skills/_vendored) and machine-local
       # harness records (gitignored, but belt and braces) are out of scope.
@@ -339,11 +348,11 @@ jobs:
       # session-directory name and absolute home-directory paths - which name
       # nobody. An alternative specific to one install (another product's name, a
       # host alias, an address range) would be published by the very file meant
-      # to keep it out, so it is never written here. It lives in the repository's
-      # Actions variable SANITIZE_EXTRA_PATTERN: extra grep -P alternatives,
+      # to keep it out, so it is never written here. It lives in the repository
+      # secret SANITIZE_EXTRA_PATTERN: extra grep -P alternatives,
       # joined with "|", mirrored from the local-only file
       # <data_root>/projects/<project>/publish/sanitize-extra-pattern.txt that
-      # agentflow.publish and agentflow.pillar_residue read. When the variable is
+      # agentflow.publish and agentflow.pillar_residue read. When the secret is
       # set, the step appends it to the pattern before the first scan, so the
       # tree, the PR title and the PR body all run the one combined pattern
       # through the same fail-closed grep, and an extra pattern grep cannot parse
@@ -409,7 +418,7 @@ jobs:
       #
       # WHAT THIS GATE CANNOT REACH, AND WHAT DOES REACH IT (E-0771). The `wiki/`
       # pillar is out of scope here BY CONSTRUCTION, not by omission. This job
-      # does actions/checkout@v4 and greps '.'; the pillar lives under the data
+      # does actions/checkout and greps '.'; the pillar lives under the data
       # root, which is not in the checkout and is not a git repository at all --
       # the same fact the pr-provenance-gate states further down when it says CI
       # has nothing to resolve a spec slug against. So "extend this gate to walk
@@ -431,7 +440,7 @@ jobs:
       #
       # DO NOT ADD THE BARE PERSONAL NAME TO THIS PATTERN as part of that work. It
       # is deliberately absent, and the pillar check counts it as its own class so
-      # it stays visible (decided at registry Q-10079).
+      # it stays visible: by recorded decision it stays a separate class.
       - name: Grep for personal/product literals
         env:
           # gh#247's live instance was a PR BODY, which nothing scanned, so the
@@ -459,25 +468,26 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           # The install-specific alternatives (see the comment above this step),
           # read through env like the PR text and never spliced into the script.
-          # Empty when the variable is unset.
-          EXTRA_PATTERN: ${{ vars.SANITIZE_EXTRA_PATTERN }}
+          # Empty when the secret is unset.
+          EXTRA_PATTERN: ${{ secrets.SANITIZE_EXTRA_PATTERN }}
         run: |
           set -euo pipefail
           # grep -P requires a unibyte/UTF-8 locale
           export LC_ALL=C.UTF-8
           pattern='C--Users-[A-Za-z0-9]+|(?:[A-Za-z]:[\\/]Users[\\/]|/c/Users/|(?<![A-Za-z]:)(?<!/c)/Users/|/home/)(?!(?:you|user|username|name|me|example|someone|yourname)(?![A-Za-z0-9._-]))[A-Za-z0-9][A-Za-z0-9._-]+'
           # Appended to the one pattern, never a second one, so every scan below runs
-          # the same rule. This script never echoes the value, but GitHub lists a step's
-          # env, values included, at the top of its log and does not mask repository
-          # variables, so this step's log and the `_shared pytest` step's carry it
-          # wherever the variable is set. Set it on the working repo only, never on a
-          # public copy.
+          # the same rule. This script never echoes the value. GitHub lists a step's env
+          # at the top of its log, and masks a repository secret's value there and in any
+          # line that prints it whole, so this step's log and the `_shared pytest` step's
+          # show `***` for it. The mask matches the whole value only: one alternative
+          # printed on its own would not be masked, so nothing here prints any part of it.
+          # Set it on the working repo only, never on a public copy.
           # `:-` because a contributor running this step locally has no such variable.
           if [ -n "${EXTRA_PATTERN:-}" ]; then
             pattern+="|$EXTRA_PATTERN"
-            echo "sanitize gate: extra pattern from repository variable SANITIZE_EXTRA_PATTERN applied to every scan"
+            echo "sanitize gate: extra pattern from repository secret SANITIZE_EXTRA_PATTERN applied to every scan"
           else
-            echo "::notice::sanitize gate: no extra pattern configured (repository variable SANITIZE_EXTRA_PATTERN is empty) - scanning the generic shapes only"
+            echo "::notice::sanitize gate: no extra pattern configured (repository secret SANITIZE_EXTRA_PATTERN is empty) - scanning the generic shapes only"
           fi
           rc=0
           # gh#447: each scan branches on grep's EXIT CODE, never on whether it printed.
@@ -552,6 +562,33 @@ jobs:
       - name: Instruction prose carries no history
         if: ${{ !cancelled() }}
         run: python3 .github/scripts/prose_history_gate.py
+      # The skill-size ratchet's escape hatch. A step here, not a job, for the reason above; it is
+      # not in `pr-provenance-gate` because that job is not a required context. The ceilings
+      # themselves are enforced by test_skill_size_budget.py in the _shared pytest jobs; this step
+      # only checks that every ceiling the PR raises over its base is declared by a
+      # `skill-budget: <skill> +N because <reason>` line in the PR body. Body and base sha come in
+      # through env, never spliced into the script. Rule and reason: the script's docstring and
+      # skills/_shared/PR-PROSE.md, "Skill budget".
+      # The base is the merge commit's first parent: the base branch exactly as this run merged it.
+      # The event's base sha can be older than that, so it is only the fallback, and the log says
+      # which one was used.
+      - name: Raised skill budgets are declared
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # The checkout is the merge commit at depth 1, so its parents are not here yet.
+          head_sha=$(git rev-parse HEAD)
+          if git fetch --no-tags --depth=2 origin "$head_sha" && base=$(git rev-parse --verify -q 'HEAD^1'); then
+            echo "skill budget gate: base is the merge commit's first parent HEAD^1 ($base)"
+          else
+            echo "::warning::skill budget gate: HEAD^1 is unavailable; falling back to the event's base sha ($BASE_SHA)"
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            base="$BASE_SHA"
+          fi
+          python3 .github/scripts/skill_budget_gate.py --base "$base"
 
   worktree-tool-gate:
     name: worktree tool/flag gate
@@ -559,7 +596,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # The launch directory is the harness home, so a lane's working directory is
       # deliberately not inside any repo. Both banned patterns bind git to whatever
       # repo the working directory happens to sit in — from the launch directory
@@ -644,8 +681,8 @@ jobs:
           if [ "$hits_rc" -eq 0 ]; then
             echo "$hits"
             echo "Use an explicit git -C form instead, e.g."
-            echo "  git -C \"<canonical_repo.local_checkout>\" worktree add \"<worktree_root>/<project>/<epic-slug>\" <branch>"
-            echo "  git -C \"<worktree_root>/<project>/<epic-slug>\" <subcommand>"
+            echo "  git -C \"<canonical_repo.local_checkout>\" worktree add \"<worktree_root>/<project>/<epic-branch>\" <branch>"
+            echo "  git -C \"<worktree_root>/<project>/<epic-branch>\" <subcommand>"
             echo "::error::worktree gate: a first-party skill file still names the native worktree-entering tool or the per-subagent worktree-isolation flag (file:line above); lanes launch from the machine launch directory, where neither resolves to a repo"
             exit 1
           fi

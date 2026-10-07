@@ -31,6 +31,8 @@ from agentflow import wiki as wiki_module
 from agentflow.wiki import (
     MAX_FIELD_CHARS,
     MAX_FRONTMATTER_CHARS,
+    WAITING_END,
+    WAITING_START,
     MissingWikilinkError,
     Page,
     PageExistsError,
@@ -42,9 +44,16 @@ from agentflow.wiki import (
     read_pages,
     refresh_projection,
     render_projection,
+    replace_waiting_region,
     select,
     write_page,
+    write_waiting_region,
 )
+
+#: Every write here passes ``write_page``'s residue guard, which resolves the configured person
+#: from the environment config. A hermetic one (``conftest.residue_config``), so the suite does
+#: not depend on the machine's config: absent on a CI runner, it would refuse every write.
+pytestmark = pytest.mark.usefixtures("residue_config")
 
 
 def _page(slug: str, created: str, lane: str | None = None, body: str = "See [[registry]].\n"):
@@ -673,6 +682,18 @@ def test_cli_refresh_says_it_wrote_nothing_on_a_second_run(tmp_path, capsys) -> 
     ], printed
 
 
+def _stub_configured(monkeypatch, data_root: Path) -> None:
+    """Every project is configured and ``data_root`` is the given one: the resolver's
+    directory and pillar checks under test, not the config files (gh#794 added the
+    configured-project check; the tests that exercise it use a real scratch config)."""
+    monkeypatch.setattr(
+        af_config, "load_environment", lambda: SimpleNamespace(data_root=str(data_root))
+    )
+    monkeypatch.setattr(
+        af_config, "load_project", lambda name, **_kw: SimpleNamespace(name=name)
+    )
+
+
 def test_cli_refresh_resolves_project_through_the_configured_data_root(
     tmp_path, capsys, monkeypatch
 ) -> None:
@@ -686,9 +707,7 @@ def test_cli_refresh_resolves_project_through_the_configured_data_root(
     _write_raw(
         wiki_root / "pages", "one.md", _page_text("One", "2026-09-03", None, "[[registry]]\n")
     )
-    monkeypatch.setattr(
-        af_config, "load_environment", lambda: SimpleNamespace(data_root=str(data_root))
-    )
+    _stub_configured(monkeypatch, data_root)
 
     assert main(["refresh", "--project", "demo"]) == 0
 
@@ -705,9 +724,7 @@ def test_cli_refresh_exits_non_zero_when_the_project_has_no_wiki(
 ) -> None:
     data_root = tmp_path / "data"
     (data_root / "projects" / "demo").mkdir(parents=True)
-    monkeypatch.setattr(
-        af_config, "load_environment", lambda: SimpleNamespace(data_root=str(data_root))
-    )
+    _stub_configured(monkeypatch, data_root)
 
     assert main(["refresh", "--project", "demo"]) == 2
     assert "no wiki pillar" in capsys.readouterr().err
@@ -785,6 +802,98 @@ def test_cli_refresh_rejects_a_project_that_is_a_path_fragment(tmp_path, capsys)
     """``--project`` routes into a path; it stays a bare slug, exactly as registry keeps it."""
     assert main(["refresh", "--project", "../../etc"]) == 2
     assert "A-Za-z0-9_-" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# gh#794: --project must name a CONFIGURED project, as registry requires (gh#715)
+# --------------------------------------------------------------------------- #
+def _write_cfg(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"# config\n\n```yaml\n{body.strip()}\n```\n", encoding="utf-8")
+
+
+@pytest.fixture
+def toy_config(tmp_path: Path, monkeypatch) -> Path:
+    """A scratch AGENTFLOW_CONFIG in which only project `toy` exists; returns data_root.
+
+    Both `toy` and an UNCONFIGURED `ghost` get a provisioned pillar under data_root, so the
+    only thing that can tell them apart is the config check - a directory probe cannot.
+    """
+    d = str(tmp_path).replace(chr(92), "/")
+    data_root = tmp_path / "data"
+    for name in ("toy", "ghost"):
+        root = data_root / "projects" / name / "wiki"
+        (root / "pages").mkdir(parents=True)
+        for fname, text in initial_pillar_files(name).items():
+            (root / fname).write_text(text, encoding="utf-8", newline="\n")
+    (tmp_path / "locks").mkdir()
+    (tmp_path / "src").mkdir()
+    home = tmp_path / "config"
+    _write_cfg(home / "environment.md", f"""
+schema_version: 1
+person:
+  name: Sample User
+data_root: {d}/data
+git_host:
+  kind: local
+notify:
+  kind: none
+lock_dir: {d}/locks
+shell: posix
+suite_root: {d}
+worktree_root: {d}
+""")
+    _write_cfg(home / "projects" / "toy.md", f"""
+schema_version: 1
+name: toy
+canonical_repo:
+  host_ref: fixture-owner/fixture-repo
+  local_checkout: {d}/src
+verification:
+  strategy: test-suite
+""")
+    monkeypatch.setenv("AGENTFLOW_CONFIG", str(home))
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    return data_root
+
+
+def test_cli_refresh_resolves_a_configured_project(toy_config: Path, capsys) -> None:
+    """The control: a configured project with a pillar refreshes, through the real config."""
+    assert main(["refresh", "--project", "toy"]) == 0
+    capsys.readouterr()
+    assert (toy_config / "projects" / "toy" / "wiki" / "hot.md").is_file()
+
+
+@pytest.mark.parametrize("command", ["refresh", "residue"])
+def test_cli_refuses_an_unconfigured_project_even_when_its_pillar_exists(
+    toy_config: Path, capsys, command: str
+) -> None:
+    """A provisioned-looking pillar is not a configured project. Without the check `ghost`
+    refreshed happily - the wiki twin of registry's phantom board."""
+    wiki_root = toy_config / "projects" / "ghost" / "wiki"
+    before = {p.name: p.read_bytes() for p in wiki_root.iterdir() if p.is_file()}
+    argv = [command, "--project", "ghost"]
+    if command == "residue":
+        argv += ["--person-name", "Sample User"]
+    assert main(argv) == 2
+    err = capsys.readouterr().err
+    assert "--project ghost: project config did not load" in err, err
+    assert "unknown project 'ghost'" in err and "configured: toy" in err, err
+    assert "remediation:" in err and "Traceback" not in err, err
+    assert len(err.strip().splitlines()) == 1, err
+    after = {p.name: p.read_bytes() for p in wiki_root.iterdir() if p.is_file()}
+    assert after == before, "the unconfigured project's pillar was written anyway"
+
+
+def test_cli_refuses_a_typo_with_the_config_error_not_a_directory_miss(
+    toy_config: Path, capsys
+) -> None:
+    """A typo used to be told `no project 'tyo': <path> does not exist`; now it is told what
+    IS configured and the closest match, as registry tells it."""
+    assert main(["refresh", "--project", "tyo"]) == 2
+    err = capsys.readouterr().err
+    assert "did you mean 'toy'?" in err, err
+    assert "does not exist" not in err, err
 
 
 def test_cli_refresh_exits_non_zero_on_an_unparseable_page(tmp_path, capsys) -> None:
@@ -924,7 +1033,10 @@ def test_create_only_is_enforced_by_the_os_not_by_an_exists_check(
     )
     before = path.read_text(encoding="utf-8")
 
-    monkeypatch.setattr(Path, "exists", lambda self: False)
+    # Blind the check for THIS page only. Blinding every path also blinds the environment config
+    # the residue guard reads, and the write is then refused as unmeasurable instead of racing.
+    real_exists = Path.exists
+    monkeypatch.setattr(Path, "exists", lambda self: False if self == path else real_exists(self))
 
     with pytest.raises(PageExistsError):
         write_page(
@@ -1375,6 +1487,59 @@ def test_a_windows_illegal_lane_is_refused_before_anything_is_written(
             created="2026-09-03",
             lane=bad,
         )
+
+
+def test_the_windows_illegal_refusal_states_the_rule_and_the_remedy() -> None:
+    """gh#887: the refusal described the crash it prevents ("does not fail validation, it crashes
+    the write half way through") instead of itself, and gave no remedy. Like its sibling branches
+    it now says what the field must be, listing every character the validator refuses."""
+    with pytest.raises(WikiFormatError) as excinfo:
+        wiki_module._validated_component("a|b", "lane", "p")
+    message = str(excinfo.value)
+
+    assert "does not fail validation" not in message and "crashes" not in message, message
+    assert "Windows filename" in message and "bare name" in message, message
+    for char in '|?*<>"/\\:':
+        assert char in message.split("without any of", 1)[1], (char, message)
+
+
+def test_the_pre_spawn_lane_refusal_names_the_lane_not_a_placeholder_page(tmp_path: Path) -> None:
+    """gh#887: with no page yet, check_new_lane blamed a fictitious 'the page being saved'."""
+    wiki_root = _seeded_pillar(tmp_path)
+
+    with pytest.raises(WikiFormatError) as excinfo:
+        wiki_module.check_new_lane(wiki_root, "a|b")
+    message = str(excinfo.value)
+
+    assert "the page being saved" not in message and "Page " not in message, message
+    assert message.startswith("lane 'a|b'"), message
+    assert "Use a bare name" in message, message
+
+
+def test_the_pre_spawn_case_twin_refusal_names_no_page(tmp_path: Path) -> None:
+    """gh#887: the case-twin branch also named the placeholder page when no page existed yet."""
+    wiki_root = _seeded_pillar(tmp_path)
+    _laned(wiki_root, "first", "lead")
+
+    with pytest.raises(WikiFormatError) as excinfo:
+        wiki_module.check_new_lane(wiki_root, "Lead")
+    message = str(excinfo.value)
+
+    assert "the page being saved" not in message, message
+    assert message.startswith("lane 'Lead' and live lane(s)"), message
+
+
+def test_a_real_page_lane_refusal_still_names_the_page(tmp_path: Path) -> None:
+    """Control for the above: a write_page refusal has a real page, and still names it."""
+    wiki_root = _seeded_pillar(tmp_path)
+
+    with pytest.raises(WikiFormatError) as excinfo:
+        _laned(wiki_root, "real-slug", "a|b")
+    message = str(excinfo.value)
+
+    assert message.startswith("Page 'real-slug' has lane='a|b'"), message
+    assert "Use a bare name" in message, message
+    assert not (wiki_root / "pages" / "real-slug.md").exists()
 
 
 def test_refresh_refuses_two_lanes_that_are_one_file_and_names_both(tmp_path: Path) -> None:
@@ -2200,9 +2365,7 @@ def test_cli_refresh_refuses_a_project_whose_wiki_lacks_a_digest(tmp_path, capsy
     data_root = tmp_path / "data"
     wiki_root = data_root / "projects" / "demo" / "wiki"
     (wiki_root / "pages").mkdir(parents=True)
-    monkeypatch.setattr(
-        af_config, "load_environment", lambda: SimpleNamespace(data_root=str(data_root))
-    )
+    _stub_configured(monkeypatch, data_root)
 
     assert main(["refresh", "--project", "demo"]) == 2
 
@@ -2456,3 +2619,105 @@ def test_a_pair_already_on_disk_still_refuses_a_twin_of_either_spelling(
     with pytest.raises(WikiFormatError, match="differ only by case"):
         _laned(wiki_root, "twin", twin)
     assert not (wiki_root / "pages" / "twin.md").exists()
+
+
+# --------------------------------------------------------------------------- #
+# The "Waiting on you" region at the top of digest.md - replaced exactly, narrative untouched
+# --------------------------------------------------------------------------- #
+def _region(body: str) -> str:
+    return f"{WAITING_START}\n{body}\n{WAITING_END}\n"
+
+
+_NARRATIVE = "# demo - fleet digest\n\nLast written: x\n\n- something moved\n"
+
+
+def test_waiting_region_is_inserted_at_the_top_when_absent():
+    out = replace_waiting_region(_NARRATIVE, _region("one"))
+    assert out.startswith(WAITING_START)
+    assert out.endswith(_NARRATIVE), "the narrative must follow byte-identical"
+
+
+def test_waiting_region_replacement_keeps_the_narrative_byte_identical():
+    first = replace_waiting_region(_NARRATIVE, _region("one"))
+    second = replace_waiting_region(first, _region("two\nlines"))
+    assert "one" not in second.split(WAITING_END)[0]
+    assert second.split(WAITING_END, 1)[1] == first.split(WAITING_END, 1)[1]
+    assert second.endswith(_NARRATIVE)
+
+
+def test_waiting_region_replacement_keeps_crlf_narrative_and_matches_its_newlines():
+    crlf = _NARRATIVE.replace("\n", "\r\n")
+    first = replace_waiting_region(crlf, _region("one"))
+    assert first.endswith(crlf)
+    head = first[: first.index(WAITING_END) + len(WAITING_END) + 2]
+    assert "\n" not in head.replace("\r\n", ""), "the inserted region follows the file's CRLF"
+    second = replace_waiting_region(first, _region("two"))
+    assert second.endswith(crlf)
+    assert second.split(WAITING_END, 1)[1] == first.split(WAITING_END, 1)[1]
+
+
+def test_waiting_region_replacement_is_idempotent():
+    once = replace_waiting_region(_NARRATIVE, _region("same"))
+    assert replace_waiting_region(once, _region("same")) == once
+
+
+def test_waiting_region_keeps_a_leading_bom_first():
+    out = replace_waiting_region("\ufeff" + _NARRATIVE, _region("one"))
+    assert out.startswith("\ufeff" + WAITING_START)
+    assert out.endswith(_NARRATIVE)
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        f"{WAITING_START}\nno end\n" + _NARRATIVE,
+        f"{WAITING_END}\n" + _NARRATIVE,
+        _region("a") + _region("b") + _NARRATIVE,
+        f"{WAITING_END}\n{WAITING_START}\n" + _NARRATIVE,
+    ],
+)
+def test_a_damaged_waiting_region_is_refused_not_guessed(digest):
+    with pytest.raises(WikiFormatError):
+        replace_waiting_region(digest, _region("x"))
+
+
+@pytest.mark.parametrize(
+    "section",
+    ["no markers\n", f"{WAITING_START}\nx\n", _region("a") + _region("b"), "lead\n" + _region("a")],
+)
+def test_a_section_that_is_not_one_marked_region_is_refused(section):
+    with pytest.raises(ValueError):
+        replace_waiting_region(_NARRATIVE, section)
+
+
+def test_write_waiting_region_writes_bytes_and_reports_unchanged(tmp_path):
+    root = tmp_path / "wiki"
+    (root / "pages").mkdir(parents=True)
+    crlf = _NARRATIVE.replace("\n", "\r\n").encode("utf-8")
+    (root / "digest.md").write_bytes(crlf)
+    assert write_waiting_region(root, _region("one")) is True
+    data = (root / "digest.md").read_bytes()
+    assert data.endswith(crlf)
+    assert write_waiting_region(root, _region("one")) is False
+    assert (root / "digest.md").read_bytes() == data
+
+
+def test_write_waiting_region_refuses_a_root_without_a_digest(tmp_path):
+    (tmp_path / "pages").mkdir()
+    with pytest.raises(wiki_module.NotAPillarError):
+        write_waiting_region(tmp_path, _region("one"))
+
+
+def test_a_marker_quoted_inside_a_narrative_line_is_narrative_not_a_marker():
+    quoting = _NARRATIVE + f"- the queue ends at `{WAITING_END}` and starts at `{WAITING_START}`\n"
+    first = replace_waiting_region(quoting, _region("one"))
+    assert first.endswith(quoting)
+    second = replace_waiting_region(first, _region("two"))
+    assert second.endswith(quoting)
+    assert "one" not in second
+
+
+def test_a_marker_line_with_trailing_space_still_counts_as_the_marker():
+    spaced = f"{WAITING_START}  \nold\n{WAITING_END} \n\n" + _NARRATIVE
+    out = replace_waiting_region(spaced, _region("new"))
+    assert "old" not in out and out.endswith(_NARRATIVE)

@@ -35,10 +35,14 @@ SKILLS_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SKILLS_ROOT / "_shared"))
 
 import agentflow.registry as _registry_module  # noqa: E402
-from agentflow.registry import AGENTS  # noqa: E402
+from agentflow.registry import AGENTS, BUILDERS  # noqa: E402
 
 # Loops that select work to BUILD: their survey must be scoped to one project.
-BUILDER_SKILLS = ("lead-dev", "jr-dev-1", "jr-dev-2", "auditor", "steward")
+# Explicit, not `BUILDERS`: auditor and steward are not roster builders but select work too.
+BUILDER_SKILLS = ("lead-dev", "jr-dev-1", "jr-dev-2", "jr-dev-3", "auditor", "steward")
+
+# Every junior builder lane, derived so a new jr lane reaches the junior-only gates with no edit.
+JR_DEV_LANES = tuple(b for b in BUILDERS if b != "lead-dev")
 
 # Loops that deliberately survey every project: refinement and selection need the
 # full set. Each must SAY so, so a reader cannot mistake it for an oversight.
@@ -185,13 +189,19 @@ REPO_ROOT = SKILLS_ROOT.parent
 # inbox `cull` can never reach. auditor joined in p145: its fixed-issue pass
 # (Step 4b) takes the issues a Note names as fixed as candidates, so it must
 # strike each one it acted on or re-judge it every wake.
-NOTE_CONSUMERS = ("lead-dev", "jr-dev-1", "jr-dev-2", "dev-manager", "steward", "auditor")
+NOTE_CONSUMERS = (
+    "lead-dev", "jr-dev-1", "jr-dev-2", "jr-dev-3", "dev-manager", "steward", "auditor",
+)
 
-# The two jr lanes, each mapped to the lane its own session may have abandoned.
-JR_LANES = {"jr-dev-1": "jr-dev-2", "jr-dev-2": "jr-dev-1"}
+# Every jr lane, mapped to the sibling lanes its skill's re-point check must cover: a session
+# running any junior can be re-pointed at any other. Derived from the roster so a new junior is
+# both checked for and checked by every existing lane in the commit that adds it (E-1084).
+JR_LANES = {lane: tuple(o for o in JR_DEV_LANES if o != lane) for lane in JR_DEV_LANES}
+JR_REPOINT_PAIRS = tuple((lane, sib) for lane, sibs in JR_LANES.items() for sib in sibs)
 
-# The three loops that carry a per-firing state file with an `## ON WAKE` block.
-STATE_FILE_SKILLS = ("lead-dev", "jr-dev-1", "jr-dev-2")
+# The loops that carry a per-firing state file with an `## ON WAKE` block: every builder,
+# derived from the roster so a new builder lane is covered in the commit that adds it.
+STATE_FILE_SKILLS = BUILDERS
 
 
 def _doc_text(rel: str) -> str:
@@ -295,6 +305,7 @@ _CHECKLIST_HEADING = {
     "lead-dev": "## 9. End-of-firing checklist",
     "jr-dev-1": "## End-of-firing checklist",
     "jr-dev-2": "## End-of-firing checklist",
+    "jr-dev-3": "## End-of-firing checklist",
     "dev-manager": "End-of-wake checklist",
     "steward": "## End-of-wake checklist",
     "auditor": "## End-of-pass checklist",
@@ -480,7 +491,7 @@ def test_no_prescribed_note_text_repeats_the_routing_prefix() -> None:
     )
 
 
-@pytest.mark.parametrize("skill", ("jr-dev-1", "jr-dev-2"))
+@pytest.mark.parametrize("skill", JR_DEV_LANES)
 def test_starvation_note_prescribes_the_routing_flag(skill: str) -> None:
     """The doubled prefix is cosmetic; the missing `--to` is not.
 
@@ -513,15 +524,29 @@ def test_starvation_note_prescribes_the_routing_flag(skill: str) -> None:
 _UNIMPLEMENTABLE_TARGET_FLAG = "--agent jr-dev-"
 
 
-@pytest.mark.parametrize("skill", tuple(JR_LANES))
-def test_jr_lane_repoint_uses_cross_actor_status_call(skill: str) -> None:
-    other = JR_LANES[skill]
-    text = _skill_text(skill)
+def _has_repoint_call(text: str, skill: str, other: str) -> bool:
+    """True when `text` idles `other` under its own --actor with the verbatim re-point phase."""
     call = re.compile(
         rf"status --actor {re.escape(other)} [^\n]*--state idle [^\n]*"
         rf'--phase "re-pointed to {re.escape(skill)}"'
     )
-    assert call.search(text), (
+    return bool(call.search(text))
+
+
+def test_repoint_checker_is_keyed_on_the_sibling_and_the_phase() -> None:
+    """Control for the gate below: one sibling's call never satisfies another sibling's pair, and
+    the right lane idled under another lane's phase does not count."""
+    line = ("python -m agentflow.registry status --actor jr-dev-2 --project <name> "
+            '--state idle --phase "re-pointed to jr-dev-1"')
+    assert _has_repoint_call(line, "jr-dev-1", "jr-dev-2")
+    assert not _has_repoint_call(line, "jr-dev-1", "jr-dev-3")
+    assert not _has_repoint_call(line, "jr-dev-3", "jr-dev-2")
+
+
+@pytest.mark.parametrize(("skill", "other"), JR_REPOINT_PAIRS)
+def test_jr_lane_repoint_uses_cross_actor_status_call(skill: str, other: str) -> None:
+    text = _skill_text(skill)
+    assert _has_repoint_call(text, skill, other), (
         f"{skill}/SKILL.md has no re-point call site idling `{other}` with the literal phase "
         f'"re-pointed to {skill}". Keep that phrase verbatim: `status` stamps a fresh heartbeat '
         "unconditionally, so the phase text is the ONLY honest marker that the idled lane is not "
@@ -534,6 +559,26 @@ def test_jr_lane_repoint_uses_cross_actor_status_call(skill: str) -> None:
         f"{skill}/SKILL.md prescribes `{_UNIMPLEMENTABLE_TARGET_FLAG}...`; `status` has no target "
         "flag, so that call idles YOUR OWN row and argparse rejects the flag outright"
     )
+
+
+def test_jr_lane_gates_cover_every_junior_builder() -> None:
+    """Every junior is gated against every other junior: a lane re-pointed away from a sibling
+    no SKILL names is abandoned silently, the gap E-1084 closed."""
+    juniors = sorted(JR_DEV_LANES)
+    assert len(juniors) >= 2, f"the re-point gate needs at least one sibling junior lane to mean anything: {juniors}"
+    expected = {(a, b) for a in juniors for b in juniors if a != b}
+    assert set(JR_REPOINT_PAIRS) == expected, (
+        f"re-point pairs {sorted(JR_REPOINT_PAIRS)} are not every ordered junior pair"
+    )
+
+
+def test_hand_written_seat_lists_cover_every_builder() -> None:
+    """BUILDER_SKILLS and NOTE_CONSUMERS stay explicit because they mix in non-builder seats, so
+    pin them to the roster: a new builder missing from either drops out of every gate built on it
+    while those gates stay green."""
+    for name, seats in (("BUILDER_SKILLS", BUILDER_SKILLS), ("NOTE_CONSUMERS", NOTE_CONSUMERS)):
+        missing = sorted(set(BUILDERS) - set(seats))
+        assert not missing, f"{name} omits roster builder(s) {missing}"
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +852,20 @@ def test_continuation_prompt_forwards_the_project(skill: str) -> None:
             f"{skill}/SKILL.md has a ScheduleWakeup with no prompt= - the wake would "
             f"re-enter with no command: {span.splitlines()[0]}"
         )
+    # gh#989: an unexpanded `$ARGUMENTS`/`$N` in a continuation prompt re-enters on the
+    # injected default (gh#769), so it fails FILE-WIDE and before the no-flag allowance
+    # below - which only looks inside spans and accepts any line saying "no `--project`".
+    # Being file-wide, it also reds on prose: a counter-example must spell the token as
+    # `<args>` or `<target>`, never the literal one.
+    unexpanded = [
+        m.group(2)
+        for m in re.finditer(r"prompt=([\"'`])(/.+?)\1", text)
+        if _ARGUMENTS_TOKEN.search(m.group(2))
+    ]
+    assert not unexpanded, (
+        f"{skill}/SKILL.md has continuation prompt(s) carrying an argument token {unexpanded} - "
+        "it does not expand on a self-wake; write the resolved arguments as literal text"
+    )
     # Only prompts inside an ACTUAL ScheduleWakeup( span count. Skills document
     # the bare form as a counter-example ("never a bare prompt=/jr-dev-1"), and a
     # file-wide scan would red on exactly the sentence that teaches the rule -
@@ -838,9 +897,11 @@ def test_continuation_prompt_forwards_the_project(skill: str) -> None:
         for pr in re.findall(r'prompt="(/[^"]+)"', span.split(nl)[0]):
             if "--project" in pr:
                 continue
-            # A generic placeholder (`/steward <args>`, `$ARGUMENTS`) forwards
-            # whatever was given, flag included - it is not a bare prompt.
-            if "<args>" in pr or "ARGUMENTS" in pr:
+            # A generic placeholder (`/steward <args>`) forwards whatever was given,
+            # flag included - it is not a bare prompt. `$ARGUMENTS` is NOT one: it
+            # does not expand on a self-wake, so a prompt carrying it re-enters on
+            # the injected default (gh#769). It falls through to the assert below.
+            if "<args>" in pr:
                 continue
             assert "no `--project`" in line or "no --project" in line, (
                 f"{skill}/SKILL.md has a bare continuation prompt {pr!r} that is NOT on a "
@@ -884,7 +945,7 @@ def test_skill_names_the_config_show_contract(skill: str) -> None:
 # The marker TOKENS each loop actually writes into its `phase` cell. Anchoring on
 # these is the whole gate: the first version of this test looked for the words
 # "mis-launch" INSIDE the marker span, and no marker contains them - so it matched
-# zero spans across all six loops and asserted nothing at all while reading green.
+# zero spans across every loop and asserted nothing at all while reading green.
 _MARKER_TOKENS = ("PROJECT-OVERRIDE", "proj-arg", "proj=", "proj-override", "session-default")
 
 
@@ -1017,6 +1078,54 @@ def test_command_wrapper_forwards_arguments(loop: str) -> None:
         "forwarding nothing, so the skill is entered with empty arguments and every self-wake "
         "after it falls back to the session's injected default project"
     )
+
+
+#: Every `prompt=` value a wrapper prescribes, quoted or not. A command file carries no real
+#: tool call, so the prompt shape it teaches is all there is to gate.
+_WRAPPER_PROMPT = re.compile(r"prompt\s*=\s*[\"'`]?([^\"'\n)`]*)")
+#: The positional tokens a slash command expands when a HUMAN types it - `$ARGUMENTS`, `$1`,
+#: `${ARGUMENTS}`. The same shape harness/check.py's D1 refuses in a recorded wake row.
+_ARGUMENTS_TOKEN = re.compile(r"\$\{?(?:ARGUMENTS|\d+)\}?")
+
+
+def _continuation_prompts(text: str) -> list[str]:
+    """`prompt=` values inside a `ScheduleWakeup(` or `CronCreate(` span of a wrapper."""
+    found = []
+    for m in re.finditer(r"(?:ScheduleWakeup|CronCreate)\(", text):
+        found += _WRAPPER_PROMPT.findall(text[m.start():m.start() + 300].split("\n\n")[0])
+    return found
+
+
+@pytest.mark.parametrize("name", sorted(p.stem for p in COMMANDS_DIR.glob("*.md")))
+def test_command_wrapper_continuation_never_carries_the_arguments_token(name: str) -> None:
+    """gh#769. `$ARGUMENTS` expands when a human types the slash command, not when a
+    self-wake re-invokes it, so a continuation written from the token re-enters on the
+    session's injected default project. The wrappers used to prescribe exactly that
+    (`ScheduleWakeup(prompt="/lead-dev $ARGUMENTS")`) while the loop skills say to compose
+    the prompt from the resolved values. Only continuation prompts are gated: passing
+    `$ARGUMENTS` into `Skill(<loop>, args=...)` is the wrapper's job and stays legal."""
+    text = (COMMANDS_DIR / f"{name}.md").read_text(encoding="utf-8", errors="replace")
+    bad = [p for p in _continuation_prompts(text) if _ARGUMENTS_TOKEN.search(p)]
+    assert not bad, (
+        f"commands/{name}.md prescribes a continuation prompt carrying an argument token "
+        f"{bad} - it does not expand on a self-wake, so the next wake loses --project. "
+        "Compose the prompt from the resolved values instead."
+    )
+
+
+def test_the_continuation_prompt_gate_sees_every_self_waking_wrapper() -> None:
+    """Control for the gate above: it must find a prompt to judge in every self-waking
+    loop's wrapper, or a reworded wrapper would pass it vacuously."""
+    blind = [
+        loop for loop in SELF_WAKING_LOOPS
+        if not _continuation_prompts(
+            (COMMANDS_DIR / f"{loop}.md").read_text(encoding="utf-8", errors="replace")
+        )
+    ]
+    assert not blind, f"no ScheduleWakeup/CronCreate prompt= found in commands/ for {blind}"
+    assert _ARGUMENTS_TOKEN.search('/lead-dev $ARGUMENTS') and _continuation_prompts(
+        'ScheduleWakeup(prompt="/lead-dev $ARGUMENTS")'
+    ) == ["/lead-dev $ARGUMENTS"]
 
 
 #: A hardcoded use-case id. A wrapper that bakes one into its command line answers for that id
@@ -1402,7 +1511,7 @@ def test_the_report_verbs_are_told_how_to_reach_past_the_cap() -> None:
 def test_every_loop_carries_the_config_write_scope_rule(skill: str) -> None:
     """It shipped from two per-machine config profiles into the suite, and prose
     that lives in only one place is prose the next SKILL.md rewrite drops
-    silently. Six loops can write config; six loops state the limit."""
+    silently. Every loop can write config; every loop states the limit."""
     text = " ".join((SKILLS_ROOT / skill / "SKILL.md").read_text(encoding="utf-8").split())
     assert "CONFIG WRITE SCOPE" in text, f"{skill}/SKILL.md does not state the rule"
     assert "never any other project" in text, f"{skill}/SKILL.md states it without the limit"
@@ -1600,6 +1709,28 @@ def test_the_report_skill_explains_why_DONE_and_SHIPPED_can_disagree() -> None:
     assert "merged pull requests" in text[i:i + 700]
 
 
+_LANE_COUNT_STATES = ["live", "dry", "blocked", "halted", "reaped", "silent", "stood down"]
+
+
+def _lane_count_states(line: str) -> list:
+    return re.findall(r"\d+ ([a-z]+(?: [a-z]+)?)", line.split("lanes:", 1)[1])
+
+
+def test_the_push_lanes_line_carries_the_same_seven_counts_as_the_LANES_line() -> None:
+    """The push is the only spec for the phone tally - no code renders it - so a template that
+    drops DRY and BLOCKED accounts for some seats and not others, and BLOCKED is the state that
+    asks something of the human. Both lines name all seven states in one order."""
+    text = (SKILLS_ROOT / "report" / "SKILL.md").read_text(encoding="utf-8")
+    push = text[text.index("### 5c."):text.index("### 5d.")]
+    push_lines = [ln for ln in push.splitlines() if ln.startswith("lanes:")]
+    assert len(push_lines) == 1, "the 5c template has no single lanes: line"
+    step7 = text[text.index("## Step 7"):text.index("## Step 8")]
+    step7_lines = re.findall(r"`(lanes: [^`]+)`", step7)
+    assert len(step7_lines) == 1, "Step 7 does not spell out its LANES count line"
+    assert _lane_count_states(step7_lines[0]) == _LANE_COUNT_STATES
+    assert _lane_count_states(push_lines[0]) == _lane_count_states(step7_lines[0])
+
+
 # --------------------------------------------------------------------------- #
 # epic 706 — the update path is store-primary. These pin the CONVERSION, not the
 # prose around it: the marker stop is gone BECAUSE the path no longer edits
@@ -1659,6 +1790,50 @@ def _fenced_bash_blocks(text: str) -> list:
         if inside:
             buf.append(line)
     return out
+
+
+# Every automated /autodoc-update launch, keyed by a line unique to that launch. autodoc-update's
+# Step 1 refuses to start on a multi-profile box when AUTODOC_PROJECT is unset, so a loop that
+# launches it without exporting its own resolved project either dies FATAL or, on a one-profile
+# box, refreshes whatever the session defaulted to. The jr-dev files are hand-maintained copies,
+# so each one is pinned on its own.
+_AUTODOC_LAUNCH_SITES = (
+    ("lead-dev", "**`/autodoc-update` (code-wiki) — BATCHED per epic"),
+    ("jr-dev-1", "`/autodoc-update` may already be running or queued"),
+    ("jr-dev-2", "`/autodoc-update` may already be running or queued"),
+    ("jr-dev-3", "`/autodoc-update` may already be running or queued"),
+    ("orchestrator", "`/autodoc-update` (the vault's autodoc-update skill; from outside the vault"),
+    ("steward", "* running `/autodoc-update` over the merged range"),
+)
+
+
+@pytest.mark.parametrize(("skill", "anchor"), _AUTODOC_LAUNCH_SITES,
+                         ids=[s for s, _ in _AUTODOC_LAUNCH_SITES])
+def test_every_automated_autodoc_update_launch_exports_the_resolved_project(
+        skill: str, anchor: str) -> None:
+    lines = (SKILLS_ROOT / skill / "SKILL.md").read_text(encoding="utf-8").splitlines()
+    hits = [i for i, line in enumerate(lines) if anchor in line]
+    assert len(hits) == 1, (
+        f"{skill}/SKILL.md: expected the /autodoc-update launch anchor exactly once, found "
+        f"{len(hits)}; re-key this test on the launch's new wording"
+    )
+    # The export belongs to the launch itself, not to some other paragraph of the skill.
+    window = " ".join(" ".join(lines[hits[0]:hits[0] + 9]).split())
+    assert "export AUTODOC_PROJECT=<name>" in window, (
+        f"{skill}/SKILL.md launches /autodoc-update without exporting AUTODOC_PROJECT=<name>, "
+        "so the runbook's Step 1 refuses on a multi-profile box or refreshes the session's "
+        "default project instead of this loop's"
+    )
+    # Presence is not enough: every fenced block, and every Bash tool call, is its own shell, so
+    # an export run as a separate step is gone before Step 1 reads it. The site must put the
+    # export in the SAME command as Step 1 and say why.
+    assert "first line of the same shell command that runs" in window, (
+        f"{skill}/SKILL.md does not put the AUTODOC_PROJECT export in the same shell command as "
+        "the runbook's Step 1 block, so a seat that exports it in a separate call loses it"
+    )
+    assert "separate call does not survive" in window, (
+        f"{skill}/SKILL.md does not say that an export in a separate call is lost"
+    )
 
 
 def test_autodoc_update_no_longer_hard_stops_on_a_rendered_tree() -> None:
@@ -2328,7 +2503,7 @@ def test_autodoc_init_every_manifest_path_is_written_by_a_command() -> None:
 # The harness creates a worktree per agent under .claude/worktrees/, and each
 # carries a `.git` FILE rather than a directory. Without the ignore, `git add -A`
 # in the repo root records them as GITLINKS (mode 160000) — bogus submodule
-# entries no clone can resolve, in a repo slated to go public.
+# entries no clone can resolve, in a repo that is public.
 #
 # Verified by reproduction when this landed: with a real worktree present,
 # removing the ignore line made `git add -A` stage a 160000 entry, and restoring
@@ -2905,8 +3080,9 @@ def test_the_evidence_arithmetic_would_have_caught_the_shipped_bug() -> None:
 #: The seats that can hold a Queue claim, and therefore the only ones that can unpark one.
 #: `auditor` and `steward` also say "unpark" - of their own work item, not a Queue row - and
 #: `LANE_OF` maps neither, so prescribing a release verb to them would be prescribing a call
-#: the CLI refuses.
-CLAIMING_SKILLS = ("lead-dev", "jr-dev-1", "jr-dev-2")
+#: the CLI refuses. Derived: `LANE_OF` maps exactly the roster builders (pinned by
+#: test_loop_count_prose.py's `set(LANE_OF) == set(BUILDERS)` assert).
+CLAIMING_SKILLS = BUILDERS
 
 #: `--state` belongs to TWO subcommands with DIFFERENT enums: `status` sets the Agents-row
 #: state (AGENT_STATES) and `release` sets the Queue-row state (RELEASE_STATES). Scraping the
@@ -3113,7 +3289,7 @@ def test_each_mirror_call_site_states_the_derived_touchpoint_count() -> None:
 #
 # WHERE THE EXEMPTIONS COME FROM (gh#821). The shipped ci.yml pattern carries generic
 # shapes only, and none of them exempts a word. The exempting alternatives are
-# install-specific, so they live in the extra pattern: the repository variable
+# install-specific, so they live in the extra pattern: the repository secret
 # SANITIZE_EXTRA_PATTERN, which CI's `_shared pytest` step hands this suite as an
 # environment variable of the same name. These gates derive from ci.yml's pattern
 # UNIONED with it, and SKIP - saying why - where it is empty (a public copy, or a
@@ -3296,8 +3472,8 @@ def _word_present(token: str, blob: str) -> bool:
 def _derived_exemptions(pattern_src: str) -> dict[str, list[str]]:
     """Exempt tokens the gate carves out, keyed by the lookaround shape that carved them.
 
-    Keyed rather than flattened because the two are not interchangeable evidence: the six
-    loop skills are guarded on the LOOKBEHIND token specifically, that being the token the
+    Keyed rather than flattened because the two are not interchangeable evidence: every loop
+    skill is guarded on the LOOKBEHIND token specifically, that being the token the
     historical corruption actually hit.
     """
     return {
@@ -3306,7 +3482,7 @@ def _derived_exemptions(pattern_src: str) -> dict[str, list[str]]:
     }
 
 
-#: The extra pattern, in the repository variable's own `|`-joined form, under the variable's
+#: The extra pattern, in the repository secret's own `|`-joined form, under the secret's
 #: own name. CI's `_shared pytest` step passes it through; see the block comment above.
 _EXTRA_PATTERN_ENV = "SANITIZE_EXTRA_PATTERN"
 
@@ -3397,7 +3573,7 @@ def test_the_sanitize_exemptions_actually_parse_out_of_the_workflow() -> None:
     A parser that quietly returns `[]` makes "every exempt token is still present" and
     "every loop skill still names it" pass over nothing at all, and an empty sweep reports
     the identical green as a clean tree. Both shapes are pinned here, separately, because a
-    pattern that kept only its lookahead exemption would leave the six-file gate vacuous
+    pattern that kept only its lookahead exemption would leave the every-loop gate vacuous
     while the presence gate still looked busy.
 
     Derived from ci.yml's pattern UNIONED with the extra pattern (gh#821), and skipped -
@@ -3417,7 +3593,7 @@ def test_the_sanitize_exemptions_actually_parse_out_of_the_workflow() -> None:
         f"empty set and pass on any tree whatsoever. ci.yml half read as: {shipped!r}"
     )
     assert ex["lookbehind"], (
-        "parsed no NEGATIVE-LOOKBEHIND exemption - the six-loop gate below is now vacuous "
+        "parsed no NEGATIVE-LOOKBEHIND exemption - the every-loop gate below is now vacuous "
         f"and the corruption it exists to catch would pass unseen. ci.yml half: {shipped!r}"
     )
     assert ex["lookahead"], (
@@ -3478,17 +3654,18 @@ def test_every_derived_exempt_token_still_occurs_in_the_first_party_tree() -> No
 
 @pytest.mark.parametrize("skill", ALL_LOOPS)
 def test_every_loop_skill_still_names_the_lookbehind_exempt_token(skill: str) -> None:
-    """The sharp one: the six files the historical corruption actually hit.
+    """The sharp one: every loop skill - the historical corruption hit the six loop skills of
+    the time, and a loop added since is exposed to the same bulk replace.
 
     Tree-wide presence is not enough on its own - one surviving mention in a doc would
-    satisfy the gate above while five of the six loops had been corrupted back.
+    satisfy the gate above while every loop but one had been corrupted back.
 
     SCOPED TO THE LOOP-SKILL EXEMPT TOKEN, which is identified rather than named: of the
     tokens the pattern exempts, the ones this gate holds are those a healthy tree carries in
-    ALL SIX loop skills. That indirection is the whole design. Coding it over *every*
+    EVERY loop skill. That indirection is the whole design. Coding it over *every*
     lookbehind exemption looked equivalent and was not: the sanitize pattern is an openly
     growing list, so the next commit that exempts a new literal would have reddened this
-    test six times over a corruption that never happened, and the remedy the message
+    test once per loop over a corruption that never happened, and the remedy the message
     offered - "update the expectation" - names an expectation that does not exist, because
     the set is derived. A newly exempted word simply has no loop-skill coverage yet and is
     not this gate's business; the tree-wide gate above is where it is accounted for.
@@ -3501,12 +3678,12 @@ def test_every_loop_skill_still_names_the_lookbehind_exempt_token(skill: str) ->
     behind = _derived_exemptions(_exemption_pattern_source())["lookbehind"]
     assert behind, (
         "no lookbehind exemption parsed out of the pattern - this gate just went vacuous and "
-        "would pass on all six loop skills without reading a word of them"
+        "would pass on every loop skill without reading a word of them"
     )
     texts = {loop: _skill_text(loop).lower() for loop in ALL_LOOPS}
     # A token is this skill's business when ANOTHER loop skill still carries it. That
-    # predicate is what makes the parametrized case real work rather than six copies of one
-    # global check: "present in all six" would be true of the token by construction, so a
+    # predicate is what makes the parametrized case real work rather than one copy per loop of a
+    # global check: "present in all of them" would be true of the token by construction, so a
     # per-skill assertion derived from it could never fire. Sibling-carried is different for
     # each skill and is exactly the single-file-corruption shape.
     missing = [
@@ -3523,7 +3700,7 @@ def test_every_loop_skill_still_names_the_lookbehind_exempt_token(skill: str) ->
     )
 
 
-def test_the_six_file_exempt_token_gate_covers_all_six_loops() -> None:
+def test_the_exempt_token_gate_covers_every_loop() -> None:
     """NON-VACUITY for the parametrization, plus the one case it structurally cannot see.
 
     Two jobs, both about the gate above being narrower than it looks.
@@ -3531,13 +3708,13 @@ def test_the_six_file_exempt_token_gate_covers_all_six_loops() -> None:
     1. That gate is only as wide as `ALL_LOOPS`. A loop dropped from that tuple stops being
        checked with nothing turning red - the same hollowing that let a renamed selection
        call empty a guard earlier in this file. The tuple is cross-checked against the loop
-       skills actually on disk rather than pinned to a literal 6, because this module
+       skills actually on disk rather than pinned to a literal count, because this module
        defines `ALL_LOOPS` TWICE with identical values and a contributor editing the other
        copy would move nothing here.
     2. The gate above asks "do OTHER loop skills still carry this word", which is precisely
-       blind to the historical incident's real shape: all six corrupted AT ONCE, so no
-       sibling carries it and every per-skill check passes. The tree-wide gate does not
-       catch that either, because the word survives in docs. So the all-six case is pinned
+       blind to the historical incident's real shape: the six loop skills of the time were all
+       corrupted AT ONCE, so no sibling carried it and every per-skill check passed. The tree-wide gate does not
+       catch that either, because the word survives in docs. So the all-at-once case is pinned
        HERE: at least one lookbehind-exempt token must be carried by every loop skill.
     """
     on_disk = sorted(p.parent.name for p in SKILLS_ROOT.glob("*/SKILL.md")
@@ -3545,7 +3722,8 @@ def test_the_six_file_exempt_token_gate_covers_all_six_loops() -> None:
     assert sorted(ALL_LOOPS) == on_disk, (
         f"ALL_LOOPS is {sorted(ALL_LOOPS)} but the loop skills on disk are {on_disk} - the "
         "exempt-token gate is scoped to that tuple, so a loop missing from it silently stops "
-        "being guarded against the corruption that hit all six at once"
+        "being guarded against the kind of corruption that once hit every loop skill of the "
+        "time at once"
     )
     behind = _derived_exemptions(_exemption_pattern_source())["lookbehind"]
     texts = [_skill_text(loop).lower() for loop in ALL_LOOPS]
@@ -3580,7 +3758,7 @@ def test_the_forwarding_gate_covers_every_wrapper_that_claims_to_forward() -> No
     )
     beyond_the_loops = sorted(set(wrappers) - set(ALL_LOOPS))
     assert beyond_the_loops, (
-        "the forwarding gate now covers exactly the six loops, which is how it was first "
+        "the forwarding gate now covers exactly the loops, which is how it was first "
         "written and was wrong: commands/report.md forwards too and was ungated, so deleting "
         "its forwarding line reproduced this epic's own defect in a file no test read. If a "
         "non-loop wrapper genuinely stopped forwarding, this line is the deliberate decision"
@@ -3703,6 +3881,9 @@ def test_the_parser_does_NOT_read_past_the_end_of_the_sanitize_step(tmp_path) ->
 # cannot fire on a string it exempts. A test that hardcoded today's placeholder list
 # while the gate exempted a different one next month would be that blind spot one layer
 # up, which is exactly the shape this module has already been bitten by three times.
+# ONE deliberate addition (gh#355): the parsed set must also EQUAL a pinned literal,
+# `_PINNED_PLACEHOLDER_WORDS`, so a word cannot join the exemption without this file
+# being edited too. The per-word gates still iterate the parsed set.
 #
 # EVERY POSITIVE PATH LITERAL BELOW IS BUILT BY CONCATENATION at the account boundary,
 # the same trick ci.yml uses on its own terms. A spelled-out home path in this file would
@@ -3787,6 +3968,154 @@ def test_the_placeholder_exemption_parses_out_of_the_workflow() -> None:
             f"derived placeholder {w!r} is not a plausible word - the exemption changed "
             "shape and this parser is reading fragments"
         )
+
+
+#: gh#355. The placeholder words the home-path term exempts, PINNED as a literal. This is
+#: the one place the "parsed, never restated" rule above is deliberately broken, and the
+#: break is the point: every per-word gate here still iterates the PARSED set, but the
+#: parsed set must also EQUAL this one. The structural guard above only asks that each
+#: entry be alphabetic, and a real account name is alphabetic - adding one to ci.yml makes
+#: that account permanently invisible to the scan while every structural test stays green.
+#: Pinning it means an addition reds until this line is edited too, so widening the
+#: exemption is a reviewed act in two files rather than a one-line "false positive fix".
+_PINNED_PLACEHOLDER_WORDS = frozenset(
+    {"you", "user", "username", "name", "me", "example", "someone", "yourname"}
+)
+
+
+def test_the_placeholder_exemption_equals_the_pinned_set() -> None:
+    """gh#355: an account name added to the exemption list must not pass silently.
+
+    Equality, not subset: a REMOVED word is a behaviour change too (install prose that
+    writes the placeholder starts failing CI), and it should be just as deliberate.
+    """
+    words = _placeholder_words()
+    assert len(words) == len(set(words)), f"duplicate placeholder word(s) in ci.yml: {words}"
+    added = sorted(set(words) - _PINNED_PLACEHOLDER_WORDS)
+    removed = sorted(_PINNED_PLACEHOLDER_WORDS - set(words))
+    assert not added and not removed, (
+        f"the sanitize gate's placeholder exemption changed - added {added}, removed "
+        f"{removed}. Every exempt word is invisible to the scan as a home-path account, "
+        "everywhere, forever. If the word is a genuine placeholder (names nobody), update "
+        "_PINNED_PLACEHOLDER_WORDS in the same change so the widening is reviewed; if it is "
+        "anyone's account name, it does not belong in a shipped exemption at all"
+    )
+
+
+#: gh#355. Every term in the SHIPPED sanitize pattern, keyed by its exact source text, with
+#: the account-less prefix a probe is built from. The probes are completed with
+#: `_SYNTHETIC_ACCOUNT` at run time, so no line here spells a whole home path. The drive-
+#: letter term carries two probes because it accepts either separator.
+#:
+#: The install-specific alternatives (another product's name, a host alias, an address
+#: range) are NOT here and must not be: gh#821 moved them out of ci.yml into the local-only
+#: extra pattern, and pinning them here would publish them from the very tree the gate
+#: keeps them out of.
+_SHIPPED_TERM_PROBES = {
+    "C--Users-[A-Za-z0-9]+": ("C--Users-",),
+    "[A-Za-z]:[\\\\/]Users[\\\\/]": ("C:\\Users\\", "C:/Users/"),
+    "/c/Users/": ("/c/Users/",),
+    "(?<![A-Za-z]:)(?<!/c)/Users/": ("/Users/",),
+    "/home/": ("/home/",),
+}
+
+
+def _split_top_level_alternation(src: str) -> list[str]:
+    """Split a regex on `|` at depth zero, outside character classes and escapes."""
+    parts, depth, start, i, in_class = [], 0, 0, 0, False
+    while i < len(src):
+        c = src[i]
+        if c == "\\":
+            i += 2
+            continue
+        if in_class:
+            in_class = c != "]"
+        elif c == "[":
+            in_class = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "|" and depth == 0:
+            parts.append(src[start:i])
+            start = i + 1
+        i += 1
+    assert depth == 0 and not in_class, f"unbalanced sanitize pattern: {src!r}"
+    parts.append(src[start:])
+    return parts
+
+
+def _shipped_sanitize_terms() -> list[str]:
+    """The terms of ci.yml's pattern: each top-level alternative, with a leading `(?:...)`
+    prefix group (the home-path family, which shares one account shape) opened up into its
+    own alternatives."""
+    terms = []
+    for alt in _split_top_level_alternation(_sanitize_pattern_source()):
+        if not alt.startswith("(?:"):
+            terms.append(alt)
+            continue
+        depth, i, in_class, end = 0, 0, False, None
+        while i < len(alt) and end is None:
+            c = alt[i]
+            if c == "\\":
+                i += 2
+                continue
+            if in_class:
+                in_class = c != "]"
+            elif c == "[":
+                in_class = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+            i += 1
+        assert end is not None, f"unclosed prefix group in sanitize term {alt!r}"
+        terms.extend(_split_top_level_alternation(alt[3:end]))
+    return terms
+
+
+def test_every_shipped_sanitize_term_has_a_probe() -> None:
+    """gh#355's enumeration half: the probe table below is the term list, exactly.
+
+    A NEW term without a probe is a term nothing proves fires; a DELETED term whose probe
+    still passes would mean some other term is quietly covering for it. Either way the
+    table and the pattern have stopped agreeing, and this says which.
+    """
+    terms = _shipped_sanitize_terms()
+    assert len(terms) >= 5, f"parsed only {terms} out of the sanitize pattern - parser vacuous"
+    assert set(terms) == set(_SHIPPED_TERM_PROBES), (
+        f"the shipped sanitize terms and _SHIPPED_TERM_PROBES disagree: unprobed terms "
+        f"{sorted(set(terms) - set(_SHIPPED_TERM_PROBES))}, probes for absent terms "
+        f"{sorted(set(_SHIPPED_TERM_PROBES) - set(terms))}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("term", "prefix"),
+    [(t, p) for t, ps in _SHIPPED_TERM_PROBES.items() for p in ps],
+)
+def test_each_shipped_sanitize_term_fires_on_its_own_shape(term: str, prefix: str) -> None:
+    """gh#355: deleting any one term from ci.yml's pattern must red a test.
+
+    Before this, the structural tests all stayed green with the mangled-home-path term
+    deleted - the gate failed open on the very shape it was first written for. The match
+    must start AT OFFSET ZERO, so it is this probe's own term that fired: the two `/Users/`
+    lookbehinds exist precisely so the macOS term cannot stand in for the drive-letter or
+    MSYS ones, which makes each probe reachable only through its own term.
+    """
+    probe = prefix + _SYNTHETIC_ACCOUNT + "/CODE/x.py"
+    m = _compiled_sanitize().search(probe)
+    assert m is not None and m.start() == 0, (
+        f"the sanitize gate no longer fires on {prefix!r}<account> - the term {term!r} was "
+        "deleted or narrowed, and the gate fails open on that shape with every other test "
+        "still green"
+    )
+    assert m.end() >= len(prefix) + len(_SYNTHETIC_ACCOUNT), (
+        f"the {term!r} probe matched only {probe[:m.end()]!r} - it stopped short of the "
+        "account segment, so the term is no longer the one doing the work"
+    )
 
 
 def test_the_sanitize_pattern_matches_every_plain_absolute_home_form() -> None:
@@ -3902,16 +4231,17 @@ def test_the_sanitize_step_declares_exactly_one_pattern() -> None:
 
 
 def test_the_extra_pattern_extends_the_one_pattern_before_any_scan() -> None:
-    """gh#821. The install-specific alternatives join from a repository variable, and that has
-    to stay an EXTENSION of the one `pattern=`: appended once, only when the variable is set,
+    """gh#821. The install-specific alternatives join from a repository secret, and that has
+    to stay an EXTENSION of the one `pattern=`: appended once, only when the secret is set,
     before the first grep. Anything else lets the halves enforce different rules - the failure
     the test above exists for - arriving by a spelling (`pattern+=`) its count does not see.
     """
     lines = _sanitize_step_lines()
     header = "\n".join(lines)
-    assert "EXTRA_PATTERN: ${{ vars.SANITIZE_EXTRA_PATTERN }}" in header, (
-        "the sanitize step no longer reads the extra pattern from the repository variable "
-        "through `env:` - the private alternatives would reach no scan at all"
+    assert "EXTRA_PATTERN: ${{ secrets.SANITIZE_EXTRA_PATTERN }}" in header, (
+        "the sanitize step no longer reads the extra pattern from the repository secret "
+        "through `env:` - the private alternatives would reach no scan at all, or would reach "
+        "the run log unmasked (gh#866)"
     )
     script = [ln.strip() for ln in lines]
     assigns = [i for i, ln in enumerate(script) if re.match(r"pattern\+?=", ln)]
@@ -4770,14 +5100,18 @@ _WRITES_NOTHING = re.compile(
     re.I,
 )
 
-#: How far past the anchor the duty may run. The next top-level heading bounds it first in all
-#: five files today (measured 2026-09-24 after gh#454's failed-save bullet: 3100-4100 chars), so
-#: this is the backstop for a future edit that deletes the following heading — not the primary
-#: bound. Set above the longest real section rather than at a round number: a cap that truncates a
-#: live section silently drops the last constraint in it, which is exactly how the empty-case rule
-#: went missing when this was 3000 — and dev-manager's section had already outgrown 3500 (3546)
-#: before gh#454, so its last bullet was being cut off.
-_SAVE_DUTY_CAP = 4600
+#: How far past the anchor the duty may run. WHY IT EXISTS: the next top-level heading bounds the
+#: window first in all five files, and this is the backstop for a future edit that deletes that
+#: heading — without it the window would silently become the rest of the file, and every keyword
+#: gate below would start passing on text that is not the seat's save duty.
+#:
+#: WHY THIS VALUE: measured with `_save_duty_window`'s own anchor-to-heading rule, the sections run
+#: 2938 (jr-dev-3), 3015 (jr-dev-2), 3109 (jr-dev-1), 3953 (lead-dev) and 4217 (dev-manager)
+#: chars. The cap sits roughly 1000 above the longest, because a cap that truncates a live section
+#: silently drops the last constraint in it — that is how the empty-case rule went missing when
+#: this was 3000, and the previous 4600 had shrunk to under 400 chars of headroom. If a section
+#: outgrows this, re-measure and raise it; do not trim the section to fit.
+_SAVE_DUTY_CAP = 5200
 
 
 def _save_duty_window(skill: str) -> str:
@@ -5378,6 +5712,29 @@ def test_steward_checklist_registry_verbs_are_ones_the_cli_grants_it() -> None:
     caps = _registry_module.ACTOR_CAPABILITY
     refused = sorted(v for v in listed if "steward" not in caps[v].actors)
     assert not refused, f"checklist lists verbs the CLI refuses the steward: {refused}"
+    # Both ways: every verb the map grants the steward BEYOND the all-agents set must be on the
+    # checklist, and every such checklist verb must be one of those - a new grant the prose omits
+    # is a write nobody audits at end of wake.
+    all_agents = set(_registry_module.AGENTS)
+    special = {v for v, c in caps.items() if "steward" in c.actors and set(c.actors) != all_agents}
+    listed_special = {v for v in listed if v in caps and set(caps[v].actors) != all_agents}
+    assert special == listed_special, (
+        f"map grants {sorted(special)}, checklist lists {sorted(listed_special)}"
+    )
+    # The charter's "YOU MAY NOT FIX" exception must name every special verb that writes a row
+    # the steward does not own. `answer` is excluded: it fills only the answer cells REGISTRY.md's
+    # writer table assigns to a manager role, and the charter frames it as the delegated-authority
+    # answering duty, not as an edit of another seat's row.
+    flat_skill = _flat(_skill_text("steward"))
+    charter = flat_skill.split("YOU MAY NOT FIX", 1)[1]
+    anchor = charter.find("any registry row you do not own")
+    assert anchor != -1, "steward/SKILL.md lost its charter exception line - re-anchor"
+    exception = charter[anchor:]
+    end = exception.find(" * ")
+    assert end != -1, "charter exception bullet has no following bullet - re-anchor"
+    exception = exception[:end]
+    missing = sorted(v for v in special - {"answer"} if f"`{v}`" not in exception)
+    assert not missing, f"charter exception omits {missing}: {exception!r}"
 
 
 

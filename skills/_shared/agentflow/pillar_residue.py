@@ -16,9 +16,9 @@ a decision is 71 pages - 14% of the corpus, and 42 of those 71 carry exactly one
 gate over that corpus is red on the day it ships, and a gate that is red on the day it ships is
 a gate somebody turns off. So the recorded baseline is the contract: **the number can only go
 down, and any page that did not exist at baseline time must be clean.** That is a backstop
-against the corpus getting worse while the open question about the existing 71 is decided by a
-human. Do not "fix" this into a hard failure - doing so does not clean a single page, it only
-removes the signal that the next page is dirty.
+against the corpus getting worse; by recorded decision the existing 71 stay, and this ratchet is
+the control over them. Do not "fix" this into a hard failure - doing so does not clean a single
+page, it only removes the signal that the next page is dirty.
 
 WHY TWO CLASSES, KEPT APART. They are different kinds of fact and merging them buries one:
 
@@ -26,9 +26,10 @@ WHY TWO CLASSES, KEPT APART. They are different kinds of fact and merging them b
   install-specific alternatives of the local extra pattern file when it is configured. On a
   repo file these are a build failure today; on a pillar page they are simply unreached. This
   class is a REACH gap.
-* ``person`` - the bare personal name, which that pattern does **not** contain. Whether it
-  ever joins the pattern is an open human decision (registry Q-10079), not a defect. This class
-  is an OPEN QUESTION, and a single merged number would report it as though it were settled.
+* ``person`` - the bare personal name, which that pattern does **not** contain. That is a
+  recorded decision, not a defect: the bare name is a separate class, it does not join the
+  sanitize pattern, existing pages stay, and the ratchet is the control. A single merged number
+  would hide which of the two kinds of fact moved.
 
 NEITHER CLASS IS SPELLED OUT IN THIS FILE, deliberately, and not only to keep the sanitize gate
 green on this module. A second copy of a pattern is the read/write skew this fleet keeps
@@ -48,15 +49,17 @@ whose ``PAGES_DIRNAME`` and ``TERMINAL_PARTITIONS`` this module imports rather t
 the two cannot disagree about which files are live pages.
 
 READ-ONLY OVER THE PILLAR. This module never writes, moves or edits a page. Rewriting pillar
-pages is barred by standing decision and gated on Q-10079; the only file it can write is its own
-baseline, and only when asked with ``--update-baseline``.
+pages is barred by standing decision (existing pages stay; the ratchet is the control); the only
+file it can write is its own baseline, and only when asked with ``--update-baseline``.
 """
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass, field
 import datetime
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -64,6 +67,7 @@ from typing import Iterator, Sequence
 
 from agentflow.atomic_io import atomic_write
 from agentflow.sanitize_extra import (
+    EXTRA_PATTERN_RELPATH,
     ExtraPattern,
     ExtraPatternUnreadable,
     read_extra_pattern,
@@ -91,7 +95,9 @@ CLASSES: tuple[str, ...] = (CLASS_SANITIZE, CLASS_PERSON)
 #:
 #: WHAT THAT COSTS, named rather than glossed: no version history and no review. Two things pay
 #: it down - the file carries a `history` list that this module APPENDS to and never rewrites, so
-#: each lowering leaves a dated record in the file itself, and the baseline is never written
+#: each lowering leaves a dated record in the file itself (one exception, and it keeps the record:
+#: an unreadable baseline replaced under `--accept-worsening` starts a new history, and the old
+#: file is kept beside it as `*.unreadable-<date>.json`), and the baseline is never written
 #: except on an explicit `--update-baseline` (or seeded EMPTY by install/provision.py for a
 #: pillar that has no pages yet, which has no residue to excuse).
 BASELINE_FILENAME = "residue-baseline.json"
@@ -124,12 +130,38 @@ class ResidueUnmeasurable(Exception):
     """
 
 
+class BaselineMissing(ResidueUnmeasurable):
+    """No baseline file exists. Still UNMEASURABLE (exit 2), but the scan itself succeeded, so
+    :func:`run` prints the per-page report before refusing: that report is what a human reads
+    before recording one."""
+
+
+class BaselineUnreadable(ResidueUnmeasurable):
+    """A baseline file exists and cannot be used: not JSON, the wrong shape, or a schema_version
+    this code does not speak and that is not newer. ``--update-baseline`` treats it as "cannot
+    prove this is not a worsening", so it refuses unless ``--accept-worsening`` is given."""
+
+
+class BaselineNewerSchema(ResidueUnmeasurable):
+    """A baseline whose schema_version is NEWER than this code speaks. Refused even under
+    ``--accept-worsening``: recording over it would downgrade the file to an older shape and
+    drop whatever the newer one carried. The remedy is a newer agentflow, not a flag."""
+
+
 @dataclass(frozen=True)
 class PageResidue:
-    """Per-page hit counts, by class. Only pages with at least one hit are kept."""
+    """Per-page hit counts, by class. Only pages with at least one hit are kept.
+
+    ``hits`` is ``(line, class)`` per match - WHERE, never WHAT. The matched text is never kept:
+    the pattern is written so nobody can read it, and a report that echoed its matches would
+    publish the terms into every log it lands in. ``relpath`` is the page's path under the wiki
+    root, so a reader can open the file without rebuilding the slug-to-path rule.
+    """
 
     slug: str
     counts: dict[str, int]
+    hits: tuple[tuple[int, str], ...] = ()
+    relpath: str = ""
 
     def total(self) -> int:
         return sum(self.counts.values())
@@ -210,7 +242,7 @@ def sanitize_pattern(ci_yml: Path = DEFAULT_CI_YML, extra: ExtraPattern | None =
     stays so a future generic term that does need one is read correctly.
 
     ``extra`` is :func:`agentflow.sanitize_extra.read_extra_pattern`'s result. It is appended
-    the way the CI step appends the repository variable, so CI, the cut's check and this module
+    the way the CI step appends the repository secret, so CI, the cut's check and this module
     all build the same expression.
     """
     body = _PATTERN_LINE_RE.match(sanitize_pattern_line(ci_yml)).group("body")
@@ -266,17 +298,69 @@ def compile_classes(
     }
 
 
+def configured_person_name() -> str:
+    """``person.name`` from the environment config, or UNMEASURABLE.
+
+    One resolution for both readers: the CLI (when no ``--person-name`` is given) and the
+    writer's save-time guard (:func:`writer_matchers`). An environment that will not load says
+    nothing about the corpus; uncaught, the CLI would exit 1 with a traceback, and 1 is the code
+    that reports the corpus got dirtier.
+    """
+    from . import config
+
+    try:
+        return config.load_environment().person.name
+    except (config.ConfigError, OSError, UnicodeDecodeError) as exc:
+        raise ResidueUnmeasurable(
+            "person.name not resolved: the environment config did not load: "
+            f"{config.error_line(exc, config.environment_path())} (or pass --person-name)"
+        ) from exc
+
+
+def pillar_extra_path(wiki_root: Path) -> Path:
+    """The project's extra pattern file for the pillar at *wiki_root*: ``<project>/publish/...``,
+    beside the ``wiki/`` directory. The ONE derivation from a wiki root, shared by the writer's
+    guard and the CLI's ``--wiki-root``, so the two give one verdict on one pillar. The root is
+    resolved first: the parent of a relative ``.`` is ``.``, which would look inside the pillar."""
+    return Path(wiki_root).resolve().parent / EXTRA_PATTERN_RELPATH
+
+
+def writer_matchers(wiki_root: Path) -> dict[str, re.Pattern]:
+    """The matchers the ratchet would apply to a page under *wiki_root*, for ``write_page``.
+
+    The same :func:`compile_classes` and the same person resolution as the CLI. The extra
+    pattern is the project's file beside the pillar (``<project>/publish/...``, the path
+    :func:`agentflow.sanitize_extra.project_extra_path` builds), because the writer is handed a
+    wiki root and not a project key. NO BASELINE IS READ: the baseline is the ratchet's excuse
+    list for old pages, and a new page is never excused, so a fresh pillar with no baseline is
+    still measurable here. Raises :class:`ResidueUnmeasurable` when a class cannot be built.
+    """
+    try:
+        extra = read_extra_pattern(pillar_extra_path(wiki_root))
+    except ExtraPatternUnreadable as exc:
+        raise ResidueUnmeasurable(str(exc)) from None
+    return compile_classes(person_name=configured_person_name(), extra=extra)
+
+
 def resolve_extra(a: argparse.Namespace) -> ExtraPattern:
     """The extra pattern this run unions into the ``sanitize`` class.
 
-    ``--sanitize-extra-pattern`` wins; else the project's file under the data root, found the
-    way :mod:`agentflow.publish` finds it; else not configured. A file that exists and cannot be
-    used, or a project whose data root will not resolve, is UNMEASURABLE - falling back to the
-    generic shapes would count fewer terms and report the drop as a cleaner pillar.
+    ``--sanitize-extra-pattern`` wins; else, with ``--wiki-root``, the file beside that pillar
+    (:func:`pillar_extra_path`, the writer's derivation); else, with ``--project``, the project's
+    file under the data root, found the way :mod:`agentflow.publish` finds it; else
+    UNMEASURABLE, because no source was named and nothing was looked at. The order is the wiki
+    root's own: ``--wiki-root`` wins over ``--project`` there, so the pattern follows the
+    pillar actually scanned. A file that exists and cannot be used, or a project whose data
+    root will not resolve, is UNMEASURABLE - falling back to the generic shapes would count
+    fewer terms and report the drop as a cleaner pillar. A NAMED path that does not exist
+    stays "not configured", saying where it looked.
     """
     explicit = getattr(a, "sanitize_extra", None)
+    wiki_root = getattr(a, "wiki_root", None)
     project = getattr(a, "project", None)
     path = Path(explicit) if explicit else None
+    if path is None and wiki_root:
+        path = pillar_extra_path(Path(wiki_root))
     if path is None and project:
         from . import config
 
@@ -288,6 +372,11 @@ def resolve_extra(a: argparse.Namespace) -> ExtraPattern:
                 f"{config.error_line(exc, config.environment_path())} "
                 "(or pass --sanitize-extra-pattern)"
             ) from exc
+    if path is None:
+        raise ResidueUnmeasurable(
+            "no sanitize extra pattern source: pass --sanitize-extra-pattern, --wiki-root or "
+            "--project"
+        )
     try:
         return read_extra_pattern(path)
     except ExtraPatternUnreadable as exc:
@@ -345,10 +434,21 @@ def scan_pillar(wiki_root: Path, matchers: dict[str, re.Pattern]) -> Report:
         except (UnicodeDecodeError, OSError) as exc:
             report.unreadable.append(f"{slug}: {exc!r}")
             continue
-        counts = {cls: len(rx.findall(text)) for cls, rx in matchers.items()}
-        counts = {cls: n for cls, n in counts.items() if n}
+        counts: dict[str, int] = {}
+        hits: list[tuple[int, str]] = []
+        for cls, rx in matchers.items():
+            # finditer yields the same non-overlapping matches findall counted; only the
+            # match's START is read, so the literal never leaves this loop.
+            for m in rx.finditer(text):
+                counts[cls] = counts.get(cls, 0) + 1
+                hits.append((text.count("\n", 0, m.start()) + 1, cls))
         if counts:
-            report.pages[slug] = PageResidue(slug=slug, counts=counts)
+            report.pages[slug] = PageResidue(
+                slug=slug,
+                counts=counts,
+                hits=tuple(sorted(hits, key=lambda h: (h[0], CLASSES.index(h[1])))),
+                relpath=path.relative_to(wiki_root).as_posix(),
+            )
     return report
 
 
@@ -363,8 +463,9 @@ BASELINE_NOTE = (
     "on the day it ships is a gate somebody turns off - so the contract is direction, not zero: "
     "a page not listed here must be clean, and a page listed here may not get worse. Do NOT "
     "convert this into a hard failure; that cleans no page and only removes the signal that the "
-    "NEXT page is dirty. Whether the `person` class should ever have been residue at all is an "
-    "open human decision (registry Q-10079) - that is why it is counted apart from `sanitize` "
+    "NEXT page is dirty. The `person` class is the bare personal name, and the decision on it is "
+    "recorded: it is a separate class, it does not join the sanitize pattern, existing pages "
+    "stay, and this ratchet is the control - that is why it is counted apart from `sanitize` "
     "instead of summed with it. Lower it with `--update-baseline` after removing residue; never "
     "hand-edit a count upward."
 )
@@ -390,59 +491,110 @@ def load_baseline(path: Path) -> Baseline:
 
     A missing or unreadable baseline is UNMEASURABLE, not "everything is new" and not
     "everything is allowed". Both of those defaults are a silent verdict about 500 files.
+
+    Two kinds of refusal, kept apart because they want opposite remedies. A file that could not
+    be READ off the disk (permissions, a sharing violation from another process) says nothing
+    about its contents: plain :class:`ResidueUnmeasurable`, and the remedy is to rerun. A file
+    whose CONTENT is not a baseline (not UTF-8, not JSON, the wrong shape, an unknown schema) is
+    :class:`BaselineUnreadable`, the one that ``--accept-worsening`` may replace - so a transient
+    read error on a good file can never be the thing that resets its history.
     """
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        data = path.read_bytes()
     except FileNotFoundError:
-        raise ResidueUnmeasurable(
+        raise BaselineMissing(
             f"no baseline at {path}. The ratchet compares against a recorded state, so without "
-            f"one there is nothing to compare and this run is not a verdict. Record the current "
-            f"corpus with `--update-baseline` - read the report first, because recording is "
-            f"accepting every page it lists"
+            f"one there is nothing to compare and this run is not a verdict. The report on stdout "
+            f"lists every page that carries residue, by path, line and class; read it first, "
+            f"because recording the current corpus with `--update-baseline` accepts every page "
+            f"it lists"
         ) from None
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ResidueUnmeasurable(f"baseline at {path} is unreadable: {exc!r}") from exc
-
-    version = raw.get("schema_version")
-    if version != BASELINE_SCHEMA_VERSION:
+    except OSError as exc:
         raise ResidueUnmeasurable(
+            f"baseline at {path} could not be read from disk: {exc!r}. That says nothing about "
+            f"its contents, so it is not replaceable with --accept-worsening; rerun once whatever "
+            f"holds or guards the file lets go"
+        ) from exc
+    try:
+        # ValueError covers UnicodeDecodeError, JSONDecodeError and an over-long integer literal.
+        raw = json.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise BaselineUnreadable(f"baseline at {path} is unreadable: {exc!r}") from exc
+
+    if not isinstance(raw, dict):
+        raise BaselineUnreadable(
+            f"baseline at {path} is JSON but not an object (got {type(raw).__name__})"
+        )
+    version = raw.get("schema_version")
+    if isinstance(version, bool):
+        # `true == 1` in Python, so a bool would otherwise pass as version 1.
+        raise BaselineUnreadable(f"baseline at {path} has a boolean schema_version {version!r}")
+    numeric = version
+    if isinstance(version, str):
+        # A quoted "2" is still a claim to be version 2; reading it as merely unreadable would
+        # let --accept-worsening downgrade it.
+        try:
+            numeric = float(version)
+        except ValueError:
+            numeric = None
+    if isinstance(numeric, (int, float)) and numeric > BASELINE_SCHEMA_VERSION:
+        raise BaselineNewerSchema(
+            f"baseline at {path} is schema_version {version!r}, NEWER than the "
+            f"{BASELINE_SCHEMA_VERSION} this code speaks. Upgrade agentflow and re-run"
+        )
+    if version != BASELINE_SCHEMA_VERSION:
+        raise BaselineUnreadable(
             f"baseline at {path} is schema_version {version!r}, this code speaks "
             f"{BASELINE_SCHEMA_VERSION}. Refusing rather than reading it optimistically: a "
             f"misread baseline excuses pages nobody excused"
         )
     pages = raw.get("pages")
     if not isinstance(pages, dict):
-        raise ResidueUnmeasurable(f"baseline at {path} has no `pages` object")
-    return Baseline(
-        pages={str(k): {str(c): int(n) for c, n in v.items()} for k, v in pages.items()},
-        recorded=str(raw.get("recorded", "unknown")),
-        pages_scanned=int(raw.get("pages_scanned", 0)),
-        history=list(raw.get("history", [])),
-    )
+        raise BaselineUnreadable(f"baseline at {path} has no `pages` object")
+    # JSON that parses but has the wrong shape inside (a page that is not an object, a count
+    # that is not a number or is Infinity, a history that is not a list) is the same fact as
+    # JSON that does not parse: the file cannot be read as a baseline.
+    try:
+        history = raw.get("history", [])
+        if not isinstance(history, list):
+            raise TypeError(f"`history` is {type(history).__name__}, not a list")
+        return Baseline(
+            pages={str(k): {str(c): int(n) for c, n in v.items()} for k, v in pages.items()},
+            recorded=str(raw.get("recorded", "unknown")),
+            pages_scanned=int(raw.get("pages_scanned", 0)),
+            history=list(history),
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise BaselineUnreadable(f"baseline at {path} has the wrong shape: {exc!r}") from exc
 
 
-def write_baseline(path: Path, report: Report, *, recorded: str) -> None:
-    """Record ``report`` as the new baseline, APPENDING to the history rather than replacing it.
+def write_baseline(
+    path: Path,
+    report: Report,
+    *,
+    recorded: str,
+    history: Sequence[dict] = (),
+    entry_fields: dict | None = None,
+) -> None:
+    """Record ``report`` as the new baseline, APPENDING one entry to ``history``.
+
+    ``history`` is the caller's already-loaded baseline history - passed in rather than re-read
+    here, so the file appended to is the one the caller checked, not whatever is on disk a
+    moment later. A caller that loaded no baseline passes nothing and starts a fresh history.
+    ``entry_fields`` adds keys to the new entry; replacing an unreadable baseline uses it to name
+    the aside copy (:func:`keep_unreadable_aside`) that still holds the old history, rather than
+    fabricating a placeholder entry.
 
     ``recorded`` is passed in, never read from a clock: this module has no clock, and a caller
     that must supply the date cannot accidentally stamp a run it did not make.
     """
-    history = []
-    if path.exists():
-        try:
-            history = list(load_baseline(path).history)
-        except ResidueUnmeasurable:
-            # An unreadable OLD baseline must not block recording a new one, but it must not be
-            # silently dropped either: the gap is written into the history it interrupts.
-            history = [{"recorded": "unknown", "note": "previous baseline was unreadable"}]
-    history.append(
-        {
-            "recorded": recorded,
-            "pages_scanned": report.pages_scanned,
-            "pages_with_residue": len(report.pages),
-            "totals": {cls: report.class_total(cls) for cls in CLASSES},
-        }
-    )
+    entry: dict = {
+        "recorded": recorded,
+        "pages_scanned": report.pages_scanned,
+        "pages_with_residue": len(report.pages),
+        "totals": {cls: report.class_total(cls) for cls in CLASSES},
+    }
+    entry.update(entry_fields or {})
     doc = {
         "schema_version": BASELINE_SCHEMA_VERSION,
         "note": BASELINE_NOTE,
@@ -455,9 +607,54 @@ def write_baseline(path: Path, report: Report, *, recorded: str) -> None:
             slug: dict(sorted(res.counts.items()))
             for slug, res in sorted(report.pages.items())
         },
-        "history": history,
+        "history": [*history, entry],
     }
     atomic_write(path, json.dumps(doc, indent=2, sort_keys=False) + "\n")
+
+
+def aside_path(path: Path, recorded: str, n: int = 1) -> Path:
+    """Where an unreadable baseline replaced on ``recorded`` is kept: the ONE spelling of
+    ``<stem>.unreadable-<date>[-n]<suffix>``, shared by the refusal message and the copy."""
+    suffix = "" if n == 1 else f"-{n}"
+    return path.with_name(f"{path.stem}.unreadable-{recorded}{suffix}{path.suffix}")
+
+
+def keep_unreadable_aside(path: Path, recorded: str) -> Path:
+    """Copy an unreadable baseline to a sibling file and return that file's path.
+
+    A COPY, made BEFORE the new baseline is written, and never a move: the new file lands with
+    an atomic replace, so if that write fails the old file is still at ``path`` (the caller then
+    removes this copy). Moving first would open a window with no baseline at all. The copy is
+    created exclusively and never overwrites an earlier one, so a second unreadable baseline on
+    the same date cannot erase the first's bytes. A dangling symlink is copied as a link to the
+    same target - its bytes are unreachable, but where it pointed is still worth keeping. A copy
+    that fails part-way is removed, so a half-written file never poses as the kept original.
+    """
+    dangling = path.is_symlink() and not path.exists()
+    target = os.readlink(path) if dangling else None
+    data = None if dangling else path.read_bytes()
+    for n in range(1, 1000):
+        aside = aside_path(path, recorded, n)
+        if dangling:
+            try:
+                os.symlink(target, aside)
+            except FileExistsError:
+                continue
+            return aside
+        try:
+            fh = open(aside, "xb")
+        except FileExistsError:
+            continue
+        try:
+            with fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            aside.unlink(missing_ok=True)
+            raise
+        return aside
+    raise OSError(f"no free name beside {path} to keep the unreadable baseline under")
 
 
 def violations(report: Report, baseline: Baseline) -> list[str]:
@@ -474,15 +671,21 @@ def violations(report: Report, baseline: Baseline) -> list[str]:
 
     A page that got cleaner, or disappeared, is never a violation; it is what `--update-baseline`
     is for.
+
+    Each finding is followed by one ``<path>:<line> <class>`` line per hit it covers (every hit
+    for a new page, the grown class's hits for a worsened one), so a reader can go straight to
+    the line. The matched text is never printed.
     """
     out: list[str] = []
     for slug in sorted(report.pages):
-        counts = report.pages[slug].counts
+        res = report.pages[slug]
+        counts = res.counts
         if slug not in baseline.pages:
             detail = ", ".join(f"{cls}={counts[cls]}" for cls in CLASSES if cls in counts)
             out.append(
                 f"NEW PAGE WITH RESIDUE  {slug}  ({detail}) - this page is not in the baseline, "
                 f"so it was written after the ratchet was set and had to be clean"
+                + _hit_lines(res, set(counts))
             )
             continue
         for cls in CLASSES:
@@ -491,8 +694,22 @@ def violations(report: Report, baseline: Baseline) -> list[str]:
                 out.append(
                     f"RESIDUE INCREASED      {slug}  {cls}: {was} -> {now} - the baseline is a "
                     f"ceiling per page per class"
+                    + _hit_lines(res, {cls})
                 )
     return out
+
+
+def _hit_lines(res: PageResidue, classes: set[str]) -> str:
+    """One indented ``<path>:<line> <class>`` line per (line, class) of ``classes``: position and
+    class only, never the matched text. Several matches of one class on one line collapse into
+    one line suffixed ``(xN)``, so the line count still sums to the class count without printing
+    what reads as a duplicated finding."""
+    path = res.relpath or f"{PAGES_DIRNAME}/{res.slug}.md"
+    counts = Counter(h for h in res.hits if h[1] in classes)
+    return "".join(
+        f"\n    {path}:{line} {cls}" + (f" (x{n})" if n > 1 else "")
+        for (line, cls), n in counts.items()
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -516,8 +733,9 @@ def render(
             CLASS_SANITIZE: "terms the CI sanitize pattern already covers "
                             f"({sources or 'parsed from ci.yml'}; "
                             "CI cannot reach these pages, this check is their only cover)",
-            CLASS_PERSON: "the bare personal name, which that pattern does NOT contain; whether "
-                          "it should is an open human decision (registry Q-10079)",
+            CLASS_PERSON: "the bare personal name, which that pattern does NOT contain; by "
+                          "recorded decision it stays a separate class, existing pages stay, "
+                          "and this ratchet is the control",
         }[cls]
         lines.append(f"  {cls:<9} {len(pages):>4} pages, {report.class_total(cls):>4} hits")
         lines.append(f"            {gloss}")
@@ -527,13 +745,38 @@ def render(
             f"  baseline recorded {baseline.recorded}: {len(baseline.pages)} pages with residue "
             f"over {baseline.pages_scanned} scanned"
         )
-        lines.append(f"  {len(report.pages_new_vs(baseline))} pages are new since then")
+        # pages_new_vs counts residue-carrying pages only, so a growing clean pillar reads 0
+        # there; the scanned delta shows growth, as a net figure (gh#885).
+        lines.append(
+            f"  {len(report.pages_new_vs(baseline))} pages not in the baseline carry residue"
+        )
+        lines.append(
+            f"  pages scanned: {report.pages_scanned} now, {baseline.pages_scanned} at baseline "
+            f"({report.pages_scanned - baseline.pages_scanned:+d})"
+        )
         lines.append("")
     if found:
         lines.append("RATCHET VIOLATED - the corpus is dirtier than the recorded baseline:")
         lines.extend(f"  {v}" for v in found)
     elif baseline is not None:
         lines.append("ratchet held: no new page carries residue and no page got worse.")
+    return "\n".join(lines)
+
+
+def render_pages(report: Report) -> str:
+    """Every page that carries residue, each with one ``<path>:<line> <class>`` line per hit.
+
+    This is the list recording a baseline accepts, so it is printed whenever a run has no
+    baseline and before every ``--update-baseline`` write: a recording made from class counts
+    alone excuses pages nobody named. Position and class only, never the matched text
+    (:func:`_hit_lines`)."""
+    if not report.pages:
+        return "no page carries residue; recording a baseline accepts none."
+    lines = [f"{len(report.pages)} pages carry residue; recording a baseline accepts every one:"]
+    for slug in sorted(report.pages):
+        res = report.pages[slug]
+        detail = ", ".join(f"{cls}={res.counts[cls]}" for cls in CLASSES if cls in res.counts)
+        lines.append(f"  {slug}  ({detail})" + _hit_lines(res, set(res.counts)))
     return "\n".join(lines)
 
 
@@ -568,13 +811,19 @@ def add_arguments(sp: argparse.ArgumentParser) -> argparse.ArgumentParser:
                          "(default: the one shipped beside this code)")
     sp.add_argument("--sanitize-extra-pattern", dest="sanitize_extra",
                     help="explicit local-only extra sanitize pattern file, unioned into the "
-                         "sanitize class (default: <data_root>/projects/<project>/publish/"
-                         "sanitize-extra-pattern.txt; absent = not configured)")
+                         "sanitize class (default: publish/sanitize-extra-pattern.txt beside "
+                         "the --wiki-root, else under <data_root>/projects/<project>/; "
+                         "absent = not configured)")
     sp.add_argument("--update-baseline", dest="update_baseline", metavar="YYYY-MM-DD",
                     type=iso_date,
                     help="RECORD the current corpus as the new baseline, stamped with this date. "
-                         "Accepts every page in the report; read it first. Lowering the baseline "
-                         "is free; raising it is REFUSED unless --accept-worsening is given.")
+                         "Accepts every page in the report, which lists each one by path, line "
+                         "and class before writing; a run without this flag and without a "
+                         "baseline prints the same list and exits 2. Lowering the baseline "
+                         "is free; raising it is REFUSED (exit 1) unless --accept-worsening is "
+                         "given. An existing baseline that cannot be read is REFUSED (exit 2) "
+                         "unless --accept-worsening is given, and then kept aside, not deleted; "
+                         "one with a newer schema_version is REFUSED (exit 2) regardless.")
     sp.add_argument("--accept-worsening", dest="accept_worsening", action="store_true",
                     help="allow --update-baseline to record a corpus that is WORSE than the "
                          "recorded baseline. Without it, recording a worsening is refused: the "
@@ -598,25 +847,18 @@ def run(a: argparse.Namespace, wiki_root: Path) -> int:
       an undecodable page, no project, an environment config that will not load (for
       ``person.name`` or ``data_root``). Nothing has been observed
       about the corpus, in either direction. A caller must not read this as clean, and must not
-      read it as dirty either.
-    * **3 - the filesystem refused** while recording a baseline.
+      read it as dirty either. With no baseline the scan still ran, so the report and its
+      per-page list (:func:`render_pages`) are printed before the refusal. Under
+      ``--update-baseline`` it is also the refusal to record over an existing baseline that
+      cannot be read (without ``--accept-worsening``) or that has a newer schema_version
+      (always) - not 1, because nothing was learned about whether the corpus got dirtier.
+    * **3 - the filesystem refused** while recording a baseline. The old baseline is still in
+      place: an unreadable one is copied aside before the new one is written, never moved.
 
     The split between 1 and 2 is the point. A checker that returned 0 when it could not read its
     own pattern would report a clean corpus it never looked at, which is worse than red.
     """
-    person_name = a.person_name
-    if not person_name:
-        from . import config
-
-        # An environment that will not load says nothing about the corpus. Uncaught, it exits 1
-        # with a traceback, and 1 is the code that reports the corpus got dirtier.
-        try:
-            person_name = config.load_environment().person.name
-        except (config.ConfigError, OSError, UnicodeDecodeError) as exc:
-            raise ResidueUnmeasurable(
-                "person.name not resolved: the environment config did not load: "
-                f"{config.error_line(exc, config.environment_path())} (or pass --person-name)"
-            ) from exc
+    person_name = a.person_name or configured_person_name()
 
     ci_yml = Path(a.ci_yml) if a.ci_yml else DEFAULT_CI_YML
     extra = resolve_extra(a)
@@ -632,13 +874,48 @@ def run(a: argparse.Namespace, wiki_root: Path) -> int:
 
     path = baseline_path(wiki_root)
     if a.update_baseline:
+        # A MISSING baseline records freely: there is no ratchet yet to raise. An UNREADABLE one
+        # (its CONTENT is bad) cannot prove this run is not a worsening, so it takes the same
+        # word a worsening does, and its bytes are kept aside rather than overwritten. A
+        # NEWER-schema one is refused whatever the flags, because recording over it would
+        # downgrade the file. A file that could not be READ (plain ResidueUnmeasurable, e.g. a
+        # sharing violation on a good file) propagates as exit 2 with no bypass: a rerun is the
+        # remedy, and a flag that reset good history over a transient would be the wrong one.
         existing = None
+        unreadable: BaselineUnreadable | None = None
         try:
+            if path.is_symlink() and not path.exists():
+                # Reads as missing, but recording would replace the link and lose whatever it
+                # pointed at with no copy kept: treat it as unreadable, not as absent.
+                raise BaselineUnreadable(
+                    f"baseline at {path} is a symlink whose target is missing "
+                    f"({os.readlink(path)!r})"
+                )
             existing = load_baseline(path)
-        except ResidueUnmeasurable:
+        except BaselineMissing:
             pass
+        except BaselineUnreadable as exc:
+            unreadable = exc
+        except BaselineNewerSchema as exc:
+            raise BaselineNewerSchema(
+                f"REFUSED to record: {exc}. Recording over it is refused even with "
+                f"--accept-worsening, because it would downgrade the file"
+            ) from exc
+        if unreadable is not None and not a.accept_worsening:
+            # The report first, as the no-baseline run prints it: the remedy below accepts every
+            # page on it, and a remedy named over an empty stdout accepts pages nobody read.
+            print(render(report, None, [], extra.sources()))
+            print("\n" + render_pages(report))
+            raise ResidueUnmeasurable(
+                f"REFUSED to record: {unreadable}. An unreadable baseline cannot show that this "
+                f"run is not a worsening, so recording over it needs --accept-worsening, which "
+                f"accepts every page listed above; with it, the old file is kept beside the new "
+                f"one as {aside_path(path, a.update_baseline).name} (numbered if that name is "
+                f"taken), not deleted"
+            ) from unreadable
         found = violations(report, existing) if existing else []
         print(render(report, existing, found, extra.sources()))
+        print("\n" + render_pages(report))
         # LOWERING the baseline is always free; RAISING it needs the word. Recording is
         # accepting, so this is the one command that can loosen the ratchet - and it used to
         # return 0 unconditionally, which made the only command that writes also the only one
@@ -653,8 +930,28 @@ def run(a: argparse.Namespace, wiki_root: Path) -> int:
                 file=sys.stderr,
             )
             return 1
-        write_baseline(path, report, recorded=a.update_baseline)
+        aside = keep_unreadable_aside(path, a.update_baseline) if unreadable else None
+        try:
+            write_baseline(
+                path,
+                report,
+                recorded=a.update_baseline,
+                history=existing.history if existing else (),
+                entry_fields={"replaced_unreadable_baseline": aside.name} if aside else None,
+            )
+        except BaseException:
+            # The old file is still at `path` (the write is an atomic replace), so the copy is
+            # now a stray duplicate; remove it rather than leave a second "kept" file behind.
+            if aside is not None:
+                aside.unlink(missing_ok=True)
+            raise
         print(f"\nbaseline recorded at {path} ({a.update_baseline})")
+        if aside is not None:
+            print(
+                f"REPLACED an unreadable baseline via --accept-worsening; its bytes and history "
+                f"are kept at {aside}.",
+                file=sys.stderr,
+            )
         if found:
             print(
                 f"RAISED the ratchet: {len(found)} violation(s) accepted via "
@@ -663,7 +960,13 @@ def run(a: argparse.Namespace, wiki_root: Path) -> int:
             )
         return 0
 
-    baseline = load_baseline(path)
+    try:
+        baseline = load_baseline(path)
+    except BaselineMissing:
+        # Still exit 2, but with the report the refusal tells the reader to read first.
+        print(render(report, None, [], extra.sources()))
+        print("\n" + render_pages(report))
+        raise
     found = violations(report, baseline)
     print(render(report, baseline, found, extra.sources()))
     return 1 if found else 0

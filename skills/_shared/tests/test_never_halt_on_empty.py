@@ -284,6 +284,11 @@ _ALLOWED = (
 
     # ---- the residual-key drop this epic added ----
     "drop them on your next state-file write",
+
+    # ---- the token-budget rule's API-refusal stop, which is NOT a no-work stop ----
+    # "exhaustion" here means a real context-length refusal on an actual call; the same
+    # rule tells the seat a budget counter at 0 is never that, and to run its wake.
+    "counts as exhaustion: report its exact text and stop",
 )
 
 

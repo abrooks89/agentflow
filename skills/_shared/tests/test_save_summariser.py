@@ -32,7 +32,11 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
+import signal
 import subprocess
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,6 +61,11 @@ from agentflow.save_summariser import (
 from agentflow.stream_report import STREAM_CHARS
 from agentflow.tracked_paths import tracked_files
 from agentflow.wiki import GENERATED_MARKER, initial_pillar_files
+
+#: Every write here passes ``write_page``'s residue guard, which resolves the configured person
+#: from the environment config. A hermetic one (``conftest.residue_config``), so the suite does
+#: not depend on the machine's config: absent on a CI runner, it would refuse every write.
+pytestmark = pytest.mark.usefixtures("residue_config")
 
 #: The REAL default runner, captured at import time. `_no_real_spawns` below replaces the module
 #: attribute for every test, so the only way to exercise the genuine one is to have kept a
@@ -548,7 +557,94 @@ def test_nothing_durable_is_not_a_failure(wiki_root: Path) -> None:
     )
     assert outcome.status == "nothing-durable"
     assert not outcome.wrote and not outcome.failed
+    assert outcome.spawned is True
     assert outcome.reason.strip()
+    assert _pages(wiki_root) == []
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        f"`{NOTHING_DURABLE}`",
+        f"{NOTHING_DURABLE}.",
+        "Nothing durable",
+        f'"{NOTHING_DURABLE}"\n',
+        f"```\n{NOTHING_DURABLE}\n```",
+    ],
+)
+def test_a_wrapped_or_recased_nothing_durable_is_still_nothing_durable(
+    wiki_root: Path, reply: str
+) -> None:
+    """gh#971: the prompt shows the token in backticks, so the model echoes it back that way.
+
+    Reading that as a malformed page records the most common outcome as a failed save.
+    """
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c", runner=_runner(reply), environ={}
+    )
+    assert outcome.status == "nothing-durable", outcome.render()
+    assert _pages(wiki_root) == []
+    with pytest.raises(ValueError, match="is not a page"):
+        parse_summary(reply)
+
+
+def test_a_reply_that_only_mentions_nothing_durable_is_not_the_token(wiki_root: Path) -> None:
+    """The normalisation strips wrapping, it does not search: a sentence is not the token."""
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c",
+        runner=_runner(f"I think the answer is {NOTHING_DURABLE}"), environ={},
+    )
+    assert outcome.status == "failed"
+
+
+def test_a_fenced_reply_writes_a_page_with_no_stray_fence(wiki_root: Path) -> None:
+    """gh#971: a wrapping fence left in the body renders the rest of the page as code."""
+    reply = "```\nSLUG: fenced-page\nTITLE: A fenced page\nBODY:\nLesson text, see [[other]].\n```"
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c", runner=_runner(reply), lane="lead-dev",
+        environ={},
+    )
+    assert outcome.status == "wrote", outcome.render()
+    assert _pages(wiki_root) == ["fenced-page.md"]
+    assert "```" not in (wiki_root / "pages" / "fenced-page.md").read_text(encoding="utf-8")
+
+
+def test_a_tilde_fenced_reply_and_token_are_unwrapped_like_backtick_ones() -> None:
+    """``~~~`` is the other CommonMark fence; left in, it unbalances the page the same way."""
+    _, _, body = parse_summary("~~~\nSLUG: s\nTITLE: t\nBODY:\nsee [[x]]\n~~~")
+    assert "~~~" not in body
+    assert mod.is_nothing_durable("~~~\nNOTHING DURABLE\n~~~")
+
+
+def test_a_body_that_ends_in_its_own_code_block_keeps_the_closing_fence() -> None:
+    """Only a WRAPPING fence is stripped; a body's own closing fence is not."""
+    reply = "SLUG: s\nTITLE: t\nBODY:\nsee [[x]]\n```\ncode\n```\n"
+    _, _, body = parse_summary(reply)
+    assert body.count("```") == 2
+
+
+def test_a_slug_with_a_trailing_md_is_written_without_a_doubled_extension(
+    wiki_root: Path,
+) -> None:
+    reply = "SLUG: my-lesson.md\nTITLE: t\nBODY:\nsee [[x]]\n"
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c", runner=_runner(reply), environ={}
+    )
+    assert outcome.status == "wrote", outcome.render()
+    assert outcome.slug == "my-lesson"
+    assert _pages(wiki_root) == ["my-lesson.md"]
+
+
+@pytest.mark.parametrize("slug", ["My Lesson Here", "my lesson", "My-Lesson", "a--b", "-a", "a_b"])
+def test_a_non_kebab_slug_is_refused_as_a_failed_save(wiki_root: Path, slug: str) -> None:
+    """gh#971: refused, not normalised; the create-only store would keep a bad name forever."""
+    reply = f"SLUG: {slug}\nTITLE: t\nBODY:\nsee [[x]]\n"
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c", runner=_runner(reply), environ={}
+    )
+    assert outcome.status == "failed", outcome.render()
+    assert "kebab-case" in outcome.reason
+    assert slug not in outcome.reason
     assert _pages(wiki_root) == []
 
 
@@ -647,7 +743,7 @@ def _inverted_reason(code: int, stdout: str, stderr: str) -> str:
     """The repair the issue rules out by name: the same line with the precedence flipped.
 
     It is not half a fix. The module's own default runner reports a timeout and a missing CLI
-    as `(-1, "", "<text>")` — cause on stderr, empty stdout — so this ordering hides those the
+    as `(<negative code>, "", "<text>")` — cause on stderr, empty stdout — so this ordering hides those the
     way the original hides a model limit.
     """
     return f"the summariser exited {code}: {(stdout or stderr or '').strip()[:200]}"
@@ -808,8 +904,122 @@ def test_the_audit_record_serialises_whole() -> None:
     outcome = SaveOutcome(trigger="park", status="failed", started_at="2026-09-05T00:00:00Z",
                           duration_s=1.0, reason="r")
     assert set(outcome.as_dict()) >= {
-        "trigger", "status", "started_at", "duration_s", "exit_code", "wrote", "slug", "reason"
+        "trigger", "status", "started_at", "duration_s", "exit_code", "wrote", "spawned", "slug",
+        "reason", "word_count",
     }
+
+
+# --------------------------------------------------------------------------- #
+# 4b. `spawned` — "nothing ran" and "it ran and failed" are different lines (gh#437)
+# --------------------------------------------------------------------------- #
+def _counting(inner, calls: list):
+    """Wrap a runner so a case can assert how many times the save called it."""
+
+    def run(argv, *, env, timeout, stdin):
+        calls.append(argv)
+        return inner(argv, env=env, timeout=timeout, stdin=stdin)
+
+    return run
+
+
+def test_a_never_started_child_is_failed_with_spawned_no(wiki_root: Path) -> None:
+    """The DEFAULT runner on a missing binary: `failed`, `spawned=no`, one call, no retry.
+
+    `subprocess.Popen` is replaced with what the OS does for a binary it cannot find, so no real
+    process is involved; what is under test is the runner's mapping and the save's reading of it.
+    """
+
+    def _absent(argv, **kw):
+        raise FileNotFoundError(2, "absent")
+
+    calls: list = []
+    real_which, real_run = mod.shutil.which, mod.subprocess.Popen
+    try:
+        mod.shutil.which = lambda name: None
+        mod.subprocess.Popen = _absent
+        outcome = compose_and_save(
+            wiki_root, trigger="park", context="c", runner=_counting(_REAL_RUNNER, calls),
+            environ={},
+        )
+    finally:
+        mod.shutil.which, mod.subprocess.Popen = real_which, real_run
+
+    assert outcome.status == "failed", outcome.render()
+    assert outcome.exit_code == mod.NEVER_STARTED
+    assert outcome.spawned is False
+    assert "spawned=no" in outcome.render()
+    assert outcome.as_dict()["spawned"] is False
+    assert len(calls) == 1, f"a never-started spawn was attempted {len(calls)} times (no retry)"
+
+
+def test_a_started_child_that_exits_non_zero_is_failed_with_spawned_yes(wiki_root: Path) -> None:
+    """A process that started and exited non-zero ran. cmd.exe's 'not recognized' is this case."""
+    calls: list = []
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c",
+        runner=_counting(_runner("", code=1, err="'claude' is not recognized"), calls),
+        environ={},
+    )
+    assert outcome.status == "failed", outcome.render()
+    assert outcome.spawned is True
+    assert "spawned=yes" in outcome.render()
+    assert outcome.as_dict()["spawned"] is True
+    assert len(calls) == 1, f"a failed summariser was called {len(calls)} times (no retry)"
+
+
+def test_a_timeout_counts_as_spawned(wiki_root: Path) -> None:
+    """The timeout's `-1` is a process that started; only NEVER_STARTED reads as `spawned=no`."""
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c",
+        runner=_runner("", code=-1, err="timed out after 180s"), environ={},
+    )
+    assert outcome.failed and outcome.spawned is True, outcome.render()
+
+
+def test_a_clean_write_is_spawned_yes(wiki_root: Path) -> None:
+    outcome = compose_and_save(wiki_root, trigger="park", context="c", runner=_runner(), environ={})
+    assert outcome.wrote and outcome.spawned is True, outcome.render()
+
+
+def test_an_unparseable_reply_is_failed_with_spawned_yes(wiki_root: Path) -> None:
+    """The parse-failure branch still reports the process that produced the reply."""
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c", runner=_runner("no shape at all"), environ={}
+    )
+    assert outcome.failed and outcome.spawned is True, outcome.render()
+
+
+def test_a_disabled_save_renders_spawned_dash(wiki_root: Path) -> None:
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c", runner=_runner(), environ={DISABLE_ENV: "1"}
+    )
+    assert outcome.status == "disabled"
+    assert outcome.spawned is None
+    assert "spawned=-" in outcome.render()
+    assert outcome.as_dict()["spawned"] is None
+
+
+def test_an_in_flight_skip_renders_spawned_dash(wiki_root: Path) -> None:
+    inner: list = []
+
+    def reentrant(argv, *, env, timeout, stdin):
+        inner.append(
+            compose_and_save(wiki_root, trigger="park", context="c", runner=_runner(), environ={})
+        )
+        return 0, GOOD_REPLY, ""
+
+    compose_and_save(wiki_root, trigger="park", context="c", runner=reentrant, environ={})
+    assert inner[0].status == "in-flight"
+    assert inner[0].spawned is None
+    assert "spawned=-" in inner[0].render()
+
+
+def test_a_raising_injected_runner_renders_spawned_dash(wiki_root: Path) -> None:
+    def raiser(argv, *, env, timeout, stdin):
+        raise RuntimeError("the child died")
+
+    outcome = compose_and_save(wiki_root, trigger="park", context="c", runner=raiser, environ={})
+    assert outcome.failed and outcome.spawned is None, outcome.render()
 
 
 # --------------------------------------------------------------------------- #
@@ -876,17 +1086,151 @@ def test_a_successful_save_refreshes_the_projection(wiki_root: Path) -> None:
     assert "a-lesson-about-locks" in (wiki_root / "hot.md").read_text(encoding="utf-8")
 
 
-def test_a_taken_slug_is_a_reason_not_an_overwrite(wiki_root: Path) -> None:
-    """`pages/` is create-only. The second save of one slug writes nothing and says so."""
+def test_a_taken_slug_is_written_once_under_a_suffix_that_links_back(wiki_root: Path) -> None:
+    """`pages/` is create-only, and a finished draft is not thrown away over its name.
+
+    The create-only rule's own remedy is a NEW page that links to the existing one. The draft
+    still exists only here, so this is the one place that remedy can be applied at no extra
+    model cost: one retry under `<slug>-2`, carrying a link to `<slug>`.
+    """
     first = compose_and_save(
         wiki_root, trigger="park", context="c", runner=_runner(), environ={}
     )
+    original = (wiki_root / "pages" / "a-lesson-about-locks.md").read_text(encoding="utf-8")
     second = compose_and_save(
         wiki_root, trigger="park", context="c", runner=_runner(), environ={}
     )
-    assert first.wrote and second.failed
-    assert "PageExistsError" in second.reason
+    assert first.wrote and second.wrote, second.render()
+    assert second.slug == "a-lesson-about-locks-2"
+    assert second.path and second.path.endswith("a-lesson-about-locks-2.md")
+    assert second.reason == "slug a-lesson-about-locks was taken; wrote a-lesson-about-locks-2"
+    assert _pages(wiki_root) == ["a-lesson-about-locks-2.md", "a-lesson-about-locks.md"]
+    suffixed = (wiki_root / "pages" / "a-lesson-about-locks-2.md").read_text(encoding="utf-8")
+    assert "Earlier page under the same name: [[a-lesson-about-locks]]" in suffixed
+    assert "The in-flight guard is process-local." in suffixed
+    # Never an overwrite: the first page is byte-for-byte what it was.
+    assert (wiki_root / "pages" / "a-lesson-about-locks.md").read_text(
+        encoding="utf-8"
+    ) == original
+
+
+def test_a_double_collision_fails_naming_both_slugs_and_tries_no_third(wiki_root: Path) -> None:
+    """One retry, not a counter. A third save of one slug writes nothing and names both."""
+    for _ in range(2):
+        assert compose_and_save(
+            wiki_root, trigger="park", context="c", runner=_runner(), environ={}
+        ).wrote
+    third = compose_and_save(
+        wiki_root, trigger="park", context="c", runner=_runner(), environ={}
+    )
+    assert third.failed, third.render()
+    assert "slug a-lesson-about-locks was taken" in third.reason
+    assert "a-lesson-about-locks-2 is taken too" in third.reason
+    assert "PageExistsError" in third.reason
+    assert _pages(wiki_root) == ["a-lesson-about-locks-2.md", "a-lesson-about-locks.md"]
+
+
+# --------------------------------------------------------------------------- #
+# 5b. A non-zero exit does not discard a reply that parses — the reply decides
+# --------------------------------------------------------------------------- #
+#: The measured shape: a harness advisory on stderr, a complete page on stdout, exit 1.
+_SETTINGS_ADVISORY = "Warning: a permission rule in settings.json could not be parsed"
+
+
+def test_a_non_zero_exit_with_a_complete_reply_writes_the_page(wiki_root: Path) -> None:
+    """The exit code alone no longer discards a page; the anomaly stays in the audit record."""
+    outcome = compose_and_save(
+        wiki_root, trigger="end-of-epic", context="c",
+        runner=_runner(GOOD_REPLY, code=1, err=_SETTINGS_ADVISORY), environ={},
+    )
+    assert outcome.status == "wrote", outcome.render()
+    assert outcome.exit_code == 1
+    assert outcome.spawned is True
+    assert outcome.slug == "a-lesson-about-locks"
     assert _pages(wiki_root) == ["a-lesson-about-locks.md"]
+    assert outcome.reason.startswith("summariser exited 1 but its reply parsed; stdout: ")
+    assert f"stderr: {_SETTINGS_ADVISORY}" in outcome.reason
+    assert outcome.as_dict()["exit_code"] == 1
+
+
+def test_a_non_zero_exit_joins_its_note_with_a_refresh_failure(
+    wiki_root: Path, monkeypatch
+) -> None:
+    """Both anomalies survive: the exit code note and the projection failure."""
+
+    def boom(root, **kw):
+        raise OSError("hot file is read-only")
+
+    monkeypatch.setattr(mod, "refresh_projection", boom)
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c",
+        runner=_runner(GOOD_REPLY, code=1, err=_SETTINGS_ADVISORY), environ={},
+    )
+    assert outcome.wrote, outcome.render()
+    assert "summariser exited 1 but its reply parsed" in outcome.reason
+    assert "refresh_projection failed" in outcome.reason
+    assert "\n" not in outcome.reason
+
+
+def test_a_non_zero_exit_with_error_text_on_stdout_stays_failed(wiki_root: Path) -> None:
+    """A reply that does not parse is still a failure, with both streams and the refusal."""
+    out = "Error: the session could not continue"
+    with pytest.raises(ValueError) as refusal:
+        parse_summary(out)
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c",
+        runner=_runner(out, code=1, err=_SETTINGS_ADVISORY), environ={},
+    )
+    assert outcome.status == "failed", outcome.render()
+    assert outcome.exit_code == 1
+    assert outcome.reason.startswith(
+        f"the summariser exited 1; {mod.describe_streams(out, _SETTINGS_ADVISORY)}"
+    )
+    assert _attributes(outcome.reason, stdout=out, stderr=_SETTINGS_ADVISORY)
+    assert "is missing SLUG, TITLE, BODY" in outcome.reason
+    assert str(refusal.value).split(";")[0] in outcome.reason
+    assert _pages(wiki_root) == []
+
+
+def test_nothing_durable_after_a_non_zero_exit_names_the_exit_code(wiki_root: Path) -> None:
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c",
+        runner=_runner(NOTHING_DURABLE, code=1, err=_SETTINGS_ADVISORY), environ={},
+    )
+    assert outcome.status == "nothing-durable", outcome.render()
+    assert outcome.exit_code == 1
+    assert "exited 1" in outcome.reason
+    assert _pages(wiki_root) == []
+
+
+@pytest.mark.parametrize(
+    "code, err",
+    [
+        (-1, "timed out after 180s"),
+        (mod.NEVER_STARTED, "agent CLI not found: 'claude'"),
+        (-1, "agent CLI failed to run: SubprocessError: x"),
+    ],
+)
+def test_a_runner_synthesised_failure_keeps_todays_reason(
+    wiki_root: Path, code: int, err: str
+) -> None:
+    """Empty stdout means there is no reply to judge; the reason is unchanged, nothing appended."""
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c", runner=_runner("", code=code, err=err),
+        environ={},
+    )
+    assert outcome.failed
+    assert outcome.reason == f"the summariser exited {code}; {mod.describe_streams('', err)}"
+
+
+def test_the_audit_record_carries_the_word_count(wiki_root: Path) -> None:
+    """`--json` prints `as_dict`; the compliance measurement must be in it, not only in render."""
+    outcome = compose_and_save(
+        wiki_root, trigger="park", context="c", runner=_runner(), environ={}
+    )
+    record = outcome.as_dict()
+    assert "word_count" in record
+    assert record["word_count"] == outcome.word_count and outcome.word_count
 
 
 # --------------------------------------------------------------------------- #
@@ -1138,7 +1482,7 @@ def test_the_runner_resolves_the_cli_through_pathext_not_the_bare_name() -> None
     The whole suite was green through that failure, and could not have caught it — every
     other case injects a fake runner precisely so no test starts a process, which leaves the one
     line that names a real executable untested by construction. So this asserts the RESOLUTION,
-    not the spawn: what argv the runner would hand ``subprocess.run``, with ``subprocess.run``
+    not the spawn: what argv the runner would hand ``subprocess.Popen``, with ``subprocess.Popen``
     itself replaced.
     """
     seen: dict = {}
@@ -1147,18 +1491,18 @@ def test_the_runner_resolves_the_cli_through_pathext_not_the_bare_name() -> None
         seen["argv"] = list(argv)
         raise FileNotFoundError(2, "not really run")
 
-    real_which, real_run = mod.shutil.which, mod.subprocess.run
+    real_which, real_run = mod.shutil.which, mod.subprocess.Popen
     try:
         mod.shutil.which = lambda name: _SHIM if name == mod.AGENT_CLI else None
-        mod.subprocess.run = _capture
+        mod.subprocess.Popen = _capture
         rc, out, err = _REAL_RUNNER(
             mod.build_argv(), env={mod.DISABLE_ENV: mod.DISABLE_VALUE}, timeout=1.0, stdin="p"
         )
     finally:
-        mod.shutil.which, mod.subprocess.run = real_which, real_run
+        mod.shutil.which, mod.subprocess.Popen = real_which, real_run
 
     assert seen["argv"][0] == _SHIM, (
-        f"the runner passed {seen['argv'][0]!r} to subprocess.run rather than the resolved "
+        f"the runner passed {seen['argv'][0]!r} to subprocess.Popen rather than the resolved "
         "path. On a platform where the CLI is a PATHEXT shim the bare name raises "
         "FileNotFoundError, and the save fails for a reason that has nothing to do with the model"
     )
@@ -1166,7 +1510,7 @@ def test_the_runner_resolves_the_cli_through_pathext_not_the_bare_name() -> None
         "resolution must replace argv[0] and disturb nothing else - compared against build_argv "
         "rather than a literal tail, so adding a flag there does not red this for the wrong reason"
     )
-    assert rc == -1 and "not found" in err, (
+    assert rc == mod.NEVER_STARTED and "not found" in err, (
         "a genuinely missing CLI must still report itself; resolution is not permission to "
         "swallow the failure into a silent no-op"
     )
@@ -1185,18 +1529,18 @@ def test_an_unresolvable_cli_falls_back_to_the_bare_name() -> None:
         seen["argv"] = list(argv)
         raise FileNotFoundError(2, "absent")
 
-    real_which, real_run = mod.shutil.which, mod.subprocess.run
+    real_which, real_run = mod.shutil.which, mod.subprocess.Popen
     try:
         mod.shutil.which = lambda name: None
-        mod.subprocess.run = _capture
+        mod.subprocess.Popen = _capture
         rc, out, err = _REAL_RUNNER(
             mod.build_argv(), env={mod.DISABLE_ENV: mod.DISABLE_VALUE}, timeout=1.0, stdin="p"
         )
     finally:
-        mod.shutil.which, mod.subprocess.run = real_which, real_run
+        mod.shutil.which, mod.subprocess.Popen = real_which, real_run
 
     assert seen["argv"][0] == mod.AGENT_CLI
-    assert rc == -1 and mod.AGENT_CLI in err
+    assert rc == mod.NEVER_STARTED and mod.AGENT_CLI in err
 
 
 def test_no_other_agentflow_module_starts_an_agent_session() -> None:
@@ -1334,7 +1678,7 @@ def test_no_agentflow_module_picks_one_of_the_two_streams() -> None:
     to stop reappearing.
 
     Both orders are offences. `stdout or stderr` is not the repair: the default runners here
-    synthesise a timeout and a missing binary as `(-1, "", "<text>")`, so a stdout-first
+    synthesise a timeout and a missing binary as `(<negative code>, "", "<text>")`, so a stdout-first
     precedence drops those exactly as stderr-first drops a model limit. Report both streams
     (`agentflow.stream_report.describe_streams`) or select a stream on an EXPLICIT test of its
     content — never on which one happens to be non-empty.
@@ -1371,16 +1715,17 @@ def test_no_agentflow_module_picks_one_of_the_two_streams() -> None:
 def test_the_default_runner_maps_a_timeout_onto_a_non_zero_exit(monkeypatch) -> None:
     """A timeout is reported the way every caller above already handles a failure.
 
-    Asserted against the real runner with `subprocess.run` stubbed — the one place in this file
-    that touches it, and it still starts nothing.
+    Asserted against the real runner with `subprocess.Popen` stubbed, so it still starts nothing.
+    The real-process version, which proves the tree is gone, is the gh#969 pair below.
     """
-
-    def fake_run(*a, **kw):
-        raise subprocess.TimeoutExpired(cmd="x", timeout=1)
-
-    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    killed: list = []
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *a, **kw: _FakeProc(
+        subprocess.TimeoutExpired(cmd="x", timeout=1)
+    ))
+    monkeypatch.setattr(mod, "_kill_tree", killed.append)
     code, out, err = _REAL_RUNNER(["x"], env={}, timeout=1.0, stdin="")
-    assert code != 0 and out == ""
+    assert code == -1 and out == ""
+    assert len(killed) == 1, "a timeout must kill the child's tree, not abandon it"
     # `startswith`, not `in`. TimeoutExpired IS a SubprocessError, so deleting the dedicated
     # timeout branch drops the call into the generic handler below it — whose message happens to
     # embed TimeoutExpired's own "... timed out after 1 seconds". A substring check passed that
@@ -1388,6 +1733,140 @@ def test_the_default_runner_maps_a_timeout_onto_a_non_zero_exit(monkeypatch) -> 
     assert err.startswith("timed out after"), (
         f"the timeout branch is gone: this came back through the generic handler ({err!r})"
     )
+
+
+def test_the_default_runner_maps_a_permission_error_onto_never_started(monkeypatch) -> None:
+    """An OS refusal other than a missing file is still a process that never started (gh#437)."""
+
+    def fake_popen(*a, **kw):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
+    code, out, err = _REAL_RUNNER(["x"], env={}, timeout=1.0, stdin="")
+    assert code == mod.NEVER_STARTED and out == "" and "PermissionError" in err
+
+
+def test_the_default_runner_maps_undecodable_output_onto_a_started_exit(monkeypatch) -> None:
+    """POSIX raises the decode error after the child ran, so it must not read as never-started."""
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *a, **kw: _FakeProc(
+        UnicodeDecodeError("utf-8", bytes([0xFF]), 0, 1, "invalid start byte")
+    ))
+    monkeypatch.setattr(mod, "_kill_tree", lambda proc: None)
+    code, out, err = _REAL_RUNNER(["x"], env={}, timeout=1.0, stdin="")
+    assert code == -1 and out == "" and "not UTF-8" in err
+
+
+def test_an_interrupt_during_the_call_kills_the_tree_before_propagating(monkeypatch) -> None:
+    """The child is in its own group, so a Ctrl+C on the parent never reaches it (gh#969 review).
+
+    The runner must kill the tree itself and then re-raise: swallowing the interrupt would turn
+    an operator's stop into a failed save, and not killing would leave the model session running.
+    """
+    killed: list = []
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *a, **kw: _FakeProc(KeyboardInterrupt()))
+    monkeypatch.setattr(mod, "_kill_tree", killed.append)
+    with pytest.raises(KeyboardInterrupt):
+        _REAL_RUNNER(["x"], env={}, timeout=1.0, stdin="")
+    assert len(killed) == 1, "an interrupt must kill the child's tree before it propagates"
+
+
+class _FakeProc:
+    """A started child whose ``communicate`` raises ``exc``: the runner's post-spawn branches."""
+
+    pid = 0
+    returncode = None
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def communicate(self, input=None, timeout=None):  # noqa: A002 - Popen's own parameter name
+        raise self._exc
+
+
+# --------------------------------------------------------------------------- #
+# gh#969 - the timeout bounds the call even when a GRANDCHILD holds the pipes
+# --------------------------------------------------------------------------- #
+#: Short enough to keep the suite quick, long enough for the grandchild to record its pid.
+_TREE_TIMEOUT_S = 4.0
+#: How long the grandchild would sleep if nothing killed it. Far past the timeout, so a runner
+#: that waits for it to exit on its own is measured as a failure, not as slow.
+_GRANDCHILD_SLEEP_S = 30
+#: Room for interpreter start-up, the tree kill and the bounded drain.
+_TREE_SLACK_S = 8.0
+
+
+def _alive(pid: int) -> bool:
+    """Whether ``pid`` is still running. Never signals it: ``os.kill`` on Windows TERMINATES."""
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        # PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+        handle = kernel32.OpenProcess(0x1000 | 0x00100000, False, pid)
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _assert_tree_bounded_and_gone(argv: list, pidfile: Path) -> None:
+    start = time.monotonic()
+    code, out, err = _REAL_RUNNER(argv, env=dict(os.environ), timeout=_TREE_TIMEOUT_S, stdin="hi")
+    elapsed = time.monotonic() - start
+    grandchild = int(pidfile.read_text().strip()) if pidfile.is_file() else None
+    try:
+        assert elapsed < _TREE_TIMEOUT_S + _TREE_SLACK_S, (
+            f"the runner returned after {elapsed:.1f}s on a {_TREE_TIMEOUT_S:g}s timeout: it "
+            "waited for a grandchild that holds the pipes"
+        )
+        assert (code, out) == (-1, "") and err.startswith("timed out after"), (code, out, err)
+        assert grandchild is not None, "the grandchild never recorded its pid; the probe is void"
+        deadline = time.monotonic() + 5
+        while _alive(grandchild) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not _alive(grandchild), f"grandchild {grandchild} survived the timeout"
+    finally:
+        if grandchild is not None and _alive(grandchild):
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/PID", str(grandchild)], capture_output=True)
+            else:
+                os.kill(grandchild, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the batch-shim tree is the Windows shape")
+def test_a_timeout_kills_a_batch_shims_grandchild_and_returns_on_time(tmp_path: Path) -> None:
+    """gh#969, the measured shape: the CLI is a ``.cmd`` shim and the session is its grandchild."""
+    pidfile = tmp_path / "grandchild.pid"
+    sleeper = tmp_path / "sleeper.py"
+    sleeper.write_text(
+        "import os, sys, time\n"
+        "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+        f"time.sleep({_GRANDCHILD_SLEEP_S})\n"
+        "print('late')\n",
+        encoding="utf-8",
+    )
+    shim = tmp_path / "agent.cmd"
+    shim.write_text(
+        f'@echo off\r\n"{sys.executable}" "{sleeper}" "{pidfile}"\r\n', encoding="utf-8"
+    )
+    _assert_tree_bounded_and_gone([str(shim)], pidfile)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups; Windows has its own case")
+def test_a_timeout_kills_a_shells_backgrounded_grandchild_and_returns_on_time(
+    tmp_path: Path,
+) -> None:
+    """gh#969 on POSIX: a backgrounded grandchild inherits the pipes the same way."""
+    pidfile = tmp_path / "grandchild.pid"
+    script = f'sleep {_GRANDCHILD_SLEEP_S} & echo $! > "{pidfile}"; wait'
+    _assert_tree_bounded_and_gone(["sh", "-c", script], pidfile)
 
 
 def test_the_four_triggers_are_the_decided_set() -> None:

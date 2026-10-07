@@ -27,6 +27,9 @@ walk you through running the fleet."
 - Routine config edits — edit `~/.agentflow/config/*.md` directly; the `SessionStart` hook
   re-resolves at the next session open.
 - Runtime-only re-provision with no interview — run `provision.py` directly.
+- Making a merged skill change live — run `python install/provision.py --deploy-only` from the
+  primary checkout (never a per-epic worktree; it refuses one). It runs the deploy step alone
+  and writes no project's data.
 
 ## Fresh-machine pre-reqs
 
@@ -109,12 +112,12 @@ Collect, in order:
 - `lock_dir`, `shell` (posix | powershell), `suite_root`. **Write `lock_dir` as an
   expanded absolute path, never a literal `%TEMP%/scratch`**: neither provision nor the resolver
   expands `%VAR%`, so the literal is read as a relative path, provision refuses to
-  pre-create it, and the step-10 resolver dies on it after the venv and editable install have
-  run. On Windows resolve it first — e.g.
+  pre-create it, and the resolver check stops the install on it: at step 2 when the python
+  running provision already has PyYAML, otherwise at step 5, after the venv is built. On Windows resolve it first — e.g.
   `python -c "import os; print(os.path.join(os.environ['TEMP'], 'scratch'))"` — and write the
   result with forward slashes; `~/...` is also fine, it is expanded the same way by both
 - `worktree_root` — the root every lane's per-epic worktree is created under
-  (`<worktree_root>/<project>/<epic-slug>`). Required, never defaulted, and the directory
+  (`<worktree_root>/<project>/<epic-branch>`, the claim branch name; `<epic-slug>` in a hand run). Required, never defaulted, and the directory
   must already exist: a lane launches from the machine's launch directory, which sits in
   no repo, so a worktree path cannot be inferred from the working directory
 - **the vault question — ask it ONCE, never block on it, never ask again — but ask it after
@@ -187,9 +190,12 @@ provision command.
   **"I don't know" is a valid answer, and the expected one.** Most people cannot answer
   this cold, and a shrug is more honest than a guess. When it comes — or when an answer
   sounds like a guess — read the checkout instead of pressing. The reader is
-  `agentflow.project_probe`, and **you can run it right here**: the module imports only the
-  standard library (`json`, `sys`, `dataclasses`, `pathlib`) and has a `__main__` guard, so
-  the FILE runs as a script on any Python 3.11+ before anything is installed. Only the
+  `agentflow.project_probe`, and **you can run it right here**: it tries the package's
+  `agentflow._stdio` helper first and, when the package is absent, loads the sibling
+  `_stdio.py` by path, so everything it needs is the standard library (`json`, `sys`,
+  `dataclasses`, `pathlib`, `importlib.util`) plus that one file beside it. With its
+  `__main__` guard, the FILE runs as a script on any Python 3.11+ before anything is
+  installed. Only the
   **module** form (`python -m agentflow.project_probe`) needs the `agentflow` package, which
   the venv does not get until Step 4:
 
@@ -204,7 +210,18 @@ provision command.
   ```
 
   It reports the languages, UI frameworks, browser tooling, test commands and dev commands
-  it found, then proposes a strategy **with the evidence attached**. Show them that block,
+  it found, then proposes a strategy **with the evidence attached**. It looks two directory
+  levels below the root as well (a monorepo's `frontend/package.json` counts, skipping
+  dependency, vendored, fixture, docs and example trees), and anything found down
+  there names its directory — `react in frontend/package.json` — so a finding from the
+  wrong place is easy to spot. UI evidence inside a docs, example or sample tree is listed
+  on a separate `not counted` line: the probe saw it and left it out of the recommendation,
+  so if that tree really is the project's UI, the user should overrule it. A directory or
+  manifest the probe could not read is skipped and named on an `unreadable` line, and the
+  recommendation may be missing whatever it holds. A CI workflow counts as a test suite only when a `run:` line starts a known
+  runner (pytest, `npm test`, `go test`, `cargo test`). A path that is not a directory, or any
+  argument starting with `-`, exits 2 with a usage line instead of a report — check the
+  path, not the project. Show them that block,
   say which line drove the recommendation, and let them overrule it. Never paste the
   recommendation into the config as though they had chosen it — a proposal they accepted
   and a default they never saw produce the same YAML and very different confidence.

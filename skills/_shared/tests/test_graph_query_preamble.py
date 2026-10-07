@@ -123,11 +123,19 @@ def _yaml_path(p: Path) -> str:
     return str(p).replace("\\", "/")
 
 
-def _corpus(p: Path, *, manifest: bool, project: str | None = None) -> Path:
+def _corpus(p: Path, *, manifest: bool, project: str | None = None,
+            source_path: str | None = None) -> Path:
+    # The manifest's source_path stem is deliberately NOT the profile's host_ref stem
+    # (`<name>-repo`, below): the corpus id comes from what the build recorded, and a fixture
+    # where the two agree could not tell the right source from the wrong one.
     (p / "endpoints").mkdir(parents=True, exist_ok=True)
     (p / "endpoints" / "x.md").write_text("page\n", encoding="utf-8")
     if manifest:
-        body = json.dumps({"project": project} if project else {})
+        fields = {}
+        if project:
+            fields["project"] = project
+            fields["source_path"] = source_path or f".source/{project}"
+        body = json.dumps(fields)
         (p / ".manifest.json").write_text(body, encoding="utf-8")
     return p
 
@@ -214,7 +222,10 @@ def test_each_project_resolves_to_ITS_OWN_corpus(box, project) -> None:
         f"{project} resolved to {got['AUTODOC']!r}, not its own corpus -- the machine-level "
         f"root is {_yaml_path(box['machine'])!r}, the other project's is {_yaml_path(box[other])!r}"
     )
-    assert got["REPO_STEM"] == f"{project}-repo"
+    assert got["REPO_STEM"] == project, (
+        f"REPO_STEM {got['REPO_STEM']!r} is not the manifest's corpus id {project!r} - "
+        f"derived from the profile's host_ref ({project}-repo) it orphans the built corpus"
+    )
 
 
 def test_the_migration_hazard_is_a_named_FATAL_not_a_traceback_and_not_an_answer(box) -> None:
@@ -417,3 +428,58 @@ def test_the_preamble_resolves_the_project_AUTODOC_PROJECT_names_not_PROJECT(box
     assert r.returncode == 0, r.stderr
     assert "PREAMBLE-COMPLETED" in r.stdout
     assert f"AUTODOC={_yaml_path(box['beta'])}" in r.stdout, r.stdout
+
+
+# --------------------------------------------------------------------------- #
+# The corpus id is the build's, read from the manifest, never the current host_ref
+# --------------------------------------------------------------------------- #
+def _one_project_home(tmp_path: Path, corpus: Path) -> Path:
+    d = _yaml_path(tmp_path)
+    home = tmp_path / "config"
+    home.mkdir()
+    _write_env(home, d, None)
+    _write_project(home, "alpha", d, corpus)
+    return home
+
+
+def test_a_renamed_repo_still_queries_the_corpus_the_build_stored(tmp_path) -> None:
+    """The profile's host_ref moved to `<owner>/alpha-private`; the corpus was built as `alpha`."""
+    corpus = _corpus(tmp_path / "alpha-corpus", manifest=True, project="alpha",
+                     source_path=".source/alpha")
+    home = _one_project_home(tmp_path, corpus)
+    proj_file = home / "projects" / "alpha.md"
+    proj_file.write_text(proj_file.read_text(encoding="utf-8").replace(
+        "owner/alpha-repo", "owner/alpha-private"), encoding="utf-8")
+
+    r = _run(home, "alpha")
+
+    assert r.returncode == 0, r.stderr
+    assert _emitted(r.stdout)["REPO_STEM"] == "alpha"
+
+
+@pytest.mark.parametrize("source_path, stem", [
+    (".source/widget/", "widget"),
+    (".source\\widget", "widget"),
+    ("widget", "widget"),
+])
+def test_the_corpus_id_is_the_last_segment_of_the_recorded_source_path(tmp_path, source_path,
+                                                                       stem) -> None:
+    corpus = _corpus(tmp_path / "alpha-corpus", manifest=True, project="alpha",
+                     source_path=source_path)
+    r = _run(_one_project_home(tmp_path, corpus), "alpha")
+    assert r.returncode == 0, r.stderr
+    assert _emitted(r.stdout)["REPO_STEM"] == stem
+
+
+@pytest.mark.parametrize("value", [None, "", "/", 7])
+def test_a_manifest_with_no_usable_source_path_is_refused_not_guessed(tmp_path, value) -> None:
+    corpus = _corpus(tmp_path / "alpha-corpus", manifest=False)
+    fields = {"project": "alpha"}
+    if value is not None:
+        fields["source_path"] = value
+    (corpus / ".manifest.json").write_text(json.dumps(fields), encoding="utf-8")
+
+    r = _run(_one_project_home(tmp_path, corpus), "alpha")
+
+    assert r.returncode != 0
+    assert "source_path" in r.stderr and "REPO_STEM" not in r.stdout, (r.stdout, r.stderr)

@@ -86,6 +86,9 @@ _WINDOWS_MAX_PATH = 259
 #: Subdirectories of ``pages/`` that hold TERMINAL pages. A page is moved here when it stops
 #: being live; it keeps its history but leaves the projection. ``read_pages`` skips them by
 #: name at any depth, so a nested live folder still reads while ``pages/done/…`` never does.
+#: Not ``epic_survey.TERMINAL_PARTITIONS``: a page has no state field, so its directory IS its
+#: state, where a design record's directory is a view of ``current_state``. Widening one does
+#: not widen the other (gh#233).
 TERMINAL_PARTITIONS = frozenset({"done", "archived"})
 
 #: The line every generated projection carries, so a human editing one is told it is futile.
@@ -150,6 +153,16 @@ class WikiFormatError(ValueError):
     Loud on purpose. A half-parsed page (no title, no ``created``) would sort to an arbitrary
     place in the projection and read as a real entry — the failure would be a wrong hot file,
     not an error, and nobody re-reads a hot file to check it.
+    """
+
+
+class PageResidueError(WikiFormatError):
+    """Raised when ``write_page`` is given a page the pillar residue ratchet would flag.
+
+    A :class:`WikiFormatError`, so every caller that handles the writer's refusals already
+    handles this one. Its message names the class and where it matched, NEVER the matched text:
+    the message reaches run logs, audit lines and registry rows, and quoting the term there is
+    the same leak the refusal exists to stop.
     """
 
 
@@ -274,29 +287,28 @@ def parse_page(text: str, *, slug: str) -> Page:
     )
 
 
-def _scalar_text(value: object, key: str, slug: str) -> str:
+def _scalar_text(value: object, key: str, slug: str | None) -> str:
     """One frontmatter value as a stripped, control-free, bounded string. Anything else raises.
 
     THE ``str()`` IS THE DANGEROUS PART, so the type check comes first. ``str()`` of a mapping or
     a list is a repr, and a repr of an aliased YAML node is the expansion of every alias under it
     — the amplification. A container in ``title``/``created``/``lane`` is malformed input; there
     is no reading of it that wants its repr in a hot file.
+
+    *slug* is ``None`` when no page exists yet; the message then names the field alone.
     """
+    field = f"field {key!r}" if slug is None else f"Page {slug!r} frontmatter field {key!r}"
     if isinstance(value, (dict, list, tuple, set, frozenset, bytes, bytearray)):
-        raise WikiFormatError(
-            f"Page {slug!r} frontmatter field {key!r} must be a scalar, "
-            f"got {type(value).__name__}"
-        )
+        raise WikiFormatError(f"{field} must be a scalar, got {type(value).__name__}")
     text = str(value)
     if len(text) > MAX_FIELD_CHARS:
         raise WikiFormatError(
-            f"Page {slug!r} frontmatter field {key!r} is {len(text)} chars, "
-            f"over the {MAX_FIELD_CHARS} cap"
+            f"{field} is {len(text)} chars, over the {MAX_FIELD_CHARS} cap"
         )
     text = text.strip()
     if _CONTROL_RE.search(text):
         raise WikiFormatError(
-            f"Page {slug!r} frontmatter field {key!r} carries a newline or control character: "
+            f"{field} carries a newline or control character: "
             f"{text!r} - it would fabricate lines in a rendered hot file"
         )
     return text
@@ -313,7 +325,7 @@ def _required_str(data: dict, key: str, slug: str) -> str:
     return text
 
 
-def _validated_component(value: str, key: str, slug: str) -> str:
+def _validated_component(value: str, key: str, slug: str | None) -> str:
     """One path-forming field as a BARE filename component, or a loud error naming both.
 
     ``lane`` is agent-authored frontmatter that :func:`refresh_projection` interpolates into
@@ -349,35 +361,42 @@ def _validated_component(value: str, key: str, slug: str) -> str:
     on Linux. That is a property of a PAIR of values, so a single-value rule cannot see it;
     :func:`refresh_projection` catches the case that matters — two lanes colliding on one file —
     and :func:`check_new_lane` refuses a new page that would create that pair.
+
+    *slug* is ``None`` when there is no page yet (:func:`check_new_lane` judging a lane before a
+    page exists); the message then names the value alone rather than inventing a page to blame.
     """
+    def _subject(shown: str) -> str:
+        return f"{key} {shown}" if slug is None else f"Page {slug!r} has {key}={shown}"
+
     if not value:
+        if slug is None:
+            raise WikiFormatError(f"an empty {key} was given - it must be a bare name")
         raise WikiFormatError(f"Page {slug!r} has an empty {key} - it must be a bare name")
     if _CONTROL_RE.search(value):
-        raise WikiFormatError(
-            f"Page {slug!r} has {key}={value!r} carrying a control character"
-        )
+        raise WikiFormatError(f"{_subject(repr(value))}; it carries a control character")
     if "/" in value or "\\" in value or ":" in value:
         raise WikiFormatError(
-            f"Page {slug!r} has {key}={value!r}; it must be a bare filename component "
+            f"{_subject(repr(value))}; it must be a bare filename component "
             f"(no '/', '\\' or ':') - it is interpolated straight into a path"
         )
     illegal = sorted(set(value) & _WINDOWS_ILLEGAL_CHARS)
     if illegal:
+        banned = " ".join(sorted(_WINDOWS_ILLEGAL_CHARS | {"/", "\\", ":"}))
         raise WikiFormatError(
-            f"Page {slug!r} has {key}={value!r}; {''.join(illegal)!r} cannot appear in a Windows "
-            f"filename, so it does not fail validation, it crashes the write half way through"
+            f"{_subject(repr(value))}; {''.join(illegal)!r} cannot appear in a Windows filename, "
+            f"and the {key} becomes one. Use a bare name without any of {banned}"
         )
     if value.startswith("."):
-        raise WikiFormatError(f"Page {slug!r} has {key}={value!r}; a bare name cannot start '.'")
+        raise WikiFormatError(f"{_subject(repr(value))}; a bare name cannot start '.'")
     if value.split(".")[0].lower() in _RESERVED_STEMS:
         raise WikiFormatError(
-            f"Page {slug!r} has {key}={value!r}; that is a reserved Windows device name and "
+            f"{_subject(repr(value))}; that is a reserved Windows device name and "
             f"writing it discards the bytes instead of creating a file"
         )
     size = len(value.encode("utf-8", "surrogatepass"))
     if size > MAX_COMPONENT_BYTES:
         raise WikiFormatError(
-            f"Page {slug!r} has {key}={value[:40]!r}... of {size} bytes, over the "
+            f"{_subject(repr(value[:40]))}... of {size} bytes, over the "
             f"{MAX_COMPONENT_BYTES}-byte cap; it becomes a filename, and a filesystem refuses one "
             f"that long"
         )
@@ -713,6 +732,82 @@ def _not_a_pillar(root: Path, missing: Sequence[str], via: str) -> NotAPillarErr
 
 
 # --------------------------------------------------------------------------- #
+# The "Waiting on you" region at the top of digest.md
+# --------------------------------------------------------------------------- #
+# `agentflow.decision_digest` renders the queue of decisions waiting on the human; the steward
+# writes the narrative. Both live in digest.md, so the region is fenced by two marker lines and
+# this helper rewrites ONLY what lies between them (markers included). Every byte after the end
+# marker is the narrative and comes back byte-identical, line endings included. A damaged region
+# (one marker without the other, two regions, end before start) is refused rather than guessed:
+# a guess that picked the wrong end marker would delete narrative the steward wrote. A marker
+# counts only as a whole line of its own, so narrative that quotes one inline is just narrative.
+WAITING_START = "<!-- waiting-on-you:start -->"
+WAITING_END = "<!-- waiting-on-you:end -->"
+_WAITING_START_LINE = re.compile(rf"^{re.escape(WAITING_START)}[ \t]*\r?$", re.MULTILINE)
+_WAITING_END_LINE = re.compile(rf"^{re.escape(WAITING_END)}[ \t]*\r?$", re.MULTILINE)
+
+
+def _check_waiting_section(section: str) -> None:
+    """*section* must be exactly one marked region: start line first, end line last."""
+    body = section.replace("\r\n", "\n")
+    if not (body.startswith(WAITING_START + "\n") and body.rstrip("\n").endswith(WAITING_END)):
+        raise ValueError(
+            f"a waiting-on-you section must start with {WAITING_START!r} and end with "
+            f"{WAITING_END!r}"
+        )
+    if body.count(WAITING_START) != 1 or body.count(WAITING_END) != 1:
+        raise ValueError("a waiting-on-you section must carry exactly one pair of markers")
+
+
+def replace_waiting_region(digest: str, section: str) -> str:
+    """*digest* with its waiting-on-you region replaced by *section*, or inserted at the top. PURE.
+
+    The section adopts the file's line ending (CRLF when the digest already has one). A leading
+    BOM stays first. Raises ``WikiFormatError`` on a damaged region in *digest* and ``ValueError``
+    when *section* is not one marked region.
+    """
+    _check_waiting_section(section)
+    bom = "\ufeff" if digest.startswith("\ufeff") else ""
+    text = digest[len(bom) :]
+    nl = "\r\n" if "\r\n" in text else "\n"
+    region = section.replace("\r\n", "\n").rstrip("\n").replace("\n", nl)
+    start_lines = list(_WAITING_START_LINE.finditer(text))
+    end_lines = list(_WAITING_END_LINE.finditer(text))
+    starts, ends = len(start_lines), len(end_lines)
+    if starts == 0 and ends == 0:
+        sep = nl + nl if text else nl
+        return bom + region + sep + text
+    if starts != 1 or ends != 1:
+        raise WikiFormatError(
+            f"digest.md carries {starts} start and {ends} end waiting-on-you marker(s); expected "
+            "one pair - repair the region by hand rather than let a rewrite guess which to keep"
+        )
+    s, e = start_lines[0].start(), end_lines[0].start()
+    if e < s:
+        raise WikiFormatError("digest.md's waiting-on-you end marker comes before its start marker")
+    return bom + text[:s] + region + text[e + len(WAITING_END) :]
+
+
+def write_waiting_region(wiki_root: Path, section: str) -> bool:
+    """Replace the waiting-on-you region of ``<wiki_root>/digest.md``. Returns whether it changed.
+
+    The root must be a provisioned pillar (its ``digest.md`` exists); this never creates the
+    digest, because an absent one is a finding dev-manager reports, not a file to conjure.
+    """
+    root = Path(wiki_root)
+    missing = missing_pillar_markers(root, require_hot=False)
+    if missing:
+        raise _not_a_pillar(root, missing, "waiting-on-you write")
+    path = root / DIGEST_FILENAME
+    current = path.read_bytes().decode("utf-8")
+    updated = replace_waiting_region(current, section)
+    if updated == current:
+        return False
+    atomic_write(path, updated)
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Write side (IMPURE: filesystem only — no clock, no lock)
 # --------------------------------------------------------------------------- #
 def _refresh(wiki_root: Path, *, limit: int = DEFAULT_TOP_N) -> tuple[list[Path], list[Path]]:
@@ -878,7 +973,7 @@ def _lane_pages(wiki_root: Path, pages: Sequence[Page]) -> dict[str, list[str]]:
     return out
 
 
-def check_new_lane(wiki_root: Path, lane: object, *, page: str = "the page being saved") -> str:
+def check_new_lane(wiki_root: Path, lane: object, *, page: str | None = None) -> str:
     """Refuse a lane a NEW page may not carry. Returns the validated lane.
 
     The single-value rules (:func:`_validated_component`) plus the case rule refresh applies
@@ -896,7 +991,9 @@ def check_new_lane(wiki_root: Path, lane: object, *, page: str = "the page being
     the refresh that follows every write reads the same page and fails naming its path.
 
     Public so ``save_summariser.compose_and_save`` can refuse before it spends a model call;
-    :func:`write_page` calls it too, so the rule has one home.
+    :func:`write_page` calls it too, so the rule has one home. *page* names the page the lane is
+    for when there is one (``write_page`` passes its path); left ``None`` — the pre-spawn check,
+    before any page exists — every refusal names the lane alone instead of a page that is not real.
     """
     wiki_root = Path(wiki_root)
     lane = _validated_component(_scalar_text(lane, "lane", page), "lane", page)
@@ -913,7 +1010,8 @@ def check_new_lane(wiki_root: Path, lane: object, *, page: str = "the page being
     if twins:
         found = "; ".join(f"{t!r} (pages: {', '.join(lane_pages[t])})" for t in twins)
         raise WikiFormatError(
-            f"lane {lane!r} for {page} and live lane(s) {found} differ only by case; they would "
+            f"lane {lane!r}{'' if page is None else f' for {page}'} and live lane(s) {found} "
+            f"differ only by case; they would "
             f"be ONE file (hot-{lane}.md) on a case-insensitive filesystem, and refresh refuses "
             f"the pair for the whole project. Use the existing spelling of the lane."
         )
@@ -973,6 +1071,65 @@ def _write_projection(path: Path, pages: Sequence[Page], *, limit: int, lane: st
             return False
     atomic_write(path, body)
     return True
+
+
+#: Most locations one residue refusal lists. Enough to fix a draft; bounded for a registry row.
+_MAX_RESIDUE_LOCATIONS = 8
+
+
+def _check_page_residue(wiki_root: Path, fields: Mapping[str, object]) -> None:
+    """Refuse a NEW page whose fields carry residue the pillar ratchet counts.
+
+    The ratchet (:mod:`agentflow.pillar_residue`) runs after a page lands, in the steward's
+    sweep, and ``pages/`` is creation-only - so a dirty page used to be found a wake later and
+    could then only be superseded. This applies the ratchet's two classes, built the ratchet's
+    way, at the create. ONLY THE NEW PAGE IS JUDGED; the existing corpus is the ratchet's, and
+    retiring a dirty page is a move into ``pages/archived/`` that never comes through here.
+
+    *fields* maps a field name (``slug``, ``title``, ``lane``, ``body``) to its value; a value
+    that is not a string is skipped, because the field rules after this reject it. A ``body`` hit
+    is located by line. The message carries class and location only, never the matched text.
+
+    Matchers that cannot be built (no environment config, an unusable extra pattern, a ``ci.yml``
+    this parser cannot read) REFUSE the write: a page that was not measured is not known clean.
+
+    Imported lazily: :mod:`agentflow.pillar_residue` imports this module at its top.
+    """
+    from agentflow import pillar_residue
+
+    try:
+        matchers = pillar_residue.writer_matchers(Path(wiki_root))
+    except pillar_residue.ResidueUnmeasurable:
+        # The cause can quote a config line or a home path, and this message reaches registry
+        # rows through compose_and_save, so it points at the CLI for the detail instead.
+        raise PageResidueError(
+            "the page cannot be measured for pillar residue, so it is not written: the "
+            "environment config or the extra pattern file did not load; run "
+            "`python -m agentflow.wiki residue` for the detail"
+        ) from None
+
+    found: list[str] = []
+    for key, value in fields.items():
+        if not isinstance(value, str):
+            continue
+        for cls in pillar_residue.CLASSES:
+            for match in matchers[cls].finditer(value):
+                where = key
+                if key == "body":
+                    where = f"body line {value.count(chr(10), 0, match.start()) + 1}"
+                hit = f"{cls} in {where}"
+                if hit not in found:
+                    found.append(hit)
+    if found:
+        shown = "; ".join(found[:_MAX_RESIDUE_LOCATIONS])
+        more = len(found) - _MAX_RESIDUE_LOCATIONS
+        if more > 0:
+            shown += f"; and {more} more"
+        raise PageResidueError(
+            f"the page carries pillar residue ({shown}), and a page created after the ratchet's "
+            f"baseline must be clean. Name people by role and drop the flagged term, then write "
+            f"again. The term itself is not quoted here, on purpose"
+        )
 
 
 def write_page(
@@ -1035,7 +1192,13 @@ def write_page(
     in the docs rather than in a traceback partway through the import. ``slug`` is also
     case-preserving and case-INSENSITIVE on Windows only: ``Lesson`` and ``lesson`` are one page
     there and two on Linux, and this writer refuses the second only on the platform that collides.
+
+    **RESIDUE IS CHECKED FIRST** (:class:`PageResidueError`, :func:`_check_page_residue`): a page
+    whose slug, title, lane or body carries a term the pillar ratchet counts is refused before
+    anything else. First because the other refusals quote the slug, and a slug that IS the term
+    would otherwise reach a log through them.
     """
+    _check_page_residue(wiki_root, {"slug": slug, "title": title, "lane": lane, "body": body})
     slug = _validated_component(slug, "slug", slug)
     created = _validated_created(created, slug)
     title = _scalar_text(title, "title", slug)
@@ -1130,10 +1293,15 @@ def _exclusive_create(path: Path, text: str) -> None:
 # disconnected halves, each looking complete on its own.
 #
 # --project RESOLUTION IS REGISTRY'S, NOT A SECOND ONE. `registry._resolve_registry_path` takes
-# an explicit path first, else validates --project as a bare slug and joins it under
-# `config.load_environment().data_root`. Same order and same slug rule here, with `wiki/` in
-# place of `status/registry.md`; the slug regex is IMPORTED from registry rather than restated,
-# so the two cannot drift into disagreeing about what a project name is.
+# an explicit path first; otherwise --project wins, is validated as a bare slug, must name a
+# CONFIGURED project (`config.load_project`, refused as `project_unconfigured` - gh#715), and
+# is joined under `config.load_environment().data_root`. `$AGENTFLOW_REGISTRY` never beats an
+# explicit --project there: given both, they must name the same board or the command refuses.
+# This module has no registry-style path override (nothing like `$AGENTFLOW_REGISTRY`), so
+# the order here is just `--wiki-root`, then --project under the same slug rule and the same
+# configured-project check (gh#794), with `wiki/` in place of `status/registry.md`. The slug regex is IMPORTED from
+# registry rather than restated, so the two cannot drift into disagreeing about what a project
+# name is.
 def _resolve_wiki_root(a: argparse.Namespace) -> Path:
     """``--wiki-root`` if given, else ``<data_root>/projects/<project>/wiki``. Raises if absent.
 
@@ -1156,7 +1324,8 @@ def _resolve_wiki_root(a: argparse.Namespace) -> Path:
 
 
 def _resolve_project_wiki_root(a: argparse.Namespace) -> Path:
-    """``<data_root>/projects/<project>/wiki``, with registry's slug rule. Raises if absent."""
+    """``<data_root>/projects/<project>/wiki``, with registry's slug rule and configured-project
+    check. Raises if absent."""
 
     project = getattr(a, "project", None)
     if not project:
@@ -1179,6 +1348,17 @@ def _resolve_project_wiki_root(a: argparse.Namespace) -> Path:
         raise ValueError(
             f"--project {project}: data_root not resolved: the environment config did not load: "
             f"{config.error_line(exc, config.environment_path())} (or pass --wiki-root)"
+        ) from exc
+    # gh#794: the configured-project check registry makes (gh#715), so a typo is a config
+    # refusal naming what IS configured, never a directory probe that happens to miss. After
+    # the environment load, so a config that will not load at all still reports as that.
+    try:
+        config.load_project(project)
+    except (config.ConfigError, OSError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"--project {project}: project config did not load: "
+            f"{config.error_line(exc, config.config_home() / 'projects' / f'{project}.md')} "
+            "(or pass --wiki-root)"
         ) from exc
     project_dir = Path(data_root) / "projects" / project
     if not project_dir.is_dir():

@@ -58,8 +58,8 @@ def _intake(*selectable, untriaged_count=0, available=True, reason="", claimed=(
 
 
 class _Row:
-    def __init__(self, work="", phase=""):
-        self.work, self.phase = work, phase
+    def __init__(self, work="", phase="", status="building"):
+        self.work, self.phase, self.status = work, phase, status
 
 
 class _Reg:

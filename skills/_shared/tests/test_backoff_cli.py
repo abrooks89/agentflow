@@ -10,14 +10,15 @@ properties a lane's correctness rests on:
   supposed to replace. A floored lane schedules NOTHING and the five-hour recovery guard wakes it,
   so the last line has to be able to say that - and to say it without a number beside it that
   somebody copies.
-* **The two probes are local, and neither touches the network.** This runs on every idle wake of
+* **The three probes are local, and none touches the network.** This runs on every idle wake of
   every lane; anything it does is multiplied by six an hour and charged against the exact spend the
   epic exists to reduce. A merged-PR leg was here and was removed: a merge moves master, and the
   refs signal reads the tracking refs, master's included, locally - as of the last fetch, since
   nothing here fetches.
-* **The two signals are gathered independently.** They fail independently in the field - a detached
-  checkout, a survey that raises on a malformed spec - and one `try` around both turns either
-  failure into two unreadable signals, which looks identical to a fleet with no coordinates at all.
+* **The signals are gathered independently.** They fail independently in the field - a detached
+  checkout, a survey that raises on a malformed spec, a damaged registry - and one `try` around
+  all of them turns any one failure into three unreadable signals, which looks identical to a
+  fleet with no coordinates at all.
 * **A failure is a REASON, not a silence.** An unreadable signal is a legitimate value in this
   module's vocabulary, so nothing raises; but a value whose cause nobody can see is how a probe
   that is blind every single wake goes unnoticed. Every `None` arrives with a note.
@@ -47,12 +48,44 @@ T0 = datetime(2026, 9, 22, 6, 0, tzinfo=UTC)
 FLOORED = backoff.plan_wake(50, still_age_s=backoff.FLOOR_MIN_STILL_AGE_S, now=T0)
 
 
+#: A registry with every section and an empty Queue table: the smallest board `parse_registry`
+#: reads, so the `lanes` signal is a known zero rather than unreadable.
+EMPTY_REGISTRY = chr(10).join((
+    "# Fleet Registry - demo-project",
+    "",
+    "## Agents",
+    "",
+    "| agent | status | work | phase | heartbeat | eta | waiting_on |",
+    "|---|---|---|---|---|---|---|",
+    "",
+    "## Queue",
+    "",
+    "| id | work item | lane | claimed_by | state | waiting_on | notes |",
+    "|---|---|---|---|---|---|---|",
+    "",
+    "## Questions",
+    "",
+    "## Blockers",
+    "",
+    "| id | raised_by | owner | work | state | description |",
+    "|---|---|---|---|---|---|",
+    "",
+    "## Directives",
+    "",
+))
+
+
 def _inputs(tmp_path: Path, **over) -> ReportInputs:
-    """A ReportInputs over a tmp tree: no repo, an empty (but readable) survey."""
+    """A ReportInputs over a tmp tree: no repo, an empty (but readable) survey and registry."""
+    board = tmp_path / "projects" / "demo-project" / "status" / "registry.md"
+    if not board.exists():
+        board.parent.mkdir(parents=True, exist_ok=True)
+        board.write_text(EMPTY_REGISTRY, encoding="utf-8", newline=chr(10))
     base = dict(
         data_root=tmp_path,
         project="demo-project",
         mtime_cutoff_iso=EPOCH,
+        registry_path=board,
         repo_path=None,
         tracker_host_ref="",
     )
@@ -157,7 +190,7 @@ def test_a_blind_probe_on_this_wake_names_its_side_and_prints_a_blind_line():
     `action=schedule`, so a lane keyed only on `uncertain` or a non-zero exit would never record
     it, and a probe blind on every wake would look like a healthy hourly board."""
     movement = backoff.compare(
-        backoff.Marker(refs="refs-a", queue="queue-a"), backoff.Marker(refs=None, queue="queue-a")
+        backoff.Marker(refs="refs-a", queue="queue-a", lanes="lanes-a"), backoff.Marker(refs=None, queue="queue-a", lanes="lanes-a")
     )
     out = backoff.render(movement, backoff.plan_wake(0), [])
     assert "unreadable: refs" in out, out
@@ -169,7 +202,7 @@ def test_a_blind_probe_on_this_wake_names_its_side_and_prints_a_blind_line():
 def test_a_blind_first_observation_still_says_why():
     """No prior marker AND a blind probe: the verdict is UNKNOWN for two reasons, and the report
     must carry both rather than printing `unknown` with nothing beside it."""
-    movement = backoff.compare(None, backoff.Marker(refs=None, queue="queue-a"))
+    movement = backoff.compare(None, backoff.Marker(refs=None, queue="queue-a", lanes="lanes-a"))
     out = backoff.render(movement, backoff.plan_wake(0), [])
     assert "reason: no prior marker to compare against; unreadable: refs (this probe)" in out, out
     assert _second_last(out) == "blind=refs", out
@@ -180,7 +213,7 @@ def test_a_blind_previous_marker_is_not_blamed_on_this_wake():
     but the side is named, and the blind line is `-`: this wake's probe is healthy, and the
     previous marker's gap is gone by the next wake."""
     movement = backoff.compare(
-        backoff.Marker(refs=None, queue="queue-a"), backoff.Marker(refs="refs-a", queue="queue-a")
+        backoff.Marker(refs=None, queue="queue-a", lanes="lanes-a"), backoff.Marker(refs="refs-a", queue="queue-a", lanes="lanes-a")
     )
     out = backoff.render(movement, backoff.plan_wake(0), [])
     assert movement.verdict == backoff.UNKNOWN
@@ -192,7 +225,7 @@ def test_a_blind_previous_marker_is_not_blamed_on_this_wake():
 def test_a_signal_blind_on_both_sides_names_both():
     """The same signal lost on the previous marker and on this probe: the reason names both
     sides, and the blind line still reports this probe's loss."""
-    blind = backoff.Marker(refs=None, queue="queue-a")
+    blind = backoff.Marker(refs=None, queue="queue-a", lanes="lanes-a")
     out = backoff.render(backoff.compare(blind, blind), backoff.plan_wake(0), [])
     assert "reason: unreadable, cannot claim stillness: refs (previous marker, this probe)" in out
     assert _second_last(out) == "blind=refs", out
@@ -201,7 +234,7 @@ def test_a_signal_blind_on_both_sides_names_both():
 def test_a_healthy_wake_prints_blind_dash():
     """Both sides readable: nothing to record, and the line says so explicitly rather than being
     absent, so a lane can tell a healthy probe from a report it failed to read."""
-    same = backoff.Marker(refs="refs-a", queue="queue-a")
+    same = backoff.Marker(refs="refs-a", queue="queue-a", lanes="lanes-a")
     out = backoff.render(backoff.compare(same, same), backoff.plan_wake(1), [])
     assert "unreadable: -" in out, out
     assert "reason:" not in out, "a STILL verdict needs no reason line"
@@ -261,7 +294,7 @@ def test_the_per_wake_marker_makes_no_network_call(tmp_path, monkeypatch):
         lambda p: _inputs(tmp_path, tracker_host_ref="owner/repo"),
     )
     marker, _ = backoff.gather_marker("demo-project")
-    assert marker.as_dict() == {"refs": None, "queue": marker.queue}
+    assert marker.as_dict() == {"refs": None, "queue": marker.queue, "lanes": marker.lanes}
     strayed = [c for c in reached if pathlib.Path(c).stem != "git"]
     assert not strayed, (
         f"the per-wake marker shelled out to {strayed}; only a local `git` read is allowed on "
@@ -286,8 +319,10 @@ def test_each_signal_is_guarded_SEPARATELY(tmp_path, monkeypatch):
         "an EMPTY survey is a measurement, not a failure; collapsing it into unreadable is the "
         "defect that would have thrown away the steward's 62-wake observation"
     )
+    assert marker.lanes is not None, "an empty Queue table is a measurement, not a failure"
     assert any(n.startswith("refs:") for n in notes), notes
     assert not any(n.startswith("queue:") for n in notes), notes
+    assert not any(n.startswith("lanes:") for n in notes), notes
 
 
 def test_a_failing_survey_is_a_note_and_not_an_exception(tmp_path, monkeypatch):
@@ -350,7 +385,7 @@ def test_a_blind_probe_reaches_the_cli_report(tmp_path, capsys, monkeypatch):
     through to `render` intact, or the side split drops and the report says `blind=-`."""
     monkeypatch.setattr(
         backoff, "gather_marker",
-        lambda project: (backoff.Marker(refs=None, queue="q"), ["refs: stub"]),
+        lambda project: (backoff.Marker(refs=None, queue="q", lanes="l"), ["refs: stub"]),
     )
     rc = backoff.main([
         "--actor", "lead-dev", "--project", "demo-project", "--data-root", str(tmp_path),
@@ -390,9 +425,9 @@ def _real_repo(path: Path) -> Path:
 def test_a_second_run_against_an_unchanged_board_lengthens_the_delay(tmp_path, capsys, monkeypatch):
     """The mechanism actually engaging, rather than only its parts passing in isolation.
 
-    BOTH SIGNALS ARE READABLE HERE AND NO TRACKER IS CONFIGURED, which is the point: `compare`
+    EVERY SIGNAL IS READABLE HERE AND NO TRACKER IS CONFIGURED, which is the point: `compare`
     returns UNKNOWN whenever any signal is unreadable, and while a merged-PR signal was one of
-    three, a fleet with no tracker could never reach STILL and never backed off at all. Two local
+    three, a fleet with no tracker could never reach STILL and never backed off at all. Local
     signals removed that whole class of inert fleet.
 
     Two observations of the same board: the first is UNKNOWN (nothing to compare against), the
@@ -470,3 +505,46 @@ def test_the_cli_requires_both_names(capsys):
     for argv in ([], ["--actor", "steward"], ["--project", "demo-project"]):
         with pytest.raises(SystemExit):
             backoff.main(argv)
+
+
+def test_an_unwritable_log_exits_2_with_the_full_refusal_block(tmp_path, capsys, monkeypatch):
+    """A FILE where the data root should be makes `record`'s mkdir raise. That observation was
+    never taken, and the lane must get the same refusal shape as an unresolvable project - an
+    exit 2 carrying `blind=` and the `action=uncertain` line - not a traceback with no answer."""
+    monkeypatch.setattr(
+        backoff, "gather_marker",
+        lambda project: (backoff.Marker(refs="r", queue="q", lanes="l"), []),
+    )
+    afile = tmp_path / "afile"
+    afile.write_text("not a directory\n", encoding="utf-8")
+    rc = backoff.main([
+        "--actor", "lead-dev", "--project", "demo-project", "--data-root", str(afile),
+    ])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert captured.out == "", "a refusal is not an observation"
+    err = captured.err.strip().splitlines()
+    assert err[0].startswith("could not complete the observation: "), err
+    assert err[-2] == "blind=" + ",".join(backoff.SIGNALS) == "blind=refs,queue,lanes", err
+    assert err[-1] == "action=uncertain delaySeconds=3600", err
+
+
+def test_an_unresolvable_log_root_exits_2_rather_than_raising(tmp_path, capsys, monkeypatch):
+    """Without `--data-root` the root is re-resolved from config; a `ConfigError` there is the
+    same unrecorded observation and gets the same refusal."""
+    from agentflow import fleet_report
+    from agentflow.config import ConfigError
+
+    monkeypatch.setattr(
+        backoff, "gather_marker",
+        lambda project: (backoff.Marker(refs="r", queue="q", lanes="l"), []),
+    )
+
+    def _boom(project):
+        raise ConfigError("data_root", tmp_path / "environment.md", "gone", "put it back")
+
+    monkeypatch.setattr(fleet_report, "inputs_from_config", _boom)
+    assert backoff.main(["--actor", "lead-dev", "--project", "demo-project"]) == 2
+    err = capsys.readouterr().err.strip().splitlines()
+    assert err[0].startswith("could not complete the observation: ConfigError"), err
+    assert err[-1] == "action=uncertain delaySeconds=3600", err

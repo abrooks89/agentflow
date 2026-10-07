@@ -47,15 +47,19 @@ LOOPS = tuple(SKILLS_ROOT.joinpath(n, "SKILL.md") for n in ("lead-dev", "jr-dev-
                                                             "jr-dev-3"))
 SKILLS = (PROJECT, SOLUTION, ORCHESTRATOR, *LOOPS)
 
-#: The path token is the computed layout in `/project`; the orchestrator's recovery names the tree
-#: its Step 1.1 resolved (`<worktree>`), which is that same layout unless the plan's `worktree:`
-#: field overrides it. Nothing else is a legal path here.
-_PATH = r"(?:<worktree_root>/<project>/<epic-slug>|<worktree>)"
+#: The path token is the layout `/project` Step 5 creates: the directory is the epic's branch, which
+#: in a fleet run is the claim branch name and so carries the row's number. A hand run is covered
+#: too, because its `<epic-branch>` is its slug; admitting `<epic-slug>` here would let a reverted
+#: command stay green. The orchestrator's recovery names the tree its Step 1.1 resolved
+#: (`<worktree>`). Nothing else is a legal path here.
+_PATH = r"(?:<worktree_root>/<project>/<epic-branch>|<worktree>)"
 _GIT = r"git -C <canonical_repo\.local_checkout> "
 CREATE = re.compile(_GIT + r"worktree add " + _PATH + r" -b <epic-branch> --no-track origin/<base-branch>$")
 REATTACH = re.compile(_GIT + r"worktree add " + _PATH + r" <epic-branch>$")
 FETCH = _GIT.replace("\\", "") + "fetch"
 _COMMAND = re.compile(r"git\s+-C\s+\S+\s+worktree\s+add\b[^`]*")
+#: Removal commands wrap across lines in some skills, hence matching over the whole text.
+_REMOVE = re.compile(r"git\s+-C\s+<canonical_repo\.local_checkout>\s+worktree\s+remove\s+([^`,\s]+)")
 
 
 def _tracked() -> list[Path]:
@@ -108,6 +112,22 @@ def test_project_step5_defines_both_forms_and_every_placeholder():
             f"/project Step 5 uses {ph} without defining it"
         )
     assert "resumed epic" in step5, "the existing-path rule (reuse only a resumed epic's tree)"
+    # A merged tree is a detached HEAD, so only a numbered directory still ties it to its row.
+    # Per command, not per section: create, re-attach and remove must each name the branch.
+    paths = re.findall(r"worktree (?:add|remove) (<worktree_root>/<project>/[^`,\s]+)", step5)
+    assert len(paths) == 3 and set(paths) == {"<worktree_root>/<project>/<epic-branch>"}, paths
+    assert re.search(r"directory is the claim branch name", step5), (
+        "/project Step 5 must define the fleet worktree directory as the claim branch name"
+    )
+
+
+@pytest.mark.parametrize("path", (PROJECT, *LOOPS), ids=lambda p: p.parent.name)
+def test_worktree_remove_names_the_tree_create_made(path: Path):
+    """A removal on another path leaves the created tree behind and the next create collides."""
+    _tracked()
+    got = _REMOVE.findall(path.read_text(encoding="utf-8"))
+    assert got, f"{path.parent.name} has no explicit epic-end worktree remove"
+    assert set(got) == {"<worktree_root>/<project>/<epic-branch>"}, (path.parent.name, got)
 
 
 @pytest.mark.parametrize("path", SKILLS, ids=lambda p: p.parent.name)

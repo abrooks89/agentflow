@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.tracked import tracked_files
+
 CORE_MODULES = (
     "autodoc_query.api",
     "autodoc_query.router",
@@ -58,9 +60,10 @@ def test_cli_is_the_only_query_module_wiring_a_backend():
         assert "sqlite_backend" not in text
     # eval: run_eval.py is that surface's composition root (it opens the
     # store to run live queries); the metric/embedder modules stay clean
+    # Tracked modules only (gh#410): one untracked .py beside them must not redden this.
     eval_dir = PKG_DIR / "eval"
     if eval_dir.exists():
-        for path in eval_dir.glob("*.py"):
+        for path in tracked_files(eval_dir, lambda rel: "/" not in rel and rel.endswith(".py")):
             if path.name == "run_eval.py":
                 continue
             assert "sqlite_backend" not in path.read_text(encoding="utf-8"), (

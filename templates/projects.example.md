@@ -69,6 +69,7 @@ excluded_domains: []          # O — epic domain/project values the fleet never
 work_source:
   kind: github-issues         # O (default filesystem) — github-issues | gitea | filesystem | none
   bug_triage: true            # O (default false) — is open-bug work first-class here
+  # open_issue_page: 200      # O (default 200) — open issues one intake read answers for; raise when more are open
 
 generation_skills:            # O — Delegated skills that CREATE work (lead-dev only)
   polishing: null             # O — a bug-finding/polishing skill path

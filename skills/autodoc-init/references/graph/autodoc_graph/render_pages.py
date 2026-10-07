@@ -44,6 +44,10 @@ WIKILINK_RE = re.compile(r"\[\[([^\]\[|\n]+)(?:\|([^\]\[\n]+))?\]\]")
 # Reserved frontmatter keys: writer/renderer plumbing, never emitted as YAML.
 _RESERVED_PREFIX = "_"
 
+# The only page kinds a stored ``_diagram`` is drawn on; on any other kind the
+# reserved key is never rendered, so a diagram there has to stay in the body.
+DIAGRAM_KINDS = ("flow", "data-model")
+
 # Defensive twin of records._FM_KEY_RE (adversarial finding 6): the records
 # writer rejects non-identifier keys at intake, and the renderer refuses to
 # emit one regardless — a key containing ':' or a newline would break out of
@@ -325,7 +329,7 @@ class _Renderer:
             fm["depends_on"] = [f"[[{t}]]" for t in sorted(depends)]
         body = (ent.get("body") or "").replace("\r\n", "\n").replace("\r", "\n")
         body = self._resolve_body(page, body)
-        if mermaid and ent["kind"] in ("flow", "data-model"):
+        if mermaid and ent["kind"] in DIAGRAM_KINDS:
             body = _insert_diagram(body, str(mermaid))
             fm["diagram"] = True
             fm["diagram_source_sha"] = str(diagram_sha or "")

@@ -31,6 +31,7 @@ from agentflow.issue_intake import (
     spec_fixers,
 )
 from agentflow import registry as _registry
+from agentflow.config import WorkSource
 from agentflow.registry import QueueRow
 
 HOST_REF = "owner/repo"
@@ -124,17 +125,14 @@ class _Env:
 
 
 class _Proj:
-    def __init__(self, ws_kind: str = "github-issues"):
+    def __init__(self, ws_kind: str = "github-issues", open_issue_page: int = OPEN_ISSUE_PAGE):
         class _CR:
-            pass
-
-        class _WS:
             pass
 
         self.canonical_repo = _CR()
         self.canonical_repo.host_ref = HOST_REF
-        self.work_source = _WS()
-        self.work_source.kind = ws_kind
+        # the real dataclass, so a field fix-claims starts reading cannot be missing from the fake
+        self.work_source = WorkSource(kind=ws_kind, open_issue_page=open_issue_page)
 
 
 _QUEUE_HEADER = ("| id | work item | lane | claimed_by | state | waiting_on | notes |\n"
@@ -207,6 +205,30 @@ def test_a_pr_claims_the_fix_through_each_documented_shape(pr) -> None:
         "prose"])
 def test_a_keyword_that_does_not_open_the_line_claims_nothing(body) -> None:
     assert fix_claims([_issue(10)], [_pr(1, body=body)], []) == []
+
+
+def test_a_grouped_pr_claims_its_also_addresses_issue_beside_its_source() -> None:
+    body = ("Agentflow [lead-dev]\n\nSource: gh#932\n\n"
+            "Also addresses gh#933 (same row).\n")
+    claims = fix_claims([_issue(932), _issue(933)], [_pr(1, body=body)], [])
+    assert [c.number for c in claims] == [932, 933]
+
+
+@pytest.mark.parametrize("body", [
+    "also addresses gh#5",
+    "- Also addresses gh#5",
+    "**Also addresses:** gh#5",
+], ids=["lowercase", "bulleted", "bold"])
+def test_an_also_addresses_line_tolerates_the_source_lead_in(body) -> None:
+    assert [c.number for c in fix_claims([_issue(5)], [_pr(1, body=body)], [])] == [5]
+
+
+@pytest.mark.parametrize("body", [
+    "Refs #77",
+    "This change also addresses gh#77 in passing.",
+], ids=["refs", "mid-line-prose"])
+def test_refs_and_a_mid_line_also_addresses_claim_nothing(body) -> None:
+    assert fix_claims([_issue(77)], [_pr(1, body=body)], []) == []
 
 
 def test_a_title_hash_ref_without_gh_does_not_claim() -> None:
@@ -566,6 +588,22 @@ def test_a_full_open_issue_read_prints_capped(monkeypatch, project, capsys) -> N
     summary = capsys.readouterr().out.splitlines()[-1]
     assert f"{OPEN_ISSUE_PAGE} open issue(s) read (capped at {OPEN_ISSUE_PAGE})" in summary
     assert "merged PR(s) read (capped" not in summary
+
+
+def test_fix_claims_reads_the_configured_open_issue_page(monkeypatch, project, capsys) -> None:
+    from agentflow import config as _config
+
+    page = 300
+    monkeypatch.setattr(_config, "load_project",
+                        lambda name: _Proj(open_issue_page=page))
+    runner = _use(monkeypatch, TrackerRunner(open_issues=_open(*range(page + 1, 0, -1))))
+    assert main(["fix-claims", "--project", "demo", "--json"]) == 0
+    argv = next(c for c in runner.calls if tuple(c[1:3]) == ("issue", "list"))
+    assert argv[argv.index("--limit") + 1] == str(page + 1)
+    summary = json.loads(capsys.readouterr().out)["summary"]
+    assert summary["open_limit"] == page and summary["open_read"] == page
+    assert summary["open_capped"] is True
+    assert f"{page} open issue(s) read (capped at {page})" in summary["line"]
 
 
 def test_exactly_a_page_of_open_issues_is_not_capped(monkeypatch, project, capsys) -> None:

@@ -62,6 +62,10 @@ A loop's PR body cites the issue it works on as:
 Source: gh#N
 ```
 
+A PR that fixes more than one issue names the first on `Source:` and each other one on its own line
+starting `Also addresses gh#N`. `fix-claims` reads both lines, so every issue the PR fixes reaches the
+auditor's closure pass; a `Refs #N` line is not a fix claim and is not read.
+
 Neither the PR title, the body, nor any commit message on the branch puts a GitHub closing keyword
 before an issue reference. The keyword is `close`, `closes`, `closed`, `fix`, `fixes`, `fixed`,
 `resolve`, `resolves` or `resolved`, in any case, with or without a colon; the reference is `#N`,
@@ -87,7 +91,7 @@ are the auditor (its fixed-issue pass) and, on the human's instruction, dev-mana
 built the fix is never one. In order:
 
 1. The attribution line.
-2. `Checked against: <base_branch> <sha7>; claimed fixed by #<pr> (<sha7>)`, naming the claim's
+2. `Checked against: <base-branch> <sha7>; claimed fixed by #<pr> (<sha7>)`, naming the claim's
    newest claimant. Use `spec <slug>` for a done spec, or `sha <sha7>` for a candidate that came by
    Note.
 3. `Verdict: fixed`, `Verdict: remainder` or `Verdict: routed`.
@@ -155,6 +159,28 @@ nothing is missing rather than leaving the inheritor to guess.
 The pointer is a POINTER: the review comment it names is still written per this file, and each
 later round's review still goes on the same issue as that round completes. Neither is enforced by
 the gate.
+
+## Skill budget
+
+Every budgeted `SKILL.md` has a line ceiling in `skills/_shared/skill_budgets.json`. A PR that
+raises a ceiling carries one line in its body per raised skill:
+
+```
+skill-budget: <skill> +<N> because <reason>
+```
+
+`<skill>` is the budget key (the skill's directory name, or `install` for `install/SKILL.md`), and
+`<N>` is exactly the raise over the base branch. A key the base did not have (a new skill, or a
+renamed one) is raised by however far its ceiling sits above its file's line count. The
+`sanitize-gate` job compares the budget file against the base and fails on a raise with no line,
+a line whose `<N>` differs from the raise, a malformed `skill-budget:` line, and two lines for one
+skill. A lowered ceiling needs no line. The line may be a list item or a quote; a line inside a
+fenced code block, or one still holding `<skill>`, is read as an example.
+
+The line goes in the body for the same reason as the review pointer: the body is what the
+`pull_request` event carries, and `edited` re-runs the check after a fix. The reason is the point.
+Growth is allowed, but it is a decision a reviewer can see and question, not a side effect of the
+diff. Why the budget exists: `docs/ARCHITECTURE.md`, "Prose as code".
 
 ## No Claude Code session URLs on the host
 

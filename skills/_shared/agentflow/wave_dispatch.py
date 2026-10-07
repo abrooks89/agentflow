@@ -14,6 +14,7 @@ from pathlib import Path
 
 from agentflow.plan_parser import PlanFrontmatter, Task, parse_plan  # noqa: F401 (parse_plan re-export)
 from agentflow.status_writer import StatusState, coerce_wave_outcome
+from agentflow.wave_worktree import _wave_branch, _wave_path
 
 _LOG = logging.getLogger(__name__)
 
@@ -28,8 +29,8 @@ def _mode(task: Task) -> str:
     return "single"
 
 
-# `## Task N:` (solution SKILL) and `### Task N:` (vendored writing-plans) are both
-# in use, so the level is captured rather than assumed.
+# `### Task N:` is canonical; legacy `## Task N:` plans still exist, so the level is
+# captured rather than assumed.
 _TASK_HEADING_RE = re.compile(r"^(#{2,3})\s+Task\s+(\d+)\b")
 _ANY_HEADING_RE = re.compile(r"^(#{1,6})\s")
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -79,8 +80,10 @@ def _task_body(plan_path: Path, tid: int) -> str:
     """Extract the markdown body under the `## Task <tid>` or `### Task <tid>` heading.
 
     The body runs to the next Task heading, or to a heading shallower than the task's
-    own. A same-level heading that is not a Task heading is part of the body, because
-    the solution SKILL puts `## Files:` inside each `## Task N:` body. Lines inside a
+    own. A same-level heading that is not a Task heading is part of the body, so a
+    legacy `## Task N:` plan keeps its `## Files:` subsection. The canonical shape is
+    `### Task N:` with the Files block at `####` (or a bold `**Files:**` label); a `##`
+    heading under a `### Task` ends the body by design. Lines inside a
     fenced code block are never headings: task bodies paste shell and Python whose
     `# comment` lines would otherwise end the body. A fence left open at end of file
     would swallow every later task into this one, so an unbalanced plan is re-read
@@ -141,7 +144,7 @@ def build_wave_args(
             # The implementer sees only this body; an empty one is a silent no-op task.
             raise ValueError(
                 f"Task {tid} has an empty body in {Path(plan_path).as_posix()}: "
-                f"expected a '## Task {tid}:' or '### Task {tid}:' heading followed by its contract"
+                f"expected a '### Task {tid}:' (or legacy '## Task {tid}:') heading followed by its contract"
             )
         tasks_out.append({
             "id": tid,
@@ -158,6 +161,18 @@ def build_wave_args(
             "test_commands": list(v.test_commands) if v else [],
             "wave_deadline_minutes": t.wave_deadline_minutes,
         })
+        if plan.per_wave_worktrees:
+            # Derived with the same helpers create_wave_worktree uses, so the workflow lands the
+            # tree Step 7.0 actually made. Both keys or neither: wave_group.js blocks a task
+            # carrying only one.
+            tree = _wave_path(Path(repo_path), plan.slug, wave_n, tid)
+            if not tree.is_dir():
+                raise ValueError(
+                    f"Wave tree for task {tid} does not exist: {tree.as_posix()} "
+                    f"(Step 7.0 creates it before build_wave_args)"
+                )
+            tasks_out[-1]["wave_worktree"] = tree.as_posix()
+            tasks_out[-1]["wave_branch"] = _wave_branch(plan.slug, wave_n, tid)
     return {
         "wave_n": wave_n,
         "epic_slug": plan.slug,

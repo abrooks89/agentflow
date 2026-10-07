@@ -89,7 +89,7 @@ def test_the_record_states_what_the_drill_does_NOT_prove(tmp_path, drill):
         "audit reads the old limit and concludes the watcher still has no legitimate scheduler"
     )
     assert "no packet left the machine" in record.lower(), (
-        "notify() returns None whether it POSTed or not, so no caller can claim delivery"
+        "the drill injects its sender, and even a True from notify() is not a delivery receipt"
     )
     assert "process boundary" in record.lower(), (
         "'outside a loop' is proven to a subprocess and no further - whether the MACHINE had a "

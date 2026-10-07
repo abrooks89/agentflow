@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1011,3 +1012,435 @@ def test_file_entries_are_copies_and_can_still_drift_under_the_REAL_mode(
     deployed.write_text("drifted under the shipped mode\n", encoding="utf-8")
     with pytest.raises(RuntimeError):
         provision._do_deploy_skills(opts)
+
+
+# --------------------------------------------------------------------------- #
+# gh#985 item 2 - re-provisioning from a second checkout re-points, never doubles
+# --------------------------------------------------------------------------- #
+def _sessionstart_commands(settings_file: Path) -> list:
+    settings = json.loads(settings_file.read_text(encoding="utf-8"))
+    return [h["command"] for block in settings["hooks"]["SessionStart"]
+            for h in block.get("hooks", [])]
+
+
+def test_reprovision_from_a_second_checkout_repoints_links_and_replaces_the_hook(
+    tmp_path, claude_root, real_deploy_mode, monkeypatch
+):
+    """The issue's repro: provision from repo/, then from an identical clone repo2/.
+
+    An identical clone hashes EQUAL, so the old hash-only rule kept every link pointing at
+    repo/ while the manifest recorded repo2/, and the exact-string hook dedupe appended a
+    second SessionStart entry. Deleting repo/ then dangled every seat and left a hook
+    exiting 127. A foreign SessionStart entry is the control: it must survive untouched.
+    """
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    repo = _make_suite(tmp_path / "repo")
+    repo2 = _make_suite(tmp_path / "repo2")
+    settings_file = tmp_path / "settings.json"
+    foreign = {"matcher": "startup", "hooks": [{"type": "command", "command": "echo mine"}]}
+    settings_file.write_text(json.dumps({"hooks": {"SessionStart": [foreign]}}),
+                             encoding="utf-8")
+
+    for checkout in (repo, repo2):
+        opts = _make_opts(checkout, claude_root)
+        opts.settings_file = settings_file
+        opts.config_home = tmp_path / "cfg"   # one config home, two checkouts
+        provision._do_deploy_skills(opts)
+        provision._do_sessionstart_hook(opts)
+
+    links = [claude_root / key for key, _src in provision._deploy_sources(repo2)
+             if provision._is_link(claude_root / key)]
+    assert links, f"{real_deploy_mode} mode deployed no link to check"
+    for link in links:
+        assert link.resolve().is_relative_to(repo2.resolve()), (
+            f"{link} still resolves to {link.resolve()}, not into {repo2}")
+    manifest = json.loads((claude_root / provision.DEPLOY_MANIFEST_NAME).read_text("utf-8"))
+    assert manifest["suite_root"] == str(repo2)
+
+    cmds = _sessionstart_commands(settings_file)
+    ours = [c for c in cmds if provision._is_agentflow_sessionstart(c)]
+    assert ours == [f'"{provision._venv_python(_make_opts(repo2, claude_root))}" '
+                    f'"{repo2 / provision.SESSIONSTART_HOOK_REL}"'], cmds
+    saved = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert saved["hooks"]["SessionStart"][0] == foreign, "a foreign entry was touched"
+
+
+def test_a_link_the_manifest_does_not_account_for_is_not_repointed(
+    tmp_path, claude_root, real_deploy_mode
+):
+    """Ownership is the manifest key PLUS a link landing on this entry's slot in a checkout.
+
+    An operator re-points a deployed skill at their own tree (same content, so no hash
+    drift). The key is still in the manifest, but `theirs/alpha` neither equals the
+    recorded source nor ends in `skills/alpha`, so re-provision from repo2/ leaves their
+    link exactly where they put it.
+    """
+    repo = _make_suite(tmp_path / "repo")
+    repo2 = _make_suite(tmp_path / "repo2")
+    provision._do_deploy_skills(_make_opts(repo, claude_root))
+    target = claude_root / "skills" / "alpha"
+    if not provision._is_link(target):
+        pytest.skip(f"{real_deploy_mode} mode deploys no directory link")
+    theirs = tmp_path / "theirs" / "alpha"
+    shutil.copytree(repo / "skills" / "alpha", theirs)
+    provision._remove_target(target)
+    _make_link(theirs, target)
+
+    provision._do_deploy_skills(_make_opts(repo2, claude_root))
+
+    assert target.resolve() == theirs.resolve()
+
+
+def _rewrite_manifest_to(claude_root: Path, old: Path, new: Path) -> None:
+    """Leave the manifest the way the pre-gh#985 code did: every recorded source already
+    names the NEW checkout while the links on disk still point into the OLD one."""
+    path = claude_root / provision.DEPLOY_MANIFEST_NAME
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["suite_root"] = str(new)
+    for entry in data["entries"].values():
+        entry["source"] = entry["source"].replace(str(old), str(new))
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _deployed_links(claude_root: Path, suite_root: Path) -> list:
+    return [claude_root / key for key, _src in provision._deploy_sources(suite_root)
+            if provision._is_link(claude_root / key)]
+
+
+def _add_plan_lint(root: Path) -> Path:
+    """The one deploy entry whose key (scripts/plan-lint.sh) is NOT its suite-relative
+    path; `_deploy_sources` ships it only when this exact file exists."""
+    script = root / "skills" / "_shared" / "scripts" / "plan-lint.sh"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    return script
+
+
+def _assert_plan_lint_survives(claude_root: Path, repo2: Path) -> None:
+    """Run AFTER repo/ is gone: a link must point into repo2/, a copy must still exist."""
+    deployed = claude_root / "scripts" / "plan-lint.sh"
+    if provision._is_link(deployed):
+        assert deployed.exists() and deployed.resolve().is_relative_to(repo2.resolve()), (
+            f"{deployed} resolves to {deployed.resolve()}, not into {repo2}")
+    else:
+        assert deployed.is_file(), f"{deployed} vanished with the old checkout"
+
+
+def test_reprovision_repoints_owned_links_after_the_manifest_was_already_rewritten(
+    tmp_path, claude_root, real_deploy_mode, capsys
+):
+    """gh#985 auditor repro: the manifest already records repo2/, the links still point at
+    repo/. The recorded source no longer equals the link target, so an exact-match rule
+    never re-points them - and deleting repo/ then dangles skills/alpha, beta, _vendored.
+    The re-point is also announced on stderr, since the record did not name the old target."""
+    repo = _make_suite(tmp_path / "repo")
+    repo2 = _make_suite(tmp_path / "repo2")
+    _add_plan_lint(repo)
+    _add_plan_lint(repo2)
+    provision._do_deploy_skills(_make_opts(repo, claude_root))
+    links = _deployed_links(claude_root, repo)
+    assert links, f"{real_deploy_mode} mode deployed no link to check"
+    assert all(link.resolve().is_relative_to(repo.resolve()) for link in links)
+    _rewrite_manifest_to(claude_root, repo, repo2)
+    capsys.readouterr()
+
+    provision._do_deploy_skills(_make_opts(repo2, claude_root))
+
+    err = capsys.readouterr().err
+    for link in links:
+        assert link.resolve().is_relative_to(repo2.resolve()), (
+            f"{link} still resolves to {link.resolve()}, not into {repo2}")
+        assert f"provision: re-pointed {link} from " in err, err
+    shutil.rmtree(repo)
+    assert all(link.exists() for link in links), "a seat dangled once repo/ was deleted"
+    _assert_plan_lint_survives(claude_root, repo2)
+
+
+def test_reprovision_repoints_owned_links_the_deleted_checkout_left_dangling(
+    tmp_path, claude_root, real_deploy_mode
+):
+    """Same state, but the operator deleted repo/ BEFORE re-provisioning: every owned
+    link now dangles, and re-provision from repo2/ must re-point it, not crash or skip."""
+    repo = _make_suite(tmp_path / "repo")
+    repo2 = _make_suite(tmp_path / "repo2")
+    _add_plan_lint(repo)
+    _add_plan_lint(repo2)
+    provision._do_deploy_skills(_make_opts(repo, claude_root))
+    links = _deployed_links(claude_root, repo)
+    assert links, f"{real_deploy_mode} mode deployed no link to check"
+    _rewrite_manifest_to(claude_root, repo, repo2)
+    shutil.rmtree(repo)
+    assert not any(link.exists() for link in links), "setup: links should dangle"
+
+    provision._do_deploy_skills(_make_opts(repo2, claude_root))
+
+    for link in links:
+        assert link.exists() and link.resolve().is_relative_to(repo2.resolve()), link
+    _assert_plan_lint_survives(claude_root, repo2)
+
+
+def test_reprovision_leaves_foreign_links_and_user_directories_alone(
+    tmp_path, claude_root, real_deploy_mode
+):
+    """Owned means the manifest key AND a link landing on this entry's slot in a checkout.
+
+    - Key in the manifest, but the operator re-pointed it at their own tree: left alone,
+      even with the manifest already rewritten (the state this epic re-points from).
+    - A link shaped exactly like a checkout's slot under a key the manifest never
+      recorded: foreign, so the deploy refuses and touches nothing.
+    - A user's real directory under such a key: the same refusal, the same untouched tree.
+
+    The gamma half guards the OUTER `_is_agentflow_owned` gate in `_refuse_undeployable`;
+    the key check inside `_owned_link_elsewhere` is defensive only and never decides it.
+    """
+    repo = _make_suite(tmp_path / "repo")
+    repo2 = _make_suite(tmp_path / "repo2")
+    provision._do_deploy_skills(_make_opts(repo, claude_root))
+    alpha = claude_root / "skills" / "alpha"
+    if not provision._is_link(alpha):
+        pytest.skip(f"{real_deploy_mode} mode deploys no directory link")
+    theirs = tmp_path / "theirs" / "alpha"
+    shutil.copytree(repo / "skills" / "alpha", theirs)
+    provision._remove_target(alpha)
+    _make_link(theirs, alpha)
+    _rewrite_manifest_to(claude_root, repo, repo2)
+
+    provision._do_deploy_skills(_make_opts(repo2, claude_root))
+
+    assert alpha.resolve() == theirs.resolve(), "an operator's own link was hijacked"
+
+    # A slot the manifest never recorded, holding a checkout-shaped foreign link.
+    (repo2 / "skills" / "gamma").mkdir()
+    (repo2 / "skills" / "gamma" / "SKILL.md").write_text("gamma\n", encoding="utf-8")
+    other = _make_suite(tmp_path / "other-clone")
+    (other / "skills" / "gamma").mkdir()
+    (other / "skills" / "gamma" / "SKILL.md").write_text("gamma\n", encoding="utf-8")
+    gamma = claude_root / "skills" / "gamma"
+    _make_link(other / "skills" / "gamma", gamma)
+    with pytest.raises(RuntimeError, match="not deployed by agentflow"):
+        provision._do_deploy_skills(_make_opts(repo2, claude_root))
+    assert gamma.resolve() == (other / "skills" / "gamma").resolve()
+
+    # The same slot as a user's real directory.
+    provision._remove_target(gamma)
+    gamma.mkdir()
+    (gamma / "mine.md").write_text("user content\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="not deployed by agentflow"):
+        provision._do_deploy_skills(_make_opts(repo2, claude_root))
+    assert not provision._is_link(gamma)
+    assert sorted(p.name for p in gamma.iterdir()) == ["mine.md"]
+
+
+def test_reprovision_never_touches_a_link_already_inside_the_suite_root(
+    tmp_path, claude_root, real_deploy_mode, monkeypatch
+):
+    """A link into the CURRENT checkout is left exactly as it is - even when the manifest
+    records another checkout's source for it - so a re-run removes nothing."""
+    repo = _make_suite(tmp_path / "repo")
+    repo2 = _make_suite(tmp_path / "repo2")
+    provision._do_deploy_skills(_make_opts(repo2, claude_root))
+    links = _deployed_links(claude_root, repo2)
+    assert links, f"{real_deploy_mode} mode deployed no link to check"
+    _rewrite_manifest_to(claude_root, repo2, repo)   # record names the OTHER checkout
+    removed = []
+    real_remove = provision._remove_target
+    monkeypatch.setattr(provision, "_remove_target",
+                        lambda t: (removed.append(Path(t)), real_remove(t)))
+
+    provision._do_deploy_skills(_make_opts(repo2, claude_root))
+
+    assert not set(removed) & set(links), f"in-suite links were removed: {removed}"
+    for link in links:
+        assert link.resolve().is_relative_to(repo2.resolve()), link
+
+
+def test_a_wrapper_running_our_hook_script_is_not_claimed(tmp_path, claude_root, monkeypatch):
+    """Only the command step 9 writes is agentflow's: the suite venv python running the
+    hook script from the SAME checkout. An operator's wrapper around our script is theirs."""
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    repo = _make_suite(tmp_path / "repo")
+    wrapper = (f'"{tmp_path / "tools" / "wrap.exe"}" '
+               f'"{tmp_path / "x" / provision.SESSIONSTART_HOOK_REL}"')
+    other_venv = (f'"{provision._venv_python(_make_opts(tmp_path / "other", claude_root))}" '
+                  f'"{repo / provision.SESSIONSTART_HOOK_REL}"')
+    entries = [{"hooks": [{"type": "command", "command": c}]} for c in (wrapper, other_venv)]
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"hooks": {"SessionStart": entries}}), encoding="utf-8")
+    opts = _make_opts(repo, claude_root)
+    opts.settings_file = settings_file
+    opts.config_home = tmp_path / "cfg"
+
+    provision._do_sessionstart_hook(opts)
+
+    saved = json.loads(settings_file.read_text(encoding="utf-8"))["hooks"]["SessionStart"]
+    assert saved[:2] == entries, "a non-agentflow entry was rewritten or dropped"
+    assert len(saved) == 3 and provision._is_agentflow_sessionstart(
+        saved[2]["hooks"][0]["command"])
+
+
+# --------------------------------------------------------------------------- #
+# --deploy-only: step 7 alone, so a lane's skill deploy writes no project's data
+# --------------------------------------------------------------------------- #
+def _two_project_config(tmp_path: Path) -> tuple[Path, Path]:
+    """A config home with two configured projects and a data_root holding one partial subtree.
+
+    `otherproj`'s subtree is deliberately incomplete (directories, no seeded files), so a
+    run that reached step 11 would visibly add to it. Returns (config_home, data_root).
+    """
+    data_root = tmp_path / "data"
+    config_home = tmp_path / "cfg"
+    (config_home / "projects").mkdir(parents=True)
+    (config_home / "environment.md").write_text(
+        f"```yaml\ndata_root: {data_root.as_posix()}\n```\n", encoding="utf-8")
+    for name in ("homeproj", "otherproj"):
+        (config_home / "projects" / f"{name}.md").write_text(f"# {name}\n", encoding="utf-8")
+    other = data_root / "projects" / "otherproj"
+    (other / "wiki" / "pages").mkdir(parents=True)
+    (other / "status").mkdir(parents=True)
+    (other / "status" / "notes.md").write_text("left alone\n", encoding="utf-8")
+    return config_home, data_root
+
+
+def _tree(root: Path) -> dict:
+    return {p.relative_to(root).as_posix(): (p.read_bytes() if p.is_file() else None)
+            for p in sorted(root.rglob("*"))}
+
+
+def _deploy_only_argv(suite: Path, claude_root: Path, config_home: Path, tmp_path: Path,
+                      *extra: str) -> list[str]:
+    return ["--deploy-only", *extra,
+            "--suite-root", str(suite),
+            "--claude-root", str(claude_root),
+            "--config-home", str(config_home),
+            "--settings-file", str(tmp_path / "settings.json")]
+
+
+def test_deploy_only_deploys_and_never_touches_another_projects_subtree(
+        suite, claude_root, tmp_path, capsys):
+    config_home, data_root = _two_project_config(tmp_path)
+    before = _tree(data_root)
+
+    rc = provision.main(_deploy_only_argv(suite, claude_root, config_home, tmp_path))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert (claude_root / "skills" / "alpha" / "SKILL.md").is_file()
+    assert (claude_root / "commands" / "alpha.md").is_file()
+    assert (claude_root / provision.DEPLOY_MANIFEST_NAME).is_file()
+    assert _tree(data_root) == before, "deploy-only wrote into a project's data subtree"
+    assert not (data_root / "projects" / "homeproj").exists()
+    # Step 7 is the only step that ran; the settings file steps 8 + 9 write never appeared.
+    assert re.findall(r"^  (\d+)\. ", out, re.MULTILINE) == ["7", "7"]  # start + done
+    # The apply header names only what step 7 reads and writes.
+    assert f"  claude_root : {claude_root}" in out
+    for absent in ("config_home :", "settings    :", "autodoc     :", "auto-allow  :"):
+        assert absent not in out, absent
+    assert not (tmp_path / "settings.json").exists()
+
+
+def test_deploy_only_dry_run_lists_only_the_deploy_step(suite, claude_root, tmp_path, capsys):
+    config_home, _ = _two_project_config(tmp_path)
+
+    rc = provision.main(_deploy_only_argv(suite, claude_root, config_home, tmp_path, "--dry-run"))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert provision.DEPLOY_ONLY_NOTE in out
+    assert re.findall(r"^  (\d+)\. ", out, re.MULTILINE) == ["7"]
+    assert "Scaffold data_root" not in out
+    assert not claude_root.exists()
+
+
+def test_full_dry_run_still_lists_the_scaffold_step(suite, claude_root, tmp_path, capsys):
+    """The other half of the split: without the flag nothing changes, step 11 included."""
+    config_home, _ = _two_project_config(tmp_path)
+    argv = _deploy_only_argv(suite, claude_root, config_home, tmp_path, "--dry-run")
+    argv.remove("--deploy-only")
+
+    assert provision.main(argv) == 0
+    full = capsys.readouterr().out
+    assert provision.main([*argv, "--deploy-only"]) == 0
+    reduced = capsys.readouterr().out
+
+    assert "11. Scaffold data_root" in full and "11. Scaffold data_root" not in reduced
+    assert provision.DEPLOY_ONLY_NOTE not in full
+
+
+@pytest.mark.parametrize("extra, named", [
+    (("--resume-from", "5"), "--resume-from"),
+    (("--autodoc",), "--autodoc"),
+    (("--wake-watch",), "--wake-watch"),
+])
+def test_deploy_only_refuses_flags_that_ask_for_another_step(
+        suite, claude_root, tmp_path, capsys, extra, named):
+    config_home, data_root = _two_project_config(tmp_path)
+    before = _tree(data_root)
+
+    with pytest.raises(SystemExit) as exc:
+        provision.main(_deploy_only_argv(suite, claude_root, config_home, tmp_path, *extra))
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    # The error line itself, not the usage block, which names every flag anyway.
+    error_line = err.strip().splitlines()[-1]
+    assert "--deploy-only" in error_line and f"cannot be combined with {named}" in error_line
+    assert not claude_root.exists()
+    assert _tree(data_root) == before
+
+
+@pytest.mark.parametrize("extra", [("--no-autodoc",), ("--no-auto-allow",), ("--no-wake-watch",),
+                                   ("--force",)])
+def test_deploy_only_accepts_flags_that_agree_with_it(
+        suite, claude_root, tmp_path, capsys, extra):
+    """Skip flags say what deploy-only already does, and --force tunes step 7 itself."""
+    config_home, _ = _two_project_config(tmp_path)
+
+    rc = provision.main(_deploy_only_argv(suite, claude_root, config_home, tmp_path,
+                                          "--dry-run", *extra))
+
+    assert rc == 0
+    assert provision.DEPLOY_ONLY_NOTE in capsys.readouterr().out
+
+
+# What `git worktree add` writes as a linked worktree's `.git`: a FILE, not a directory.
+LINKED_WORKTREE_DOT_GIT = "gitdir: /elsewhere/.git/worktrees/epic-branch\n"
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_deploy_only_refuses_a_linked_worktree_suite_root(
+        suite, claude_root, tmp_path, capsys, dry_run):
+    """Live entries point into suite_root; a per-epic worktree is deleted after merge."""
+    (suite / ".git").write_text(LINKED_WORKTREE_DOT_GIT, encoding="utf-8")
+    config_home, data_root = _two_project_config(tmp_path)
+    before = _tree(data_root)
+    extra = ("--dry-run",) if dry_run else ()
+
+    with pytest.raises(SystemExit) as exc:
+        provision.main(_deploy_only_argv(suite, claude_root, config_home, tmp_path, *extra))
+
+    assert exc.value.code == 2
+    error_line = capsys.readouterr().err.strip().splitlines()[-1]
+    assert "linked git worktree" in error_line and "primary checkout" in error_line
+    assert not claude_root.exists()
+    assert _tree(data_root) == before
+
+
+def test_deploy_only_accepts_a_primary_checkout_suite_root(suite, claude_root, tmp_path, capsys):
+    (suite / ".git").mkdir()
+    config_home, _ = _two_project_config(tmp_path)
+
+    rc = provision.main(_deploy_only_argv(suite, claude_root, config_home, tmp_path))
+
+    assert rc == 0
+    assert (claude_root / "skills" / "alpha" / "SKILL.md").is_file()
+
+
+def test_the_worktree_guard_is_scoped_to_deploy_only(suite, claude_root, tmp_path, capsys):
+    """A full install from a worktree is unchanged: its dry run still plans every step."""
+    (suite / ".git").write_text(LINKED_WORKTREE_DOT_GIT, encoding="utf-8")
+    config_home, _ = _two_project_config(tmp_path)
+    argv = _deploy_only_argv(suite, claude_root, config_home, tmp_path, "--dry-run")
+    argv.remove("--deploy-only")
+
+    assert provision.main(argv) == 0
+    assert "11. Scaffold data_root" in capsys.readouterr().out

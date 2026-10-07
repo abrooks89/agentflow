@@ -84,7 +84,7 @@ clone will not print the id above, and that is expected.
 > The **second** finding in that issue, split out as `gh#322`, is fixed for the case it
 > recorded: step 2 no longer pre-creates a scraped `data_root` or `worktree_root` that is
 > relative, or whose only existing ancestor is the drive root, and leaves the loud failure to
-> the step-10 resolver. It still creates a well-formed path under an existing directory before
+> the resolver. It still creates a well-formed path under an existing directory before
 > the resolver runs, by design, because a fresh `data_root` does not exist yet.
 
 Set aside about twenty minutes, most of it waiting on downloads.
@@ -250,6 +250,21 @@ bare `owner/repo` and no config field carries a hostname — so the call goes to
 which reports a repository that does not exist there. Expect a GitHub error naming a repo you
 never meant to reach; your own host's logs will show nothing.
 
+**`/autodoc-init`'s source clone reads `git_host.kind`.** Step 1 clones the repository it
+documents into the corpus's `.source/` directory, and picks the call by host:
+
+- **`github` with `gh` on PATH** — `gh repo clone <host_ref> <dir> -- --depth 1 --branch
+  <base_branch>`. gh must be authenticated for a private repository; if the call fails, the next
+  two sources are tried.
+- **Any other host, or GitHub without `gh`** — `git clone --depth 1 --branch <base_branch>
+  <origin> <dir>`, where `<origin>` is the `origin` remote of `canonical_repo.local_checkout`. It
+  uses whatever credentials that checkout already pushes and pulls with (SSH key, credential
+  helper), so a Gitea, GitLab or local profile needs nothing beyond a working `git pull` there.
+  Prompts are off: an HTTPS remote that would ask for a password fails instead.
+- **No origin, or one that does not answer** — `git clone --depth 1 --branch <base_branch>
+  file://<local_checkout>`. This needs a local `<base_branch>` branch in the checkout, and it
+  documents what that branch holds, which can lag the host; the run warns when it falls back.
+
 Everything that goes through plain `git` — clone, worktrees, branches, commits, pushes — works
 on any host.
 
@@ -361,14 +376,20 @@ a schedule whether or not any session is open, happens only if you opt in with `
   **symlinks** back into `~/agentflow`, so the deployed skills track your checkout live. On
   Windows the skill *directories* are **junctions**, which track the checkout live the same way
   and need no admin rights; the `commands/*.md` files and the hook script remain copies, because
-  a junction can only point at a directory, and those stay stale until you re-run provision
-  (gh#296). A manifest at `~/.claude/.agentflow-deploy.json` records one entry per
+  a junction can only point at a directory, and those stay stale until you refresh them with
+  `python install/provision.py --deploy-only`, run from `~/agentflow` itself and never from a
+  git worktree of it (gh#296). That runs the deploy step alone and touches no project data. A manifest at `~/.claude/.agentflow-deploy.json` records one entry per
   deployed skill *directory*, per `commands/*.md` file, **and one hook script** —
   `skills/_shared/scripts/plan-lint.sh`, which lands at the stable path
   `~/.claude/scripts/plan-lint.sh` so the host copy is never unmanaged (gh#110). Provision
   registers no hook for it: nothing runs it unless you add one yourself. Each entry carries
   source, target, and a single sha256 over that whole entry, not a per-file listing. Three kinds of thing, not two: the
   script is the one people forget, and a deployed file nothing claims is a file nothing updates.
+  A profile's delegated skill path (`generation_skills.polishing`, say) may name a skill the
+  suite ships either in the checkout or at its deployed place under the Claude config dir's `skills/` (`~/.claude/skills/` by
+  default); the
+  latter does not exist until step 7 deploys it, so steps 2 and 5 accept it when the checkout
+  holds the same file, and step 10 checks it for real once it is there.
 - **A `SessionStart` hook** in `~/.claude/settings.local.json`, which prints agentflow's
   resolved config into every new Claude Code session **started from your home directory** —
   `settings.local.json` is the *project* settings file for a session rooted there, not the
@@ -395,8 +416,8 @@ a schedule whether or not any session is open, happens only if you opt in with `
   lane launched with `--dangerously-skip-permissions` needs these hooks at all has not been
   verified, so do not read declining them as either safe or unsafe for such a lane.
 - **Optionally, a scheduled missed-wake watchdog — off unless you ask for it.** A plain
-  install registers nothing on the OS scheduler: step 12 prints `SKIPPED` and names the flag.
-  Run the provisioner with `--wake-watch` to opt in. Opted in on Windows, the installer
+  install registers nothing on the OS scheduler: `provision.py` step 12 prints `SKIPPED` and
+  names the flag. Run the provisioner with `--wake-watch` to opt in. Opted in on Windows, the installer
   registers one Task Scheduler entry per project, named
   `agentflow-wake-watch-<project>`, firing hourly. It runs
 
@@ -479,6 +500,7 @@ info glob:spec             /home/you/agentflow-data/projects/your-project/design
 info glob:plan             /home/you/agentflow-data/projects/your-project/design/plans exists but holds nothing yet
 ok   glob:status           1 match(es)
 ok   vocabulary            no epic declares a queue_class
+ok   done-spec-pointers    every done-spec pointer resolves
 info autodoc               no autodoc root configured or derived
 info vault                 no vault - recorded as declined (`vault: null`)
 
@@ -514,17 +536,25 @@ says the project subtree was never scaffolded - re-run `python install/provision
 The same scaffold seeds the project's `wiki/` pillar. When the pillar has no pages yet, that
 includes an empty residue baseline (`wiki/residue-baseline.json`, dated at provision time), so the
 steward's residue check (`python -m agentflow.wiki residue`) can measure from its first wake. A
-pillar that already has pages gets no baseline: the check exits 2 until you read its report and
-record one with `--update-baseline`.
+pillar that already has pages gets no baseline: the check exits 2 and prints its report, every
+page that carries residue with one `<path>:<line> <class>` line per hit, until you read that
+report and record one with `--update-baseline`. Recording prints the same list before it writes,
+and accepts every page on it.
 
 There are four statuses. `ok` and `info` are both healthy — **`info` is not a soft failure**, it
 is "this is switched off, deliberately". `warn` means a value resolved but *not as you wrote it*
-(a dial that was clamped, say), which is reported loudly and still exits 0. Only `fail` exits 1,
-and the run ends with `N FAILING:` and each one restated. Two closing lines are healthy:
-`resolved surface healthy`, and `resolved surface healthy, but NOT everywhere as configured — see
-the warning(s) above`. A run that selected no project (two or more profiles and no `--project`)
-ends `environment and paths only: ...` instead, because it examined no checkout, registry or
-glob; pass `--project <name>` to check one.
+(a dial that was clamped, say), or, on a `survey:<kind>` line, a spec the fleet cannot promote (no
+`## Files` section, a pathless one, a slug collision): a spec-corpus problem, fixed in the spec,
+not in config. An unknown `queue_class` reports on the `vocabulary` line, a config warning, and
+a bare `survey` line (a message no kind recognised) counts as config too. Both kinds are reported
+loudly and still exit 0. Only `fail` exits 1, and the run ends with `N FAILING:` and each one
+restated. Three closing lines are healthy: `resolved surface healthy`; `resolved surface healthy,
+but NOT everywhere as configured — see the warning(s) above` when any config warning is present
+(with `; also N spec-corpus warning(s) (survey:*)` when specs warn too); and `resolved surface
+healthy and configured as intended; N spec-corpus warning(s) (survey:*) — see above` when only
+specs warn. A run that selected no project (two or more profiles and no `--project`) ends
+`environment and paths only: ...` instead, because it examined no checkout, registry or glob; pass
+`--project <name>` to check one.
 
 **`doctor` is the install-health command; `python harness/check.py --self-test`, run from the suite root, is the deeper behaviour check** — see [`harness/README.md`](../harness/README.md).
 
@@ -550,9 +580,11 @@ the process environment — so put the project on the slash command instead
 (`/<loop> --project <name>`), per §12 below and *Add another project later* in
 [`install/SKILL.md`](../install/SKILL.md).
 
-If instead it prints `agentflow SessionStart config injection FAILED` followed by a
-`ConfigError`, read what the error names — it tells you the exact field and how to fix it —
-or paste it back to Claude and ask it to fix the config.
+If instead it exits non-zero, the first line it prints is the error itself: the field in
+brackets and what is wrong with it. The headline `agentflow SessionStart config injection
+FAILED` comes next, then the full `ConfigError` with the file and the remediation. Read what
+the error names — it tells you the exact field and how to fix it — or paste it back to
+Claude and ask it to fix the config.
 
 Then confirm the write path the loops actually use resolves, replacing `<name>` with your
 project's name:
@@ -821,8 +853,9 @@ behind:
   the steal is a decision some lane took rather than a side effect of the next retry. With no builder running, it just sits there;
 - any git worktrees a build created. Those are in neither of the two folders you'd look in
   first: not in your project checkout and not in the data folder, but under the machine's
-  configured worktree root, one directory per epic at `<worktree_root>/<project>/<epic-slug>`
-  (the field itself is in [`skills/_shared/SCHEMA.md`](../skills/_shared/SCHEMA.md)). One
+  configured worktree root, one directory per epic at `<worktree_root>/<project>/<epic-branch>`,
+  named after the epic's claim branch (`e<NNNN>-<short>`; a hand run with no registry row uses
+  the epic's slug instead). The field itself is in [`skills/_shared/SCHEMA.md`](../skills/_shared/SCHEMA.md). One
   worktree home per machine, shared by every fleet and partitioned by project;
 - **the scheduled missed-wake watchdog**, if you set one up. It is the suite's one daemon
   (single-daemon rule, 2026-09-22) and it is deliberately outside the sessions: an OS scheduler
@@ -859,7 +892,7 @@ worktree to remove — rather than relying on where your shell happens to be, wh
 launch directory is no repository at all:
 
 ```
-git -C ~/projects/your-project worktree remove <worktree_root>/<project>/<epic-slug>
+git -C ~/projects/your-project worktree remove <worktree_root>/<project>/<epic-branch>
 git -C ~/projects/your-project worktree prune
 ```
 
@@ -884,17 +917,22 @@ flag on every later run.
 1. `~/.claude/.agentflow-deploy.json` lists every skill directory and command file the
    installer placed in `~/.claude`, with the source and target of each — on Linux the targets
    are symlinks. Delete the targets it names, then delete the manifest.
-2. In `~/.claude/settings.local.json`, remove the three things the install writes: the
+2. In `~/.claude/settings.local.json`, remove the four things the install writes: the
    `SessionStart` entry that runs `hooks/sessionstart-inject-config.py`, the `PreToolUse`
-   auto-allow entries, and any values the interview put in the `"env"` block (`install/SKILL.md`
-   Step 3 routes `NTFY_URL`, `NTFY_TOPIC`, git-host URLs **and tokens** there, plus `AGENTFLOW_PROJECT`).
-   Check the `"env"` block specifically — skipping it leaves credentials on the machine.
+   auto-allow entries, `env.AGENTFLOW_CONFIG` (the provisioner writes it whenever the config
+   home is not the default `~/.agentflow/config`; note the directory it names before you delete
+   it), and any values the interview put in the `"env"` block (`install/SKILL.md` Step 3 routes
+   `NTFY_URL`, `NTFY_TOPIC`, git-host URLs **and tokens** there).
+   Check the `"env"` block specifically — skipping it leaves credentials on the machine, and a
+   stale `AGENTFLOW_CONFIG` makes a later reinstall into the default config home refuse.
    Leave the rest of the file alone — it is yours, not agentflow's.
 3. Remove the `source ~/agentflow/.venv/bin/activate` line from `~/.bashrc` (or wherever
    step 7 put it), so your shell goes back to the system Python. If you enabled notifications,
    also remove the two `export NTFY_URL` / `export NTFY_TOPIC` lines beside it (the `$env:`
    lines in `$PROFILE` on Windows), or the file you sourced them from.
-4. Delete `~/.agentflow`, which holds the config the interview wrote.
+4. Delete `~/.agentflow`, which holds the config the interview wrote. If uninstall step 2
+   above found an `env.AGENTFLOW_CONFIG`, also delete the config home it named: that is where this install's
+   config lives, and it sits outside `~/.agentflow`.
 5. `gh auth logout` — step 5 stored a GitHub token on this machine and `gh auth setup-git`
    wired it into git's credential helper. Removing agentflow's files does not remove either.
 6. **The scheduled watchdog, if one is registered.** It is outside every session by design,

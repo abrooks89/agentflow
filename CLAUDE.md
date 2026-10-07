@@ -35,10 +35,10 @@ private.
 
 CI greps the whole tree (`.github/workflows/ci.yml`, job *"Grep for personal/product literals"`) and
 **fails the build** on machine-specific paths, plus whatever install-specific literals (names of
-other products, personal hostnames, private IP literals) the repository's `SANITIZE_EXTRA_PATTERN`
-Actions variable adds. Only the generic shapes are written in `ci.yml`, because it ships; the rest
-is kept out of the tree on purpose (`docs/runbooks/publish.md`, preconditions 1 and 3). It excludes
-`.git`, `node_modules`, `_vendored`, `records`, `__pycache__` and `toy-repo`.
+other products, personal hostnames, private IP literals) the `SANITIZE_EXTRA_PATTERN` repository
+secret adds; run logs mask its value. Only the generic shapes are written in `ci.yml`, because it
+ships; the rest is kept out of the tree on purpose (`docs/runbooks/publish.md`, preconditions 1
+and 3). It excludes `.git`, `node_modules`, `_vendored`, `records`, `__pycache__` and `toy-repo`.
 
 **It also scans your pull request's title and body** — those are published beside the code and are
 not tracked files, so a clean checkout is not a clean PR. If it fails there, the message says so

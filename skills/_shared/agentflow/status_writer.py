@@ -13,7 +13,13 @@ from typing import Literal, Optional
 
 import yaml
 
-from agentflow.plan_parser import _SLUG_FILENAME_RE, SpecFormatError, parse_spec_frontmatter
+from agentflow.plan_parser import (
+    _SLUG_FILENAME_RE,
+    BoardReconcile,
+    SpecFormatError,
+    orphan_escalation_text,
+    parse_spec_frontmatter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +329,25 @@ def _lazy_backfill_project(state: StatusState) -> None:
         return
 
 
+def _auto_block(state: StatusState) -> str:
+    """The AUTO block for *state*, markers included - the one shape every writer emits."""
+    return (
+        "<!-- AUTO:start - regenerated on every wake. Edit frontmatter above. -->\n\n"
+        f"{render_body(state)}\n\n"
+        "<!-- AUTO:end -->"
+    )
+
+
+def _replace_auto_block(body: str, state: StatusState) -> str:
+    """*body* with its first AUTO block re-rendered from *state*; every byte outside it kept."""
+    new_auto = _auto_block(state)
+    # Use a lambda so re.sub doesn't interpret backslashes in `new_auto` as
+    # escape sequences. Otherwise Windows paths in the rendered body (e.g.
+    # `C:\Users\...\stabilization-tests\...`) explode at sub time on the
+    # `\U` / `\x` byte sequences. The lambda returns the literal string.
+    return _AUTO_BLOCK_RE.sub(lambda _m: new_auto, body, count=1)
+
+
 def write_status(path: Path, state: StatusState) -> None:
     """Atomically write status.md: serialize frontmatter, regenerate AUTO body, preserve user notes."""
 
@@ -333,20 +358,10 @@ def write_status(path: Path, state: StatusState) -> None:
     existing = strip_bom(path.read_text(encoding="utf-8")) if path.exists() else ""
     body_after_frontmatter = _FRONTMATTER_RE.sub("", existing, count=1)
 
-    new_auto = (
-        "<!-- AUTO:start - regenerated on every wake. Edit frontmatter above. -->\n\n"
-        f"{render_body(state)}\n\n"
-        "<!-- AUTO:end -->"
-    )
-
     if _AUTO_BLOCK_RE.search(body_after_frontmatter):
-        # Use a lambda so re.sub doesn't interpret backslashes in `new_auto` as
-        # escape sequences. Otherwise Windows paths in the rendered body (e.g.
-        # `C:\Users\...\stabilization-tests\...`) explode at sub time on the
-        # `\U` / `\x` byte sequences. The lambda returns the literal string.
-        new_body = _AUTO_BLOCK_RE.sub(lambda _m: new_auto, body_after_frontmatter, count=1)
+        new_body = _replace_auto_block(body_after_frontmatter, state)
     else:
-        new_body = new_auto + "\n\n" + body_after_frontmatter
+        new_body = _auto_block(state) + "\n\n" + body_after_frontmatter
 
     fm = _state_to_frontmatter_dict(state)
     fm_yaml = yaml.safe_dump(fm, sort_keys=False, default_flow_style=False)
@@ -521,6 +536,46 @@ def answer_escalation(
     if state.status == "escalation" and all_escalations_answered(state):
         state.status = "running"
     return esc
+
+
+ORPHAN_RESOLVED_ANSWER = "resolved: board matches plan"
+
+
+def sync_orphan_escalations(state: StatusState, board: BoardReconcile) -> bool:
+    """Make the open orphan escalations match `board.orphaned_open`. True when anything changed.
+
+    - Each orphaned-open task has exactly one open escalation carrying
+      `orphan_escalation_text(tid)`: one is opened only when none is open already, so a wake
+      that finds the same orphan again does not stack a duplicate.
+    - An open orphan escalation whose task is no longer orphaned (the operator fixed the board
+      or the plan) is answered through `answer_escalation`, which returns the epic to
+      `running` once nothing else is open. Left open, it would hold the epic on a question
+      nobody needs to answer.
+    - Opening one keeps a status other than `running`: `open_escalation` sets `escalation`,
+      and, as its contract says for the bootstrap path, a caller that wants a different
+      status assigns it after the call. A `blocked` or held epic stays that way.
+
+    Does NOT call write_status — the caller persists.
+    """
+    changed = False
+    for esc in list(state.escalations):
+        if (
+            esc.answer is None
+            and esc.question == orphan_escalation_text(esc.task)
+            and esc.task not in board.orphaned_open
+        ):
+            answer_escalation(state, esc.id, ORPHAN_RESOLVED_ANSWER)
+            changed = True
+    for tid in board.orphaned_open:
+        text = orphan_escalation_text(tid)
+        if any(e.answer is None and e.question == text for e in state.escalations):
+            continue
+        prior = state.status
+        open_escalation(state, task=tid, question=text)
+        if prior != "running":
+            state.status = prior
+        changed = True
+    return changed
 
 
 def transition_status(
@@ -840,6 +895,107 @@ def _plan_names(
     return names
 
 
+def _terminal_spec_dirs(data_root: Path | str, project: str) -> list[Path]:
+    """The project's spec partitions where ``reconcile`` files a terminal spec (gh#891).
+
+    Read off the survey's own spec globs rather than spelled here, so the layout and the
+    partition names (``epic_survey.TERMINAL_PARTITIONS``) stay single-sourced: a glob whose
+    directory is one of those partitions is exactly a place reconcile moves specs to.
+    """
+    from agentflow.epic_survey import TERMINAL_PARTITIONS, SurveyPatterns
+
+    root = Path(data_root)
+    return [
+        root / Path(pattern).parent
+        for pattern in SurveyPatterns().for_project(project).spec_globs
+        if Path(pattern).parent.name in TERMINAL_PARTITIONS
+    ]
+
+
+def resolve_plan(data_root: Path | str, project: str, plan: Path | str) -> tuple[Path, bool]:
+    """The spec file ``mark_done`` reads for ``plan``, and whether it was followed (gh#891).
+
+    ``plan`` itself when it exists. Otherwise ``reconcile`` has probably filed the spec into a
+    terminal partition since the lane noted its path - a retried mark-done after a merge is the
+    usual case - so the ONE file with the same name in the project's ``design/specs/{done,
+    archived}/`` is used instead, and ``(that path, True)`` returned. The slug and project checks
+    still run on whatever file this returns, so following can never mark a different epic done.
+
+    Refuses when nothing is there either (the message says where else it looked, so the lane
+    knows the move was considered) and when more than one partition holds that name: two
+    candidates are two different histories, and picking one would be a guess.
+    """
+    plan_path = Path(plan)
+    if plan_path.exists():
+        return plan_path, False
+    dirs = _terminal_spec_dirs(data_root, project)
+    found = [d / plan_path.name for d in dirs if (d / plan_path.name).is_file()]
+    if len(found) == 1:
+        return found[0], True
+    if not found:
+        raise MergeRecordRefused(
+            f"--plan {plan_path} is not a readable spec: no such file, and no "
+            f"{plan_path.name!r} in {' or '.join(str(d) for d in dirs)} either "
+            "(where reconcile files a done or archived spec)"
+        )
+    raise MergeRecordRefused(
+        f"--plan {plan_path} does not exist and {plan_path.name!r} is in more than one terminal "
+        f"partition ({', '.join(str(p) for p in found)}); pass the one this epic shipped"
+    )
+
+
+def _is_spec_location(path: Path) -> bool:
+    """``path`` sits where a spec lives: ``.../specs/<file>`` or ``.../specs/<terminal>/<file>``."""
+    from agentflow.epic_survey import TERMINAL_PARTITIONS
+
+    parent = path.parent
+    return parent.name == "specs" or (
+        parent.name in TERMINAL_PARTITIONS and parent.parent.name == "specs"
+    )
+
+
+def _refuse_plan_outside_design(data_root: Path | str, project: str, plan_path: Path) -> None:
+    """Refuse a ``project:``-less spec that is not under ``<data_root>/projects/<project>/design/``.
+
+    The plan and the project's own design directory are each resolved, so a junction or symlink
+    anywhere on either path (above ``projects/`` or at ``projects/<project>/design`` itself)
+    compares by where the files really are. The project name must also appear on disk exactly as
+    given, case-sensitively like the ``project:`` field check: on a case-insensitive filesystem
+    ``--project Toy`` would otherwise reach ``projects/toy``.
+    """
+    projects = Path(data_root) / "projects"
+    try:
+        real = plan_path.resolve(strict=True)
+        names = os.listdir(projects)
+    except OSError as exc:
+        raise MergeRecordRefused(
+            f"--plan {plan_path} could not be resolved to check which project owns it: {exc}"
+        ) from exc
+    design = None
+    if project in names:
+        try:
+            design = (projects / project / "design").resolve(strict=True)
+        except OSError:
+            design = None  # the project has no design tree, so it owns no spec
+    if design is not None and real.is_relative_to(design) and real != design:
+        return
+    try:
+        rel = real.relative_to(projects.resolve(strict=True)).parts
+    except (OSError, ValueError):
+        rel = ()
+    if len(rel) > 1:
+        where = f"is in project {rel[0]!r}'s tree"
+    elif rel:
+        where = "is directly in the projects directory"
+    else:
+        where = "is outside the data root's projects directory"
+    raise MergeRecordRefused(
+        f"--plan {plan_path} (resolved: {real}) has no project: field and {where}, "
+        f"not under {projects / project / 'design'}; a record here would mark an epic done on a "
+        "board that has no spec for it"
+    )
+
+
 def mark_done(
     data_root: Path | str,
     *,
@@ -854,14 +1010,46 @@ def mark_done(
     """Write (or complete) the epic's merge record with ``status: done``. Returns ``(path, changed)``.
 
     Idempotent: the same inputs a second time change no byte and return ``changed=False``. An
-    existing record for the SAME epic is updated in place - its other keys, tasks and body are
-    kept, and a missing required key (a hand-written record's ``plan``/``started``) is filled.
+    existing record for the SAME epic is updated in place - its other keys and tasks are kept,
+    and a missing required key (a hand-written record's ``plan``/``started``) is filled.
+
+    Completing a board also finishes it, so it no longer waits on a wake or a human:
+    ``next_wake`` is removed; ``ended`` is set to ``now`` (or the current UTC time) when absent
+    or null and never moved once set; every escalation still open is answered
+    ``closed by mark-done at merge: <shipped>`` through ``answer_escalation``, which logs the
+    close as a decision stamped with ``ended``, while an answered one is left as it is; and a
+    body carrying an AUTO block has that block re-rendered from the completed state, with every
+    byte outside it - the user notes after ``AUTO:end`` included - kept. Tasks are kept exactly
+    as the board had them, so a task left ``in_flight`` still renders as current activity. A
+    body with no AUTO block is kept verbatim. Each of these is a no-op on a board already
+    finished, which is what keeps a re-run byte-identical.
     That includes the orchestrator's own running board at this path, whose ``epic:`` is the plan's
     human title rather than the slug: the file is ours by its stem, as the survey decides it.
     Refuses (``MergeRecordRefused``) rather than overwrite when ``epic:`` is some third value that
     is neither the slug nor a title of this epic's spec or plan, when the file has no parseable
     frontmatter, or when ``plan``'s spec slug is not ``slug`` - the survey joins
     the record to the spec by slug, so a mismatched one would mark the wrong epic done or none.
+
+    Also refuses when the spec's ``project:`` frontmatter names a project other than ``project``
+    (gh#888): the record would land on the other board as a done epic with no spec there, while
+    the real epic stays selectable on its own. When the field is present it decides, not the
+    path. A spec with NO ``project:`` (older specs predate the field) is decided by location
+    instead: it must resolve to a file under ``<data_root>/projects/<project>/design/`` (which
+    includes the ``done/`` and ``archived/`` partitions ``resolve_plan`` follows into), and is
+    refused otherwise - inside another project's tree or outside the data root entirely. Both
+    sides are resolved before the compare, because ``data_root`` and spec paths are routinely
+    reached through junctions. Both matches are case-sensitive on purpose (``Toy`` is refused
+    under ``toy``): project names are directory names, and a near-miss refusing is the safe way
+    to be wrong.
+
+    A fresh record's ``epic:`` and heading are the spec's ``title`` (its slug when it has none),
+    because the survey shows the board's ``epic:`` as the epic's title once a board exists
+    (gh#892); the ownership cross-check already counts the spec title as ours.
+
+    ``plan`` is resolved through ``resolve_plan`` (gh#891): a spec path that reconcile has since
+    filed into ``done/`` or ``archived/`` is followed there when exactly one file of that name
+    exists, and every check above runs on the followed file. A stored ``plan:`` naming the
+    spec's old, now-missing location is rewritten to the file read; one that exists is kept.
     """
     if not shipped or not shipped.strip():
         raise MergeRecordRefused("shipped must name the evidence, e.g. '<sha> (PR N)'")
@@ -874,13 +1062,24 @@ def mark_done(
         )
     if not path.parent.is_dir():
         raise MergeRecordRefused(f"status dir does not exist: {path.parent} (wrong --project?)")
-    plan_path = Path(plan)
+    plan_path, _followed = resolve_plan(data_root, project, plan)
     try:
         spec = parse_spec_frontmatter(plan_path)
     except (OSError, SpecFormatError, yaml.YAMLError, UnicodeDecodeError) as exc:
         raise MergeRecordRefused(f"--plan {plan_path} is not a readable spec: {exc}") from exc
     if spec.slug != slug:
         raise MergeRecordRefused(f"--plan {plan_path} is spec {spec.slug!r}, not {slug!r}")
+    spec_doc = _read_doc(plan_path)
+    if spec_doc is None:  # it parsed a moment ago, so this is a race; do not guess past it
+        raise MergeRecordRefused(f"--plan {plan_path} could not be re-read for its project:")
+    spec_project = spec_doc[0].get("project")
+    if spec_project not in (None, "") and str(spec_project) != project:
+        raise MergeRecordRefused(
+            f"--plan {plan_path} is a spec of project {str(spec_project)!r}, not {project!r}; "
+            "a record here would mark an epic done on a board that has no spec for it"
+        )
+    if spec_project in (None, ""):
+        _refuse_plan_outside_design(data_root, project, plan_path)
 
     try:
         existing_text = path.read_text(encoding="utf-8") if path.exists() else None
@@ -890,7 +1089,7 @@ def mark_done(
         ) from exc
     if existing_text is None:
         data: dict = {}
-        body = f"# {slug}: done\n"
+        body = f"# {' '.join(spec.title.split())}: done\n"
     else:
         # Parsed BOM-stripped; `existing_text` itself stays raw so the idempotence compare below
         # sees the BOM and rewrites the record without it rather than calling it unchanged.
@@ -917,15 +1116,44 @@ def mark_done(
             raise MergeRecordRefused(
                 f"{path} has a non-text epic: {epic_value!r}; not overwriting it"
             )
-        if epic_value not in names:
-            raise MergeRecordRefused(
-                f"{path} is the record for epic {data.get('epic')!r}, which is neither {slug!r} "
-                "nor a title of its spec or plan; not overwriting it"
-            )
         body = existing_doc[match.end() :]
+        # A record this writer completed (done, with merge evidence) at this slug's own path is
+        # ours whatever its epic: says - the spec may have been retitled since, and a re-run must
+        # stay idempotent rather than refuse its own output. Its stale title is refreshed, and so
+        # is the heading when it is still exactly the one this writer generated.
+        ours_by_record = data.get("status") == "done" and bool(data.get("shipped"))
+        if epic_value is None or not epic_value.strip():
+            # No `epic:` (absent, blank, or a key with no value) names no other epic, so there is
+            # nothing to cross-check: the filename already makes the record ours. Fill the title
+            # rather than refuse (gh#1162); setdefault below would keep a null value as it is.
+            data["epic"] = spec.title
+        elif epic_value not in names:
+            if not ours_by_record:
+                raise MergeRecordRefused(
+                    f"{path} is the record for epic {data.get('epic')!r}, which is neither "
+                    f"{slug!r} nor a title of its spec or plan; not overwriting it"
+                )
+            if body.strip() == f"# {' '.join(epic_value.split())}: done":
+                body = f"# {' '.join(spec.title.split())}: done\n"
+            data["epic"] = spec.title
 
     started = now or datetime.now(tz=timezone.utc).isoformat()
-    data.setdefault("epic", slug)
+    data.setdefault("epic", spec.title)  # parse_spec_frontmatter falls back to the slug
+    # A stored `plan:` that names this spec's OLD location (same file name, a spec directory,
+    # gone from disk) is refreshed to the file just read, or the record keeps pointing at a path
+    # reconcile removed (gh#891). One that still exists is kept: an orchestrator board's `plan:`
+    # names its plan file, not the spec. The spec-directory test keeps a relative plan path -
+    # which cannot be checked from here and may share the spec's file name - from being taken
+    # for a dead spec path. After the rewrite the stored path exists, so a re-run keeps it.
+    stored_plan = data.get("plan")
+    if (
+        isinstance(stored_plan, str)
+        and stored_plan.strip()
+        and Path(stored_plan).name == plan_path.name
+        and _is_spec_location(Path(stored_plan))
+        and not Path(stored_plan).exists()
+    ):
+        data["plan"] = str(plan_path)
     data.setdefault("plan", str(plan_path))
     data.setdefault("started", started)
     data["status"] = "done"
@@ -936,22 +1164,66 @@ def mark_done(
     data["shipped"] = shipped
     if actor:
         data["written_by"] = actor
+    # A done board has no next wake and has ended (gh#890). `ended` is set once and kept, so a
+    # re-run - with or without `now` - finds it present and changes no byte.
+    # `ended: null` counts as absent: real boards carry the key with no value, and a setdefault
+    # would leave a done board that never ended.
+    data.pop("next_wake", None)
+    if data.get("ended") is None:
+        data["ended"] = now or datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     # Key order: the five the parser requires first, so a reader sees what makes it a board.
     ordered = {k: data[k] for k in _MERGE_REQUIRED}
     ordered.update((k, v) for k, v in data.items() if k not in ordered)
 
-    fm_yaml = yaml.safe_dump(ordered, sort_keys=False, default_flow_style=False, allow_unicode=True)
-    full = f"---\n{fm_yaml}---\n\n{body.lstrip()}".replace("\r\n", "\n")
-    # A record the survey would skip is a refusal here, not a warning there. The usual cause is an
-    # existing board carrying something the parser rejects (an unknown task field, a non-integer
-    # task id), which this writer keeps verbatim and so cannot repair.
-    try:
-        parse_status_text(full)
-    except _PARSE_ERRORS as exc:
-        raise MergeRecordRefused(
-            f"{path}: the completed record would not parse ({type(exc).__name__}: {exc}); "
-            "not writing it"
-        ) from exc
+    def _render(fm: dict, text: str) -> str:
+        fm_yaml = yaml.safe_dump(fm, sort_keys=False, default_flow_style=False, allow_unicode=True)
+        return f"---\n{fm_yaml}---\n\n{text.lstrip()}".replace("\r\n", "\n")
+
+    def _parsed(text: str) -> StatusState:
+        # A record the survey would skip is a refusal here, not a warning there. The usual cause
+        # is an existing board carrying something the parser rejects (an unknown task field, a
+        # non-integer task id), which this writer keeps verbatim and so cannot repair.
+        try:
+            return parse_status_text(text)
+        except _PARSE_ERRORS as exc:
+            raise MergeRecordRefused(
+                f"{path}: the completed record would not parse ({type(exc).__name__}: {exc}); "
+                "not writing it"
+            ) from exc
+
+    full = _render(ordered, body)
+    state = _parsed(full)
+    # An escalation still open at merge would keep the board asking a question nobody needs to
+    # answer. Each is closed through `answer_escalation`, so the decision log records the close
+    # like any other answer. Only `escalations`/`decisions` are taken back from the state: every
+    # other key - tasks above all - stays exactly as the board had it. A re-run finds nothing
+    # open, adds no event and so changes no byte.
+    # The close is stamped with the board's `ended`, not the wall clock `answer_escalation` would
+    # use, so the log never shows a question closed after the board ended and a fixed `now`
+    # gives fixed output.
+    open_ids = [e.id for e in state.escalations if e.answer is None]
+    logged_before = len(state.decisions)
+    for eid in open_ids:
+        answer_escalation(state, eid, f"closed by mark-done at merge: {shipped}")
+    ended_at = ordered["ended"]
+    if isinstance(ended_at, datetime):  # an unquoted YAML timestamp parses to a datetime
+        ended_at = ended_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for decision in state.decisions[logged_before:]:
+        decision.at = str(ended_at)
+    if open_ids:
+        answered = _state_to_frontmatter_dict(state)
+        ordered["escalations"] = answered["escalations"]
+        ordered["decisions"] = answered["decisions"]
+    # The orchestrator's AUTO block still shows the running board (open escalations, a next
+    # wake, current activity); re-render it from the completed state. Only the block changes -
+    # the user notes after `AUTO:end` and anything before `AUTO:start` are kept byte for byte.
+    # A body with no AUTO block (this writer's own `# <title>: done`) is not ours to restyle.
+    has_auto = bool(_AUTO_BLOCK_RE.search(body))
+    if has_auto:
+        body = _replace_auto_block(body, state)
+    if open_ids or has_auto:
+        full = _render(ordered, body)
+        _parsed(full)
     if existing_text == full:
         return path, False
     try:
@@ -961,31 +1233,33 @@ def mark_done(
     return path, True
 
 
-def find_shadowing_boards(data_root: Path | str, project: str, slug: str) -> list[Path]:
-    """Other status boards under the project status dir that the survey also keys as ``slug``.
+def _survey_boards_for(status_dir: Path, slug: str) -> list[Path]:
+    """Every board survey pass 3 counts for ``slug`` under ``status_dir``, sorted.
 
-    Pass 3 keeps ONE board per slug and the last one walked wins, so a same-slug board deeper in
-    the tree (``status/legacy/<slug>.status.md``, or Convention 1's ``<slug>/status.md``) can
-    report ``running`` over the record just written. Uses the survey's own walker, signature
-    test and stem normalisation, so this names exactly the files the survey would weigh.
+    Delegates to the survey's own gatherer (``epic_survey._status_boards_under``, both filename
+    conventions, signature-gated) and its stat step (``_stat_status_boards``, which drops a board
+    that vanished since the walk), rather than copying either: a copy is what drifted the last
+    time the rule changed. Staleness and parse checks do not apply, matching the survey, for
+    which a stale or malformed board beside a fresh one still makes a duplicate.
     """
-    from agentflow.epic_survey import _normalize_slug_stem, _rwalk_match, is_orchestrator_status
+    # Local import: epic_survey imports StatusEnum and read_status from this module at its top
+    # level, so a top-level import here would be a cycle.
+    from agentflow.epic_survey import _stat_status_boards, _status_boards_under
 
+    boards = _status_boards_under(status_dir).get(slug, set())
+    return [p for p, _ in _stat_status_boards(boards)]
+
+
+def find_duplicate_boards(data_root: Path | str, project: str, slug: str) -> list[Path]:
+    """The OTHER boards keyed as ``slug`` beside the merge record, in sorted order.
+
+    Non-empty means the survey refuses this epic: a slug with more than one board reads as
+    ``DUPLICATE_STATUS_BOARDS`` - neither done nor selectable - until one board remains, so the
+    record just written does not make it survey as done. Empty when the record is the only board.
+    """
     own = merge_record_path(data_root, project, slug)
-    status_dir = own.parent
-    out = []
-    for p in sorted(_rwalk_match(status_dir, lambda n: n.endswith("status.md"))):
-        if p == own:
-            continue
-        if p.name == "status.md":
-            keyed_as = _normalize_slug_stem(p.parent.name)  # Convention 1
-        elif p.name.endswith(".status.md"):
-            keyed_as = _normalize_slug_stem(p.name[: -len(".status.md")])  # Convention 2
-        else:
-            continue
-        if keyed_as == slug and is_orchestrator_status(p):
-            out.append(p)
-    return out
+    boards = _survey_boards_for(own.parent, slug)
+    return [] if len(boards) < 2 else [b for b in boards if b != own]
 
 
 def find_title_keyed_boards(
@@ -995,14 +1269,30 @@ def find_title_keyed_boards(
 
     A board named from the epic's title instead of its plan slug is a second record for the same
     epic under a different key: no join by slug finds it, so it reads as a separate epic that
-    stays ``running`` after this one is marked done. The inverse of ``find_shadowing_boards``,
+    stays ``running`` after this one is marked done. The inverse of ``find_duplicate_boards``,
     which catches the same key under a different name.
+
+    A board keyed as a slug that has its OWN spec in the project is skipped: that is a real epic
+    which happens to share a title (two specs both called "Polish pass"), not a duplicate, and
+    warning there would tell a lane to delete a correct record.
     """
-    from agentflow.epic_survey import _normalize_slug_stem, _rwalk_match, is_orchestrator_status
+    from agentflow.epic_survey import (
+        SurveyPatterns,
+        _normalize_slug_stem,
+        _rwalk_match,
+        is_orchestrator_status,
+    )
 
     # The spec parser falls back to the slug when a spec has no title, and a slug is not a title.
     wanted = {t for t in titles if t and t != slug}
     status_dir = merge_record_path(data_root, project, slug).parent
+    root = Path(data_root)
+    spec_slugs: set[str] = set()
+    for pattern in SurveyPatterns().for_project(project).spec_globs:
+        for sp in root.glob(pattern):
+            doc = _read_doc(sp)
+            fm_slug = doc[0].get("slug") if doc is not None else None
+            spec_slugs.add(str(fm_slug) if fm_slug else _SLUG_FILENAME_RE.match(sp.stem).group(1))
     out = []
     for p in sorted(_rwalk_match(status_dir, lambda n: n.endswith("status.md"))):
         if p.name == "status.md":
@@ -1011,7 +1301,7 @@ def find_title_keyed_boards(
             keyed_as = _normalize_slug_stem(p.name[: -len(".status.md")])  # Convention 2
         else:
             continue
-        if keyed_as == slug or not is_orchestrator_status(p):
+        if keyed_as == slug or keyed_as in spec_slugs or not is_orchestrator_status(p):
             continue
         doc = _read_doc(p)
         epic = doc[0].get("epic") if doc is not None else None
@@ -1035,7 +1325,12 @@ def main(argv: Optional[list] = None) -> int:
     md = sub.add_parser("mark-done", help="write the epic's status.md with status: done at merge")
     md.add_argument("--project", required=True)
     md.add_argument("--slug", required=True, help="the spec slug (no date prefix)")
-    md.add_argument("--plan", required=True, help="the epic's spec path")
+    md.add_argument(
+        "--plan",
+        required=True,
+        help="the epic's spec path; if it is gone, the one same-named file in the project's "
+        "design/specs/done/ or archived/ is used",
+    )
     md.add_argument("--shipped", required=True, help='merge evidence, e.g. "<sha> (PR N)"')
     md.add_argument("--queue-id", help="the registry Queue id, E-NNNN-...")
     md.add_argument("--actor", help="the lane writing it, e.g. jr-dev-1")
@@ -1045,9 +1340,18 @@ def main(argv: Optional[list] = None) -> int:
     if args.data_root:
         data_root = args.data_root
     else:
-        from agentflow.config import load_environment
+        from agentflow import config
 
-        data_root = load_environment().data_root
+        # A lane raises a refusal as a Blocker row, so it is one line that keeps the
+        # remediation; a traceback reads as a crash in this writer rather than a config it
+        # could not resolve (gh#1161). OSError and UnicodeDecodeError are an environment.md
+        # that cannot be read at all, which load_environment reports before any ConfigError.
+        try:
+            data_root = config.load_environment().data_root
+        except (config.ConfigError, OSError, UnicodeDecodeError) as exc:
+            line = config.error_line(exc, config.environment_path())
+            print(f"refused: cannot resolve data_root: {line}", file=sys.stderr)
+            return 2
     try:
         path, changed = mark_done(
             data_root,
@@ -1064,14 +1368,23 @@ def main(argv: Optional[list] = None) -> int:
     print(f"{'written' if changed else 'unchanged'}: {path}")
     # A WARNING, not a refusal: the record above is correct and already on disk, and the other
     # board is not this writer's to delete. It is on stderr so a lane raises it like a refusal.
-    shadows = find_shadowing_boards(data_root, args.project, args.slug)
-    for other in shadows:
+    for other in find_duplicate_boards(data_root, args.project, args.slug):
         print(
-            f"WARNING: {other} is also keyed as {args.slug!r} by the survey and may win over "
-            f"{path}; move or remove it so the survey reads this record",
+            f"WARNING: {other} is also keyed as {args.slug!r}, so this epic has duplicate status "
+            f"boards beside {path}; the survey refuses it (neither done nor selectable) until "
+            "one board remains - move or remove the stale one",
             file=sys.stderr,
         )
-    plan_path = Path(args.plan)
+    # mark_done resolved the same --plan a moment ago, so this cannot refuse now. The note goes
+    # to stderr: stdout is the one `written:`/`unchanged:` line lanes parse, and this is not a
+    # WARNING - nothing is wrong, the lane just learns where its spec went.
+    plan_path, followed = resolve_plan(data_root, args.project, args.plan)
+    if followed:
+        print(
+            f"note: --plan {args.plan} does not exist; followed it to {plan_path}, where "
+            "reconcile filed the spec",
+            file=sys.stderr,
+        )
     titles = {
         parse_spec_frontmatter(plan_path).title,  # mark_done parsed it a moment ago
         *_first_heading(plan_path),

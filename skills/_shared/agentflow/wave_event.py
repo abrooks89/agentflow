@@ -106,16 +106,30 @@ def _read_board(status_path: Path) -> StatusState:
         raise ValueError(f"status board unreadable: {status_path} ({exc})") from exc
 
 
+class _LockOutcome:
+    """Whether the wave-event lock was released, read by the caller after the `with` exits."""
+
+    released: bool = True
+
+
 @contextlib.contextmanager
-def _wave_lock(status_path: Path, *, timeout: float = 15.0, poll: float = 0.1) -> Iterator[None]:
+def _wave_lock(
+    status_path: Path, *, timeout: float = 15.0, poll: float = 0.1
+) -> Iterator[_LockOutcome]:
     """Short blocking lock around a status.md read-modify-write.
 
     Reuses lock_file.acquire (O_EXCL + dead-PID steal) but retries on
-    LockHeldError so concurrent reporters serialize instead of failing.
+    LockHeldError so concurrent reporters serialize instead of failing. A
+    PermissionError is retried too: on Windows a just-released lock that a peer
+    still has open sits delete-pending, and opening it fails until that peer
+    closes it.
+
+    Release never raises (lock_file says why on stderr). The yielded outcome
+    records an unclean release - the lock leaked, or was no longer ours - so the
+    CLI can say the write landed, rather than calling a landed write a failure.
     """
     lock_path = Path(str(status_path) + ".wave-event.lock")
     deadline = time.monotonic() + timeout
-    handle = None
     while True:
         try:
             handle = lock_file.acquire(lock_path)
@@ -126,10 +140,17 @@ def _wave_lock(status_path: Path, *, timeout: float = 15.0, poll: float = 0.1) -
                     f"wave-event lock busy >{timeout}s at {lock_path}"
                 ) from None
             time.sleep(poll)
+        except PermissionError as exc:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"wave-event lock unopenable >{timeout}s at {lock_path} ({exc})"
+                ) from exc
+            time.sleep(poll)
+    outcome = _LockOutcome()
     try:
-        yield
+        yield outcome
     finally:
-        handle.release()
+        outcome.released = handle.release()
 
 
 def report_note(
@@ -137,16 +158,20 @@ def report_note(
     task: int = 0,
     tier: int = 2,
     summary: str = "",
-) -> None:
-    """Append a decision-log note. task=0 is a wave-level note."""
+) -> bool:
+    """Append a decision-log note. task=0 is a wave-level note.
+
+    Returns False when the note landed but the lock release was unclean.
+    """
     if not summary:
         raise ValueError("summary is required and must be non-empty")
     status_path = Path(status_path)
     _require_board(status_path)
-    with _wave_lock(status_path):
+    with _wave_lock(status_path) as lock:
         state = _read_board(status_path)
         append_decision(state, task=task, tier=tier, summary=summary)
         write_status(status_path, state)
+    return lock.released
 
 
 def report_task_state(
@@ -160,8 +185,11 @@ def report_task_state(
     model: str | None = None,
     role: str | None = None,
     verifier_iterations: int | None = None,
-) -> None:
-    """Set an existing task's state (+ optional verdict fields). Never touches session status."""
+) -> bool:
+    """Set an existing task's state (+ optional verdict fields). Never touches session status.
+
+    Returns False when the write landed but the lock release was unclean.
+    """
     if state not in TASK_STATES:
         raise ValueError(
             f"invalid task state {state!r}; must be one of {sorted(TASK_STATES)}"
@@ -172,7 +200,7 @@ def report_task_state(
         _validate_findings(findings)
     status_path = Path(status_path)
     _require_board(status_path)
-    with _wave_lock(status_path):
+    with _wave_lock(status_path) as lock:
         st = _read_board(status_path)
         if task not in st.tasks:
             raise ValueError(f"unknown task {task}; not present in {status_path}")
@@ -191,6 +219,7 @@ def report_task_state(
         if verifier_iterations is not None:
             ts.verifier_iterations = verifier_iterations
         write_status(status_path, st)
+    return lock.released
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -220,6 +249,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Exit 0 when the write landed, 2 when it was refused or failed.
+
+    A landed write whose lock release was unclean (leaked, or the lock was no
+    longer ours) still exits 0, with a `wave-event warning:` line naming the
+    lock: callers re-issue any write reported as failed, so a non-zero exit
+    here would duplicate it.
+    """
     # First, before any output: a legacy cp1252 stdout cannot carry a non-cp1252
     # character a lane wrote (gh#574).
     from agentflow._stdio import utf8_stdio
@@ -228,10 +264,10 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         if args.cmd == "note":
-            report_note(args.status, task=args.task, tier=args.tier, summary=args.summary)
+            released = report_note(args.status, task=args.task, tier=args.tier, summary=args.summary)
         elif args.cmd == "task-state":
             findings = json.loads(args.findings) if args.findings else None
-            report_task_state(
+            released = report_task_state(
                 args.status,
                 task=args.task,
                 state=args.state,
@@ -245,6 +281,12 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, json.JSONDecodeError, TimeoutError) as exc:
         print(f"wave-event error: {exc}", file=sys.stderr)
         return 2
+    if not released:
+        print(
+            "wave-event warning: write landed; lock release failed (leaked, or no "
+            f"longer ours) for {args.status}.wave-event.lock",
+            file=sys.stderr,
+        )
     return 0
 
 

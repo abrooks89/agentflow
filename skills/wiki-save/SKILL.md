@@ -114,13 +114,24 @@ Two calls, in this order, both through `agentflow.wiki`. There is no third way t
 the pillar, and hand-editing is not a fallback:
 
 ```python
+from pathlib import Path
+from agentflow import config
 from agentflow.wiki import write_page, refresh_projection
 
+# <data_root>/projects/<name>/wiki, built in code. Never paste data_root into a "..." literal:
+# a Windows path's backslashes become escapes and the fence fails to compile.
+wiki_root = Path(config.load_environment().data_root) / "projects" / "<name>" / "wiki"
+# Raw and triple-quoted, so backslashes and either quote stay literal. The one text it cannot
+# hold is three double quotes in a row; the newline before the closing quotes keeps a trailing
+# backslash in the text from escaping them.
+body = r"""
+<the page, with at least one [[wikilink]]>
+"""
 page = write_page(
-    wiki_root,                 # <data_root>/projects/<name>/wiki
+    wiki_root,
     slug="<kebab-slug>",       # a bare filename component; no separators
     title="<one line>",
-    body="<the page, with at least one [[wikilink]]>",
+    body=body.strip(),
     created="<YYYY-MM-DD>",    # COMPUTE it (`date -u +%F`), never type it — see below
     lane="<lane>",             # the seat writing it; drives hot-<lane>.md
 )
@@ -206,12 +217,24 @@ here: a fence is what a tired seat copies, and a copy is a second spawn path tha
 the guardrails.
 
 ```python
+from pathlib import Path
+from agentflow import config
 from agentflow.save_summariser import compose_and_save
 
+# <data_root>/projects/<name>/wiki, built in code. Never paste data_root into a "..." literal:
+# a Windows path's backslashes become escapes and the fence fails to compile before the save
+# can return `failed`. <name> is the seat's resolved project, a bare slug.
+wiki_root = Path(config.load_environment().data_root) / "projects" / "<name>" / "wiki"
+# Raw and triple-quoted, so backslashes and either quote stay literal. The one text it cannot
+# hold is three double quotes in a row; the newline before the closing quotes keeps a trailing
+# backslash in the text from escaping them.
+context = r"""
+<what this firing did and concluded — bounded, never the whole transcript>
+"""
 outcome = compose_and_save(
-    wiki_root,                 # <data_root>/projects/<name>/wiki
+    wiki_root,
     trigger="park",            # one of the four boundaries above
-    context="<what this firing did and concluded — bounded, never the whole transcript>",
+    context=context.strip(),
     lane="<lane>",
 )
 print(outcome.render())        # the audit line: trigger, duration, exit, wrote-or-not, slug
@@ -248,11 +271,14 @@ named above.
    guard is a process-local lock released under `try/finally`, so it cannot go stale into a
    permanent refusal — a seat that dies takes it with it.
 3. **NON-FATAL.** A failed, timed-out, empty or unparseable summariser writes nothing, says why,
-   and never raises into the firing. It never blocks the epic, the merge or the wake. A memory
+   and never raises into the firing. The reply decides, not the exit code: a non-zero exit whose
+   stdout still parses as a complete page is written, and its reason keeps the exit code and both
+   streams so the anomaly stays in the record. It never blocks the epic, the merge or the wake. A memory
    function that can fail a build is worse than none — but a silent one is worse still, so the
    reason always reaches the caller.
 4. **AUDITABLE.** Every attempt returns a record: the trigger, the UTC start, the duration, the
-   exit code, whether it wrote, and the slug if it did. That record is how *every spawn is
+   exit code, whether it wrote, the slug if it did, and the word count it wrote. `--json` prints
+   the same fields. That record is how *every spawn is
    auditable* holds without a reconciler. It is a return value and one
    rendered line, not a new store: a log file under `wiki/` would be a new file kind in a pillar
    built of pages plus pure projections, and a registry row would put per-save churn on a
@@ -340,9 +366,10 @@ it is not a licence to widen the read boundary above, which is untouched.
 
 | Failure | Action |
 |---|---|
-| `write_page` raises `PageExistsError` | the slug is taken. Write a NEW page that links to the existing one. Never overwrite, never delete-then-write. |
+| `write_page` raises `PageExistsError` | the slug is taken. Write a NEW page that links to the existing one. Never overwrite, never delete-then-write. `compose_and_save` applies this itself: it retries once as `<slug>-2` with a line linking `[[<slug>]]` and reports `wrote`. Only when `<slug>-2` is taken too does it return `failed`, naming both slugs. |
 | `write_page` raises `MissingWikilinkError` | the body has no `[[wikilink]]`. Add a real target — not `[[ ]]`, which the extractor correctly rejects as an edge to nothing. |
 | `write_page` raises `WikiFormatError` | a field is malformed (`created` is not `YYYY-MM-DD`, the slug or lane is not a bare component, is over 100 bytes, or makes a path longer than the platform opens, the title carries a control character). Fix the field; do not route around the writer. |
+| `write_page` raises `PageResidueError` (a `WikiFormatError`; `compose_and_save` returns `failed` with it) saying the page "carries pillar residue" | the slug, title, lane or body holds a term the pillar residue ratchet counts: the configured person's name, or a term the sanitize pattern covers. The message names the class and where (`person in title`, `sanitize in body line 3`), never the term. Nothing was written. Reword with the person named by role and the flagged term dropped, then write again. If it says the page "cannot be measured", the environment config or the extra pattern file will not load: fix that; never write around the guard. |
 | `write_page` raises `NotAPillarError` (or `refresh` exits 2 saying "not a provisioned wiki pillar") | `wiki_root` is the wrong path or an unprovisioned project: it lacks `digest.md`, `pages/` or a GENERATED `hot.md`. Check the path; if it is right, re-provision the project (when only `hot.md` is named, `refresh` regenerates it). Never create the markers by hand. |
 | `write_page` raises `WikiFormatError` saying the lane and a live lane "differ only by case" | the lane is a case-twin of a lane a live page already carries, e.g. `LEAD-DEV` against `lead-dev`. Nothing was written. Save again with the existing spelling. |
 | `compose_and_save` returns `failed` with "lane refused before spawning" | nothing was written and no summariser ran; the rest of the reason names the cause. "differ only by case": the lane is a case-twin of a live lane, so save again with the existing spelling. Anything else: the lane itself is malformed (empty, or carrying `/`, `\`, `:`, `\|` or another character a filename cannot hold), so fix the lane. |

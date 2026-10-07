@@ -9,6 +9,8 @@ here goes all the way from the CLI to `survey_epics(..., project=...)` and `sele
 
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -78,36 +80,39 @@ def test_cli_record_round_trips_through_read_status(tmp_path: Path) -> None:
     assert fm["queue_id"] == "E-0001-ship-the" and fm["written_by"] == "jr-dev-1"
 
 
-def test_survey_reads_the_merge_record_as_done_for_the_builder_cross_check(tmp_path: Path) -> None:
+def test_survey_reads_the_merge_record_as_done_for_the_builder_cross_check(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """The steward's pin: the record is READ, not merely present.
 
-    `selectable()` keys approval on spec frontmatter, so it still hands back a record whose spec
-    says approved (its documented stale-approval caveat; reconciling the frontmatter is the other
-    half of the merge duty). What the builder's completion-truth cross-check reads is the record's
-    `lifecycle_state` and `source_path` - and those must now come from the merge record.
+    The spec still says approved (reconciling the frontmatter is the other half of the merge
+    duty), so before the merge record lands the epic is selectable. Once it lands, the survey's
+    `lifecycle_state` and `source_path` must come from the merge record, and `selectable()` drops
+    the record as a run that has ended - which is what the merge record is for. Read through the
+    FULL survey, because the dropped record is no longer in `selectable()`'s output.
     """
     spec = _spec(tmp_path)
 
-    def picked():
-        recs = survey_epics(tmp_path, PAST_CUTOFF, include_archived=True, project=PROJECT)
-        return {r.slug: r for r in selectable(recs, project=PROJECT)}[SLUG]
+    def surveyed():
+        return survey_epics(tmp_path, PAST_CUTOFF, include_archived=True, project=PROJECT)
 
-    # Control: before the merge record, the cross-check has nothing but frontmatter to read.
-    assert picked().lifecycle_state != "done"
+    def selected_slugs() -> set[str]:
+        return {r.slug for r in selectable(surveyed(), project=PROJECT)}
+
+    # Control: before the merge record, only frontmatter speaks and the epic is selectable.
+    assert {r.slug: r for r in surveyed()}[SLUG].lifecycle_state != "done"
+    assert SLUG in selected_slugs()
 
     assert _cli(tmp_path, spec) == 0
-    rec = picked()
+    rec = {r.slug: r for r in surveyed()}[SLUG]
     assert rec.lifecycle_state == "done"
     assert Path(rec.source_path) == merge_record_path(tmp_path, PROJECT, SLUG)
-    # The cross-check the builder SKILL.md prescribes refuses it.
-    assert SLUG not in {
-        r.slug
-        for r in selectable(
-            survey_epics(tmp_path, PAST_CUTOFF, include_archived=True, project=PROJECT),
-            project=PROJECT,
-        )
-        if r.lifecycle_state != "done"
-    }
+    # The merge record keeps the still-approved spec out of builder selection, and says so.
+    with caplog.at_level("WARNING"):
+        assert SLUG not in selected_slugs()
+    assert any(
+        "run ended" in r.getMessage() and repr(SLUG) in r.getMessage() for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
 
 
 def test_mark_done_is_idempotent(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
@@ -307,25 +312,46 @@ def test_a_plan_for_another_slug_lends_its_title_to_nobody(tmp_path: Path) -> No
     assert path.read_bytes() == board
 
 
-@pytest.mark.parametrize(
-    "where", ["zzz-legacy/ship-the-thing.status.md", "ship-the-thing/status.md"]
-)
-def test_warns_naming_a_same_slug_board_elsewhere_in_the_status_tree(
-    tmp_path: Path, capsys: pytest.CaptureFixture, where: str
-) -> None:
-    """Review round 1 LOW: pass 3 keeps one board per slug, and a deeper one can win."""
-    spec = _spec(tmp_path)
+_HOUR_NS = 3600 * 1_000_000_000
+
+
+def _same_slug_board(tmp_path: Path, where: str, *, offset_ns: int) -> Path:
+    """A running board keyed as SLUG at *where*, its mtime *offset_ns* from now."""
     other = tmp_path / "projects" / PROJECT / "status" / where
     other.parent.mkdir(parents=True)
     other.write_text(
         f"---\nepic: {SLUG}\nplan: p\nstarted: s\nstatus: running\ncurrent_phase: p1\n---\n",
         encoding="utf-8",
     )
+    mtime = time.time_ns() + offset_ns
+    os.utime(other, ns=(mtime, mtime))
+    return other
+
+
+@pytest.mark.parametrize("where", ["zzz-legacy/ship-the-thing.status.md"])
+@pytest.mark.parametrize("offset_ns", [_HOUR_NS, -_HOUR_NS], ids=["other-newer", "other-older"])
+def test_warns_naming_a_same_slug_board_elsewhere_in_the_status_tree(
+    tmp_path: Path, capsys: pytest.CaptureFixture, where: str, offset_ns: int
+) -> None:
+    """Review round 1 LOW: a second board keyed as the slug makes the epic ambiguous.
+
+    The survey refuses a slug with more than one board - neither done nor selectable - and picks
+    no winner by mtime or path. So whether the other board is newer or older than the record
+    mark-done writes, the CLI warns, names it, and the epic does not survey as done. The record
+    itself is still written correctly.
+    """
+    from agentflow.epic_survey import DUPLICATE_STATUS_BOARDS
+
+    spec = _spec(tmp_path)
+    other = _same_slug_board(tmp_path, where, offset_ns=offset_ns)
     capsys.readouterr()
     assert _cli(tmp_path, spec) == 0
     err = capsys.readouterr().err
     assert err.startswith("WARNING: ") and str(other) in err, err
+    assert "duplicate status boards" in err, err
     assert read_status(merge_record_path(tmp_path, PROJECT, SLUG)).status == "done"
+    recs = survey_epics(tmp_path, PAST_CUTOFF, include_archived=True, project=PROJECT)
+    assert {r.slug: r for r in recs}[SLUG].lifecycle_state == DUPLICATE_STATUS_BOARDS
 
 
 def test_no_warning_without_a_shadow(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:

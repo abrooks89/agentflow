@@ -148,7 +148,7 @@ def test_an_equal_value_spelled_differently_is_left_as_written(tmp_path, home):
 
 
 def _closing(tmp_path: Path, config_home: Path, run_step_9: bool = True) -> str:
-    doctor = mock.Mock(diagnose=lambda *_a: [], render=lambda _d: "(stubbed)\n",
+    doctor = mock.Mock(diagnose=lambda *_a, **_k: [], render=lambda _d: "(stubbed)\n",
                        examined_a_project=lambda _f: False,
                        unexamined_verdict=lambda r, _dir: r)
     settings_file = tmp_path / "h" / ".claude" / "settings.local.json"
@@ -229,3 +229,158 @@ def test_the_dry_run_plan_says_what_step_9_will_write(tmp_path, home):
     opts = _opts(tmp_path, cfg)
     step9 = next(s for s in provision.build_steps(opts) if s.n == 9)
     assert any(f"env.AGENTFLOW_CONFIG={cfg.resolve()}" in line for line in step9.detail)
+
+
+def test_a_config_home_flag_reaches_the_steps_that_resolve_config(tmp_path, home):
+    """--config-home with no shell-level variable: bootstrap, the presence checks and the
+    scaffold resolve config through agentflow.config, so they checked the default home while
+    this run provisioned another. The home now travels in opts, and to the closing doctor as
+    an argument; $AGENTFLOW_CONFIG is never set, so overlapping runs cannot cross."""
+    cfg = tmp_path / "cfg"
+    seen = {}
+    steps = [provision.Step(n=n, title=f"step {n}",
+                            run=lambda o, n=n: seen.__setitem__(
+                                n, (os.environ.get("AGENTFLOW_CONFIG"), o.config_home.expanduser().resolve())))
+             for n in (7, 10, 11)]
+    doctor_homes = []
+    doctor = mock.Mock(diagnose=lambda *_a, **k: doctor_homes.append(k.get("config_home")) or [],
+                       render=lambda _d: "(stubbed)\n",
+                       examined_a_project=lambda _f: False,
+                       unexamined_verdict=lambda r, _dir: r)
+    settings_file = tmp_path / "h" / ".claude" / "settings.local.json"
+    settings_file.parent.mkdir(parents=True)
+    settings_file.write_text("{}", encoding="utf-8")
+    with mock.patch.dict(sys.modules, {"agentflow.doctor": doctor}), \
+         mock.patch.object(provision, "build_steps", lambda _o: steps), \
+         mock.patch.object(provision, "_print_verification_readiness", lambda _r: None), \
+         mock.patch.object(provision, "_verification_readiness", lambda _o: []), \
+         mock.patch.object(sys, "stdout", io.StringIO()):
+        rc = provision.main(["--suite-root", str(tmp_path), "--config-home", str(cfg),
+                             "--settings-file", str(settings_file),
+                             "--claude-root", str(tmp_path)])
+    assert rc == 0
+    assert seen == {n: (None, cfg.resolve()) for n in (7, 10, 11)}
+    assert doctor_homes == [cfg.resolve()]
+    assert "AGENTFLOW_CONFIG" not in os.environ
+
+
+# --------------------------------------------------------------------------- #
+# gh#985 item 3 - an AGENTFLOW_PROJECT naming an unconfigured project
+# --------------------------------------------------------------------------- #
+def _with_profile(cfg: Path, name: str = "toy") -> Path:
+    (cfg / "projects").mkdir(parents=True, exist_ok=True)
+    (cfg / "projects" / f"{name}.md").write_text("```yaml\nname: toy\n```\n", encoding="utf-8")
+    return cfg
+
+
+def test_a_settings_env_project_that_is_not_configured_refuses(tmp_path, home, monkeypatch):
+    """The settings env shadows the shell, so the installed hook is CERTAIN to exit 1."""
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    cfg = _with_profile(tmp_path / "cfg")
+    opts = _opts(tmp_path, cfg, {"env": {"AGENTFLOW_PROJECT": "otherproj"}})
+    before = opts.settings_file.read_text(encoding="utf-8")
+
+    for check in (provision._do_preflight, provision._do_sessionstart_hook):
+        with pytest.raises(RuntimeError) as excinfo:
+            check(opts)
+        msg = str(excinfo.value)
+        assert "env.AGENTFLOW_PROJECT='otherproj'" in msg
+        assert str(opts.settings_file) in msg, "must say where the value came from"
+        assert "configured: toy" in msg
+    assert opts.settings_file.read_text(encoding="utf-8") == before, "nothing may be written"
+
+
+def test_a_settings_env_project_that_is_configured_passes(tmp_path, home, monkeypatch):
+    # The settings value shadows the shell's, so an unconfigured shell value is moot here.
+    monkeypatch.setenv("AGENTFLOW_PROJECT", "otherproj")
+    cfg = _with_profile(tmp_path / "cfg")
+    opts = _opts(tmp_path, cfg, {"env": {"AGENTFLOW_PROJECT": "toy"}})
+    out = io.StringIO()
+    with mock.patch.object(sys, "stdout", out):
+        provision._do_sessionstart_hook(opts)
+    assert "WARNING" not in out.getvalue()
+    assert _saved(opts)["hooks"]["SessionStart"]
+
+
+def test_a_shell_only_project_that_is_not_configured_warns_and_exits_0(
+        tmp_path, home, monkeypatch):
+    """Only the installing shell names it: a likely failure, not a certain one - WARN."""
+    monkeypatch.setenv("AGENTFLOW_PROJECT", "otherproj")
+    cfg = _with_profile(tmp_path / "cfg")
+    out = _closing(tmp_path, cfg)   # asserts main() returned 0
+    assert "WARNING: $AGENTFLOW_PROJECT='otherproj' in this shell's environment" in out
+    assert "configured: toy" in out
+
+
+# --- gh#1046: the step-9 rewrite is atomic and keeps non-ASCII values as UTF-8 ---------------
+
+def _raw_settings(tmp_path: Path, home: Path, settings: dict) -> provision.Options:
+    """Options over a settings file written as raw UTF-8, as an operator's is."""
+    opts = _opts(tmp_path, home / ".agentflow" / "config")
+    opts.settings_file.write_bytes(
+        json.dumps(settings, indent=2, ensure_ascii=False).encode("utf-8"))
+    return opts
+
+
+def test_non_ascii_values_survive_the_rewrite_as_utf8(tmp_path, home):
+    opts = _raw_settings(tmp_path, home, {"env": {"WHO": "Zo\u00eb", "WHERE": "\u65e5\u672c"}})
+    provision._do_sessionstart_hook(opts)
+    raw = opts.settings_file.read_bytes()
+    assert "Zo\u00eb".encode("utf-8") in raw and "\u65e5\u672c".encode("utf-8") in raw
+    # Not a bare backslash-u search: a JSON-escaped Windows path can legitimately hold one.
+    assert b"\\u00eb" not in raw and b"\\u65e5" not in raw, "rewritten as escapes"
+    saved = _saved(opts)
+    assert saved["env"] == {"WHO": "Zo\u00eb", "WHERE": "\u65e5\u672c"}
+    assert saved["hooks"]["SessionStart"], "the hook must still be registered"
+
+
+def test_a_failure_mid_write_leaves_the_original_intact(tmp_path, home, monkeypatch):
+    opts = _raw_settings(tmp_path, home, {"env": {"WHO": "Zo\u00eb"}})
+    before = opts.settings_file.read_bytes()
+    listing = sorted(p.name for p in opts.settings_file.parent.iterdir())
+
+    def boom(*_a, **_k):
+        raise OSError(5, "simulated crash before the rename")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError, match="simulated crash"):
+        provision._do_sessionstart_hook(opts)
+    assert opts.settings_file.read_bytes() == before
+    assert sorted(p.name for p in opts.settings_file.parent.iterdir()) == listing, \
+        "no stray temp file may be left beside the settings file"
+
+
+def test_the_atomic_write_is_valid_json_with_the_hook(tmp_path, home):
+    opts = _opts(tmp_path, home / ".agentflow" / "config")
+    provision._do_sessionstart_hook(opts)
+    text = opts.settings_file.read_bytes().decode("utf-8")
+    assert not text.endswith("\n"), "byte shape unchanged: json.dumps adds no trailing newline"
+    saved = json.loads(text)
+    cmds = [h["command"] for b in saved["hooks"]["SessionStart"] for h in b["hooks"]]
+    assert len(cmds) == 1 and provision._is_agentflow_sessionstart(cmds[0])
+    assert [p.name for p in opts.settings_file.parent.iterdir() if p.suffix == ".tmp"] == []
+
+
+def test_a_lone_surrogate_is_written_escaped_not_crashed(tmp_path, home):
+    # json.loads accepts "\ud800"; UTF-8 cannot carry it, so the escaped spelling is kept.
+    opts = _opts(tmp_path, home / ".agentflow" / "config",
+                 {"env": {"ODD": "\ud800", "WHO": "Zo\u00eb"}})
+    provision._do_sessionstart_hook(opts)
+    saved = _saved(opts)
+    assert saved["env"] == {"ODD": "\ud800", "WHO": "Zo\u00eb"}
+    assert saved["hooks"]["SessionStart"], "the hook must still be registered"
+
+
+def test_a_symlinked_settings_file_stays_a_link(tmp_path, home):
+    opts = _raw_settings(tmp_path, home, {})
+    target = tmp_path / "dotfiles" / "settings.local.json"
+    target.parent.mkdir()
+    target.write_bytes(opts.settings_file.read_bytes())
+    opts.settings_file.unlink()
+    try:
+        opts.settings_file.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    provision._do_sessionstart_hook(opts)
+    assert opts.settings_file.is_symlink(), "the link must not be replaced by a regular file"
+    assert json.loads(target.read_text(encoding="utf-8"))["hooks"]["SessionStart"]

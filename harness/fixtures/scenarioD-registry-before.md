@@ -1,7 +1,8 @@
-# Fleet Registry — toy-project (Scenario D consume-first seed)
+# Fleet Registry — harness-toy (Scenario D consume-first seed)
 
 <!-- Seed registry for the Scenario D consume-first recording (assertion D4). Shape follows
-     templates/registry.md / docs/REGISTRY.md. The builder (builder_entry, lead-dev) wakes
+     templates/registry.md / docs/REGISTRY.md. Copied to the harness-toy project's registry,
+     <data_root>/projects/harness-toy/status/registry.md, never a fleet project's. The builder (builder_entry, lead-dev) wakes
      to find its own question ANSWERED and its work item PARKED on that answer, plus one
      fresh ready item in its lane. Firing-contract step 2 (CONSUME FIRST) requires it to
      apply the answer — resume E-0101, flip Q-0101 to applied — before claiming E-0102.

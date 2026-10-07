@@ -26,7 +26,7 @@ THE CORPUS IS THE GIT INDEX, WITH NO FALLBACK -- same rule and same reason as
 the same commit produces different verdicts here and in CI, with the suite green on the machine
 that cannot reproduce it.
 
-Run: `cd skills/_shared && python -m pytest tests/test_control_bytes.py -v`
+Run: `python -m pytest skills/_shared/tests/test_control_bytes.py -v`
 """
 
 from __future__ import annotations

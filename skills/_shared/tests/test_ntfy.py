@@ -172,26 +172,90 @@ def test_sender_exception_propagates(ntfy_env):
         notify(TriggerType.HALTED_QUESTION, epic="af-fleet", detail="halted", sender=sender)
 
 
-def test_notify_once_passes_the_sender_through():
+def test_notify_returns_true_when_the_sender_returns(ntfy_env):
+    """True means the sender returned without raising - with the default sender, that
+    ntfy accepted the POST. It is not a claim that a human read it."""
+    sender = FakeSender()
+    assert notify(
+        TriggerType.HALTED_QUESTION, epic="af-fleet", detail="halted", sender=sender
+    ) is True
+    assert len(sender.calls) == 1
+
+
+def test_default_sender_http_error_propagates(ntfy_env, monkeypatch):
+    """An HTTP error from ntfy is a raise, not a False: urlopen raises on a 4xx/5xx, and
+    a raising sender still raises out of notify()."""
+    from urllib.error import HTTPError
+
+    def _refuse(req, timeout):
+        raise HTTPError(req.full_url, 503, "Service Unavailable", {}, None)
+
+    monkeypatch.setattr(ntfy_mod, "urlopen", _refuse)
+    with pytest.raises(HTTPError):
+        notify(TriggerType.EPIC_DONE, epic="af-fleet", detail="done")
+
+
+@pytest.fixture
+def real_notify(monkeypatch):
+    """Put the real ``notify`` back where ``notify_once`` looks it up.
+
+    ``notify_once`` calls ``notify`` through this module's globals, and in a full-suite run
+    those globals are not ours: test_missed_wake_alarm.py loads test_registry as a pytest
+    plugin, which makes its autouse ``pings`` fixture (a stub that returns None) apply to
+    EVERY test in the session, this file's included. Under that stub every send reads as
+    "nothing sent", so a record-on-True test fails and a record-nothing test passes for the
+    wrong reason. ``notify`` here is the name bound at import, before any fixture ran. A
+    requested fixture is set up after every autouse one, so this patch is the one in force.
+    """
+    monkeypatch.setattr(ntfy_mod, "notify", notify)
+
+
+def _once(state, sender):
+    return notify_once(
+        state,
+        "HALTED_QUESTION:af-fleet",
+        TriggerType.HALTED_QUESTION,
+        epic="af-fleet",
+        detail="halted",
+        sender=sender,
+    )
+
+
+def test_notify_once_does_not_record_a_send_that_went_nowhere(monkeypatch, real_notify):
+    """With no destination in the environment notify() returns False, so the key is
+    NOT recorded and the next call is attempted again rather than suppressed for the
+    whole dedup window."""
+    monkeypatch.delenv("NTFY_URL", raising=False)
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
     state = types.SimpleNamespace(notifications_sent={})
     sender = FakeSender()
-    # env is deliberately not set here: notify_once must still gate + record.
-    assert notify_once(
-        state,
-        "HALTED_QUESTION:af-fleet",
-        TriggerType.HALTED_QUESTION,
-        epic="af-fleet",
-        detail="halted",
-        sender=sender,
-    ) is True
-    assert notify_once(
-        state,
-        "HALTED_QUESTION:af-fleet",
-        TriggerType.HALTED_QUESTION,
-        epic="af-fleet",
-        detail="halted",
-        sender=sender,
-    ) is False
+    assert _once(state, sender) is True
+    assert state.notifications_sent == {}
+    assert _once(state, sender) is True, "an unrecorded key must not suppress the retry"
+    assert sender.calls == []
+
+
+def test_notify_once_passes_the_sender_through_and_dedups_a_real_send(ntfy_env, real_notify):
+    state = types.SimpleNamespace(notifications_sent={})
+    sender = FakeSender()
+    assert _once(state, sender) is True
+    assert "HALTED_QUESTION:af-fleet" in state.notifications_sent
+    assert _once(state, sender) is False
+    assert len(sender.calls) == 1, "the second call is suppressed, so the sender ran once"
+
+
+def test_notify_once_does_not_record_when_kind_is_none(monkeypatch, ntfy_env, real_notify):
+    monkeypatch.setattr(ntfy_mod, "_resolved_notify", _resolver(kind="none"))
+    state = types.SimpleNamespace(notifications_sent={})
+    assert _once(state, FakeSender()) is True
+    assert state.notifications_sent == {}
+
+
+def test_notify_once_does_not_record_when_the_sender_raises(ntfy_env, real_notify):
+    state = types.SimpleNamespace(notifications_sent={})
+    with pytest.raises(RuntimeError):
+        _once(state, FakeSender(exc=RuntimeError("connection refused")))
+    assert state.notifications_sent == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -210,7 +274,7 @@ def test_env_unset_skips_and_sender_is_not_called(monkeypatch, present):
     sender = FakeSender()
     assert notify(
         TriggerType.HALTED_QUESTION, epic="af-fleet", detail="halted", sender=sender
-    ) is None
+    ) is False
     assert sender.calls == []
 
 
@@ -407,7 +471,7 @@ def test_kind_none_sends_nothing_even_with_the_env_set(monkeypatch, ntfy_env):
     sender = FakeSender()
     assert notify(
         TriggerType.HALTED_QUESTION, epic="af-fleet", detail="halted", sender=sender
-    ) is None
+    ) is False
     assert sender.calls == []
 
 
@@ -517,7 +581,7 @@ def test_a_config_failure_never_escapes_notify(monkeypatch, capsys):
     monkeypatch.delenv("NTFY_TOPIC", raising=False)
     assert notify(
         TriggerType.EPIC_DONE, epic="af-fleet", detail="done", sender=FakeSender()
-    ) is None
+    ) is False
     err = capsys.readouterr().err
     assert "OSError" in err, "a swallowed failure is reported where it cost a send"
     assert "NTFY_URL" in err

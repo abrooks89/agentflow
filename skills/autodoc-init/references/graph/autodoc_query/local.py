@@ -34,6 +34,7 @@ from .tuning import (
     DEPTH_CAP,
     DOC_CROSS_DECAY,
     HOP_DECAY,
+    MAX_TIER_REFS_PER_ITEM,
 )
 from .types import ContextItem, PathHop, QueryError, QueryResult, RoutingDecision, TierRef
 
@@ -187,6 +188,39 @@ def _item_from_node(node: _Node) -> ContextItem:
     )
 
 
+def _attach_capped_refs(item: ContextItem,
+                        resolved: list[tuple[dict[str, Any], TierRef]]) -> None:
+    """Fill the item's applicable tier-ref list, capped at
+    MAX_TIER_REFS_PER_ITEM: a concept page documenting dozens of symbols
+    otherwise repeats every ref on every item and dominates the output.
+    Survivors are chosen like the best parallel edge — non-dreamed first,
+    then highest confidence, then entity id — so the cut is deterministic
+    and keeps the strongest facts."""
+    ranked = sorted(resolved, key=lambda er: (er[0]["origin"] == "dreamed",
+                                              -er[0]["confidence"],
+                                              er[1].entity_id))
+    target = item.documented_by if item.tier == "symbol" else item.documents
+    target.extend(r for _e, r in ranked[:MAX_TIER_REFS_PER_ITEM])
+    item.tier_refs_total = len(ranked)
+    if len(ranked) > MAX_TIER_REFS_PER_ITEM:
+        which = "documented_by" if item.tier == "symbol" else "documents"
+        item.tier_refs_truncation = (
+            f"tier_ref_cap({MAX_TIER_REFS_PER_ITEM}) kept "
+            f"{MAX_TIER_REFS_PER_ITEM} of {len(ranked)} {which} refs"
+        )
+
+
+def tier_ref_reason(items: list[ContextItem]) -> str | None:
+    """One result-level reason naming how many RETAINED items had their
+    tier-ref list capped (per-item detail stays on the item), so the cap is
+    visible in ``truncated`` without one line per hub."""
+    capped = [i for i in items if i.tier_refs_truncation]
+    if not capped:
+        return None
+    return (f"tier_ref_cap({MAX_TIER_REFS_PER_ITEM}) trimmed the "
+            f"documents/documented_by refs of {len(capped)} items")
+
+
 def cross_tiers(
     adapter,
     items: list[ContextItem],
@@ -226,12 +260,11 @@ def cross_tiers(
             edges = adapter.find_edges({"src_id": item.entity_id, "rel": "documents"})
             other_key = "dst_id"
             item.documents = []
-        for edge in edges:
+        resolved = [(edge, r) for edge in edges
+                    if (r := ref(edge[other_key])) is not None]
+        _attach_capped_refs(item, resolved)
+        for edge, _r in resolved:
             other_id = edge[other_key]
-            r = ref(other_id)
-            if r is None:
-                continue
-            (item.documented_by if item.tier == "symbol" else item.documents).append(r)
             if expand_tiers != "both" or other_id in present:
                 continue
             row = entity(other_id)
@@ -336,6 +369,8 @@ def run_local(
         items = [i for i in items if i.tier == "symbol"]
     elif expand_tiers == "concepts_only":
         items = [i for i in items if i.tier == "concept"]
+    if (reason := tier_ref_reason(items)) is not None:
+        reasons.append(reason)
 
     timings["total_ms"] = budget.elapsed_ms()
     return QueryResult(

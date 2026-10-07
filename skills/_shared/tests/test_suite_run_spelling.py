@@ -31,11 +31,19 @@ belongs, because a gate re-derives it there on every run.
 WHAT THIS GATE CHECKS, and where it stops.
 
 * It scans the FOUR BUILDER LANES' `SKILL.md` -- the lanes that create a worktree and run product
-  suites in it. `auditor` and `steward` are deliberately absent (lead-dev's seam note excludes
-  them; neither runs a product suite in an epic worktree), and so are the `skills/orchestrator/
-  prompts/*.md` fallbacks, which still sanction `cd {worktree} && <command>` for runners with no
-  path flag. That sanction is real and is tracked separately; widening this module to it without
-  the matching prose edit would red text nobody has fixed yet.
+  suites in it -- and the ORCHESTRATOR's text: `skills/orchestrator/SKILL.md` and every
+  `skills/orchestrator/prompts/*.md`. The orchestrator runs plan-authored test commands against
+  a wave's worktree, and its prompts tell subagents how to give such a command a tree. Those
+  sites prescribe the subshell form `( cd {worktree} && <command> )` for runners with no path
+  flag, which restores the parent shell's directory and so passes; the pin is that a bare-`cd`
+  fallback there now reds. The orchestrator corpus carries only the no-`cd` detector, not the
+  builder lanes' point-of-use and checklist pins, because it has no cleanup step of its own to
+  tick. `auditor` and `steward` stay absent (lead-dev's seam note excludes them; neither runs a
+  product suite in an epic worktree).
+* A command PLACEHOLDER counts as a runner. The orchestrator spells a plan-authored suite run as
+  `<command>` or `{{TEST_COMMAND}}`, never as `pytest`, so a detector that knew only runner names
+  would read `cd <worktree> && <command>` -- the fallback `skills/orchestrator/SKILL.md` Step 5
+  taught -- as harmless.
 * Its corpus comes from the GIT INDEX via `tracked_files`, never from a tree walk. A gate whose
   corpus is whatever is lying in one checkout is a verdict about that checkout, not about the
   commit (`test_corpus_from_index.py`).
@@ -63,6 +71,10 @@ WHAT THIS GATE CHECKS, and where it stops.
 
   What it buys is that none of the spellings it does see can come back into a builder skill
   without a red test.
+* The orchestrator corpus also carries a LONE-`cd` detector: a `cd` or `pushd` into a worktree
+  placeholder (`{wave_tree}`, `{{WORKTREE}}`, `<worktree>`), whether or not anything follows it.
+  A prompt that tells a subagent to `cd {wave_tree}` as its first action wedges the tree just as
+  the chained form does, and the chained detector cannot see it because no runner follows.
 * A SUBSHELL is allowed on purpose -- `( cd <worktree> && npm ci )` restores the parent shell's
   directory on exit, so it does not wedge anything. Measured while producing the parity numbers
   above: every `cd`-based run in that measurement was subshell-wrapped and `pwd` was unchanged
@@ -96,6 +108,9 @@ BUILDER_LANES = ("lead-dev", "jr-dev-1", "jr-dev-2", "jr-dev-3")
 _RUNNER = re.compile(
     r"\b(?:pytest|vitest|jest|npm\s+(?:run\s+)?test|npx\s+\S*(?:vitest|jest)|go\s+test"
     r"|cargo\s+test)\b"
+    # The placeholders the orchestrator writes for a plan-authored suite command. No `\b`
+    # around them: `<` and `{` are not word characters, so a boundary would never match.
+    r"|<command>|\{\{TEST_COMMAND\}\}|\{plan_test_commands\}"
 )
 
 #: `<verb> <target> <sep> <rest>` inside a single command span. `open` captures a preceding `(`,
@@ -150,6 +165,31 @@ def cd_chained_suite_runs(text: str) -> list[str]:
     return offenders
 
 
+#: `cd`/`pushd` into a worktree PLACEHOLDER -- `{wave_tree}`, `{{WORKTREE}}`, `<worktree>` --
+#: with or without anything after it. The chained detector above needs a runner behind the `cd`,
+#: so a lone `cd {wave_tree}` told to a subagent as its first action passed it, while binding that
+#: subagent's persistent shell to the tree exactly as the chained form does. The target must OPEN
+#: with `{` or `<`, so prose naming the bare word ("never a bare `cd`") and a concrete directory in
+#: an unrelated example cannot match; `open` again marks a subshell, which restores the cwd. A
+#: quoted target and a `--` end-of-options marker are caught too. A "do not do this" example
+#: must be written as prose, not in a backtick span or fence, or it trips this gate.
+_CD_INTO_PLACEHOLDER = re.compile(
+    r"(?P<open>\(\s*)?\b(?P<verb>cd|pushd)\s+(?:--\s+)?(?P<target>[\"']?[{<][^\s&|;`)]*)"
+)
+
+
+def lone_cd_into_worktree(text: str) -> list[str]:
+    """Command spans that `cd`/`pushd` into a placeholder worktree outside a subshell."""
+    offenders = []
+    for span in command_spans(text):
+        for m in _CD_INTO_PLACEHOLDER.finditer(span):
+            if m.group("open"):
+                continue  # `( cd {tree} && ... )` restores the caller's cwd on exit
+            offenders.append(span.strip())
+            break
+    return offenders
+
+
 def _skill_path(lane: str) -> Path:
     """The lane's SKILL.md, resolved through the git index."""
     rel = f"skills/{lane}/SKILL.md"
@@ -162,6 +202,20 @@ def _skill_path(lane: str) -> Path:
 
 def _skill_text(lane: str) -> str:
     return _skill_path(lane).read_text(encoding="utf-8", errors="replace")
+
+
+def _is_orchestrator_text(rel: str) -> bool:
+    """`skills/orchestrator/SKILL.md` plus the top-level `prompts/*.md`, nothing deeper."""
+    if rel == "skills/orchestrator/SKILL.md":
+        return True
+    head, _, name = rel.rpartition("/")
+    return head == "skills/orchestrator/prompts" and name.endswith(".md")
+
+
+def _orchestrator_ids() -> list[str]:
+    """The orchestrator files the no-`cd` detector reads, from the git index."""
+    found = tracked_files(SUITE_ROOT, _is_orchestrator_text)
+    return [p.relative_to(SUITE_ROOT).as_posix() for p in found]
 
 
 # --------------------------------------------------------------------------------------------
@@ -179,6 +233,52 @@ def test_no_builder_skill_documents_a_cd_chained_suite_run(lane: str) -> None:
         "<worktree>/skills/_shared -q`, which collects exactly the same node ids - or, where the "
         "runner has no path flag, wrap the `cd` in a subshell: `( cd <worktree> && <command> )`."
     )
+
+
+@pytest.mark.parametrize("rel", _orchestrator_ids())
+def test_no_orchestrator_text_documents_a_cd_chained_suite_run(rel: str) -> None:
+    text = (SUITE_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+    offenders = cd_chained_suite_runs(text)
+    assert not offenders, (
+        f"{rel} documents a suite run that `cd`s first: {offenders}. A bare `cd` persists in the "
+        "shell and wedges worktree removal on Windows (gh#240). Use the runner's own path flag, "
+        "or a subshell: `( cd <worktree> && <command> )`."
+    )
+
+
+@pytest.mark.parametrize("rel", _orchestrator_ids())
+def test_no_orchestrator_text_tells_anyone_to_cd_into_a_worktree(rel: str) -> None:
+    """A lone `cd {wave_tree}` wedges the tree as surely as one chained to a runner.
+
+    The wave-subagent prompt in `skills/orchestrator/SKILL.md` Step 7 once opened with exactly
+    that line, and the chained detector passed it because nothing followed the `cd`.
+    """
+    text = (SUITE_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+    offenders = lone_cd_into_worktree(text)
+    assert not offenders, (
+        f"{rel} tells a reader to `cd` into a worktree: {offenders}. The shell's working "
+        "directory persists across calls, so the shell stays inside the tree and Windows refuses "
+        "to remove it. Carry `-C <tree>` on git calls and absolute paths under the tree on "
+        "everything else, or a subshell: `( cd <worktree> && <command> )`."
+    )
+
+
+def test_the_orchestrator_corpus_is_not_empty() -> None:
+    """Non-vacuity. A parametrised gate over an empty corpus reports no cases, not a failure.
+
+    The floor is the SKILL plus the five prompts that carry the no-path-flag fallback today; a
+    rename or a predicate typo that drops any of them reds here instead of shrinking coverage.
+    """
+    ids = set(_orchestrator_ids())
+    expected = {
+        "skills/orchestrator/SKILL.md",
+        "skills/orchestrator/prompts/implementer-with-tdd-loop.md",
+        "skills/orchestrator/prompts/implementer-with-verifier-loop.md",
+        "skills/orchestrator/prompts/regression_debugger.md",
+        "skills/orchestrator/prompts/simplify-pass.md",
+        "skills/orchestrator/prompts/verifier.md",
+    }
+    assert expected <= ids, f"orchestrator corpus is missing {sorted(expected - ids)}"
 
 
 @pytest.mark.parametrize("lane", BUILDER_LANES)
@@ -406,6 +506,21 @@ def test_the_detector_catches_an_or_guarded_cd() -> None:
     ]
 
 
+#: The Step 5 fallback `skills/orchestrator/SKILL.md` taught before it moved to the subshell form,
+#: and the same move in a prompt's template spelling.
+_WEDGING_PLACEHOLDER = "otherwise `cd <worktree> && <command>`. Run from the launch directory"
+_WEDGING_TEMPLATE = "the tree named in the command (`cd {{WORKTREE}} && {{TEST_COMMAND}}`)"
+
+
+def test_the_detector_catches_a_cd_chained_to_a_command_placeholder() -> None:
+    """The orchestrator writes a plan-authored suite run as a placeholder, not a runner name."""
+    assert cd_chained_suite_runs(_WEDGING_PLACEHOLDER) == ["cd <worktree> && <command>"]
+    assert cd_chained_suite_runs(_WEDGING_TEMPLATE) == ["cd {{WORKTREE}} && {{TEST_COMMAND}}"]
+    assert cd_chained_suite_runs("Run `cd {worktree} && {plan_test_commands}`.") == [
+        "cd {worktree} && {plan_test_commands}"
+    ]
+
+
 def test_the_detector_passes_the_explicit_path_form() -> None:
     assert cd_chained_suite_runs(_FIXED) == []
 
@@ -425,3 +540,46 @@ def test_the_detector_does_not_fire_on_prose_about_cd() -> None:
         "wrap the `cd` in a SUBSHELL - `( cd <worktree> && <command> )` - never a bare `cd`.",
     ):
         assert cd_chained_suite_runs(benign) == [], benign
+
+
+#: The wave-subagent prompt line the lone-`cd` detector exists for, as it sat in its fence.
+_WEDGING_WAVE_PROMPT = (
+    "     Build in `{wave_tree}`, a git worktree on branch `{wave_ref}`. Your FIRST action\n"
+    "     must be:\n"
+    "\n"
+    "     ```\n"
+    "         cd {wave_tree}\n"
+    "     ```\n"
+)
+
+
+def test_the_lone_cd_detector_catches_the_wave_prompt_line() -> None:
+    assert lone_cd_into_worktree(_WEDGING_WAVE_PROMPT) == ["cd {wave_tree}"]
+
+
+@pytest.mark.parametrize(
+    "span", ['`cd "{wave_tree}"`', "`cd '{wave_tree}'`", "`cd -- {wave_tree}`"]
+)
+def test_the_lone_cd_detector_catches_quoted_and_dashed_targets(span: str) -> None:
+    assert lone_cd_into_worktree(f"Then {span}.") == [span.strip("`")]
+
+
+def test_the_lone_cd_detector_catches_inline_and_pushd_spellings() -> None:
+    assert lone_cd_into_worktree("First run `cd <worktree>`, then build.") == ["cd <worktree>"]
+    assert lone_cd_into_worktree("Start with `pushd {wave_tree}`.") == ["pushd {wave_tree}"]
+    assert lone_cd_into_worktree("Run `cd {{WORKTREE}}` first.") == ["cd {{WORKTREE}}"]
+    assert lone_cd_into_worktree("`cd <worktree>/skills/_shared && python -m pytest`") == [
+        "cd <worktree>/skills/_shared && python -m pytest"
+    ]
+
+
+def test_the_lone_cd_detector_passes_subshells_prose_and_git_dash_c() -> None:
+    """Precision: the forms the orchestrator prescribes, and prose about the rule itself."""
+    for benign in (
+        "wrap it in a subshell: `( cd {wave_tree} && <command> )`.",
+        "the tree named in the command (`( cd {{WORKTREE}} && {{TEST_COMMAND}} )`;",
+        "Never a bare `cd`. The shell's working directory persists across calls.",
+        "Every git call carries `-C {wave_tree}`: `git -C {wave_tree} add`.",
+        "a test run uses an absolute path under `{wave_tree}`",
+    ):
+        assert lone_cd_into_worktree(benign) == [], benign

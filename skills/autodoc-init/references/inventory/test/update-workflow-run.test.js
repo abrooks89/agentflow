@@ -469,3 +469,23 @@ test('both POSIX-rooted is accepted — a POSIX box is coherent, not broken', as
   assert.equal(result.communitiesRefreshed, 1);
   assert.deepEqual(result.recordsFiles, ['/run/records/refresh-1.json', '/run/records/refresh-reconcile.json']);
 });
+
+test('checkRecordsCmd reaches refresh AND audit, each with the stop on a no-PROBLEM fault', async () => {
+  const cmd = 'python -m autodoc_graph check-records --db /s/graph.db --corpus toy';
+  const calls = [];
+  const run = loadWorkflow();
+  await run(baseArgs([{ name: 'handler', file: 'app/x.py', line: 1 }], {
+    checkRecordsCmd: cmd,
+    auditPages: [{ page: 'services/Alpha.md', source_paths: ['app/x.py'] }],
+  }),
+    cannedAgent(calls), parallelStub, noop, noop);
+  for (const label of ['refresh:1', 'audit']) {
+    const call = calls.find((c) => c.opts.label === label);
+    assert.ok(call, `${label} agent not dispatched`);
+    assert.ok(call.prompt.includes(`${cmd} --records "`), `${label}: command not rendered`);
+    assert.match(call.prompt, /non-zero exit that prints NO\s+PROBLEM line/, label);
+    assert.match(call.prompt, /do NOT re-run\s+it/, label);
+  }
+  const audit = calls.find((c) => c.opts.label === 'audit').prompt;
+  assert.match(audit, /first in 'findings'/);
+});

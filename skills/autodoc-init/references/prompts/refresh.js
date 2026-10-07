@@ -86,6 +86,7 @@ export const contextSpec = {
   symbolCount: 'number (optional) — how many rows that file holds, so the agent knows the size of what it must read (only meaningful alongside checklistPath)',
   deletedFiles: 'array of strings — repo-relative files deleted in the range',
   date: 'string — run date YYYY-MM-DD',
+  checkRecordsCmd: 'string (optional) — `graph check-records --db <store> --corpus <id>` as a shell command; the agent appends --records <its file> and must re-run it until it exits 0 (gh#465). Empty/absent omits the step',
 };
 
 export const template = `You incrementally refresh ONE derived code community of the "{{autodocName}}" code wiki after new commits.
@@ -211,7 +212,19 @@ bare array — 'graph records' rejects anything else outright. Exactly this shap
 Omit "reports" entirely — community reports belong to the init path, and a key you do not send is
 simply skipped. Both {{repoPath}}/ and {{autodocPath}}/ are read-only to you. Do not emit records for
 index.md / _index.md / overview.md (Reconcile's job; nav is rendered from meta records).
-
+{{#if checkRecordsCmd}}
+CHECK the file you just wrote, before returning:
+    {{checkRecordsCmd}} --records "{{recordsPath}}"
+Exit 0 means every page record is well-formed and every 'documents' citation resolves. A non-zero
+exit prints one PROBLEM line per defect — a wrong kind (copy the kind the line names), an absent
+symbol (drop the citation), or a kind that is never indexed at all (no such citation can ever
+resolve: cite the enclosing symbol or leave the file to 'source_paths'). Fix every one, rewrite the
+file, and re-run until it exits 0: this is where a bad citation costs one edit instead of a refused
+'graph records' run after every agent has finished. A non-zero exit that prints NO PROBLEM line is
+not a defect in your file (a missing store, a wrong corpus, a crash): do NOT re-run it. Stop
+checking, return the manifest as below, and put "CHECK-RECORDS FAILED: <its error output,
+verbatim>" first in notes.
+{{/if}}
 Return 'path' (equal to {{recordsPath}}) plus updated/created/removed (+ notes) as the light
 manifest — NOT the record bodies, which stay on disk. Also return "covered" (the checklist symbols
 now documented, as {community:"{{communityKey}}",name,line}) and "excluded"

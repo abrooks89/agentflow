@@ -31,6 +31,7 @@ HOP_DECAY = 0.75           # per-hop score decay (rank blend component)
 DOC_CROSS_DECAY = 0.9      # tier-crossing hop factor (outside the depth budget)
 DEFAULT_FANOUT_CAP = 25    # neighbors retained per expanded node (hub guard)
 DEFAULT_MAX_ENTITIES = 50  # total retained-entity cap on assembled context
+MAX_TIER_REFS_PER_ITEM = 10  # documents/documented_by refs kept per item (hub guard)
 DEFAULT_LOCAL_BUDGET_MS = 2500   # wall-clock; the spec's local p95 target
 
 # ---------------------------------------------------------------- global search

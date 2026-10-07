@@ -20,6 +20,11 @@ export const meta = {
 //   date:           "YYYY-MM-DD" (scripts can't call Date)
 //   taxonomyDocPath: absolute path to references/taxonomy.md
 //   validateMermaidCmd: shell command that validates a .mmd file (exit 0 = valid)
+//   checkRecordsCmd: optional — `graph check-records --db <store> --corpus <id>`;
+//                   each map agent appends `--records <its file>` and re-runs it
+//                   until it exits 0, so a bad documents citation is fixed when it
+//                   is written instead of refusing `graph records` after the
+//                   whole fan-out (gh#465). Omitted, the map prompt skips the step.
 //   scratchPath:    writable scratch dir for diagram drafts (NEVER the render target)
 //   tourOrderPath:  path to references/inventory/tour-order.js
 //   runDir:         REQUIRED — writable run directory; every agent writes its
@@ -48,7 +53,7 @@ export const meta = {
 // }
 const {
   repoPath, autodocName, repoName, commitSha, date, taxonomyDocPath,
-  validateMermaidCmd, scratchPath, tourOrderPath,
+  validateMermaidCmd, scratchPath, tourOrderPath, checkRecordsCmd,
 } = (typeof args === 'string' ? JSON.parse(args) : args)  // driver may deliver args stringified (live-smoke 2026-08-07)
 
 const PROMPTS = args.prompts
@@ -210,6 +215,7 @@ const mapped = (await parallel(
       autodocName, taxonomyDocPath, repoName, repoPath,
       unitKey: u.key,
       recordsPath,
+      checkRecordsCmd: checkRecordsCmd || '',
       communitiesLine: u.communities.map((c) => `${c.id}:"${c.label}"`).join(', '),
       communities: u.communities.map((c) => {
         const d = c.descriptor || {}

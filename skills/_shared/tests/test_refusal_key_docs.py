@@ -1,22 +1,23 @@
 """The refusal-key taxonomy and its documentation are one contract; keep them in step (gh#246).
 
-WHAT EVERY REFUSAL PROMISES. Every value in `registry.RULES` opens with `REGISTRY.md`, and **62
-of the 72** go on to name one of **7** sections — `REGISTRY.md #Queue: claim only from your own
-lane`; the other ten cite the file alone. So a lane that hits a refusal is being sent somewhere to
-read the rule, and nothing checked that the somewhere exists: a new key could cite a section
-nobody ever wrote and ship green. gh#205 was the same defect pointing the other way, and it
+WHAT EVERY REFUSAL PROMISES. Every value in `registry.RULES` opens with `REGISTRY.md`, and most go
+on to name a section — `REGISTRY.md #Queue: claim only from your own lane`; the rest cite the file
+alone. So a lane that hits a refusal is being sent somewhere to read the rule. The first gate
+holds that every cited section exists as a heading in `docs/REGISTRY.md`, so a new key cannot cite
+a section nobody wrote and ship green. gh#205 was the same defect pointing the other way, and it
 reached master.
 
 AND THE EXIT CODES ARE THE OTHER HALF. `docs/REGISTRY.md` tells callers to branch on the exit
-code, and every loop skill tells agents which codes are retryable. That table is maintained by
-hand against a dispatch block in `registry.main`, and it had drifted: **`1` had no row at all**
-while being the one code whose two producers carry opposite recoveries. So the codes come from
-the SOURCE here, not from a list.
+code, and every loop skill tells agents which codes are retryable. The second gate holds that every
+code the CLI can return has a row in the exit table, with the codes derived from the SOURCE rather
+than a list, because that table is maintained by hand and had drifted: **`1` had no row at all**
+while being the one code whose two producers carry opposite recoveries. The third holds that the
+exit-1 row names both of them.
 
-WHAT THIS DOES NOT CHECK, because conflating the two is how gh#246 read as one task. It checks
-that a citation RESOLVES, never that a key is itself documented: measured, **13 of 72** RULES keys
-appear in `docs/REGISTRY.md` as a named token, and naming the other 59 is a documentation decision
-with its own cost, not a test failure. Filed as gh#413.
+AND THE KEYS A SKILL NAMES (gh#413). A key a tracked `skills/<name>/SKILL.md` tells a lane to branch
+on is one the lane will hold and grep for, so the fourth gate holds that every such key is also
+named in `docs/REGISTRY.md`, matched as a whole token. It runs one way only: a key no skill names
+is "fix the call", its message is the whole answer, and documenting it anyway stays allowed.
 
 Every check here is a pure function of its inputs plus a thin test that feeds it the real ones,
 so the red-proofs at the bottom pass synthetic inputs rather than monkeypatching the filesystem.
@@ -29,6 +30,7 @@ import re
 from pathlib import Path
 
 from agentflow.registry import RULES
+from agentflow.tracked_paths import tracked_files
 
 SKILLS_ROOT = Path(__file__).resolve().parents[2]
 SUITE_ROOT = SKILLS_ROOT.parent
@@ -77,8 +79,8 @@ def resolves(section: str, known: set[str]) -> bool:
     Unbounded containment was the first spelling and review was right to flag it: `#Agents` would
     have resolved against "Liveness sweep ... every wake" if that sentence happened to contain the
     word, which is a false pass in a gate whose whole job is to catch a citation pointing nowhere.
-    A prefix is the honest reading of `## Queue` followed by a dash and a summary, and all seven
-    sections cited today resolve under it - measured, not assumed, before tightening.
+    A prefix is the honest reading of `## Queue` followed by a dash and a summary, and every
+    section cited when it was tightened resolved under it - measured, not assumed.
     """
     squashed = re.sub(r"[^a-z0-9]", "", section.lower())
     return any(h.startswith(squashed) for h in known)
@@ -208,6 +210,36 @@ def undocumented_exit_codes(source: str, doc: str) -> list[int]:
     return sorted(set(exit_codes(source)) - exit_table_rows(doc))
 
 
+def names_key(key: str, text: str) -> bool:
+    """True when `text` names `key` as a WHOLE token.
+
+    Underscores are part of the token, so `deploy_held` is not named by `deploy_held_x` and
+    `held` is not named by `deploy_held`. A substring rule would let a longer key stand in for a
+    shorter one, and the gate below would pass on a doc that never names the key a lane holds.
+    """
+    return re.search(r"(?<![A-Za-z0-9_])" + re.escape(key) + r"(?![A-Za-z0-9_])", text) is not None
+
+
+def skill_keys_missing_from_doc(rules: dict[str, str], skills: list[str], doc: str) -> list[str]:
+    """Keys some skill names that the doc does not. One direction only: extra doc keys are fine."""
+    return sorted(
+        key for key in rules
+        if any(names_key(key, text) for text in skills) and not names_key(key, doc)
+    )
+
+
+def _skill_texts() -> list[str]:
+    # Python-glob semantics on the index, not the `skills/*/SKILL.md` pathspec, whose `*`
+    # crosses `/` and would pull vendored skills in (see `tracked_files`).
+    files = tracked_files(SUITE_ROOT, lambda r: re.fullmatch(r"skills/[^/]+/SKILL\.md", r) is not None)
+    names = {f.parent.name for f in files}
+    assert {"lead-dev", "steward", "auditor", "orchestrator"} <= names, (
+        f"the skill corpus is missing a fleet skill ({sorted(names)}) - a gate over a narrowed "
+        "corpus passes by reading less, so it fails here instead"
+    )
+    return [f.read_text(encoding="utf-8") for f in files]
+
+
 # --------------------------------------------------------------------------------------------
 # The gates, against the real tree
 # --------------------------------------------------------------------------------------------
@@ -239,6 +271,20 @@ def test_every_exit_code_the_cli_can_return_has_a_row_in_the_exit_table() -> Non
         f"exit code(s) {missing} are returned by registry.main but have no row in the exit "
         "table. Produced by: "
         + "; ".join(f"{c} <- {', '.join(produced.get(c, ['success']))}" for c in missing)
+    )
+
+
+def test_every_refusal_key_a_skill_names_is_named_in_the_doc() -> None:
+    """A key a skill tells a lane to branch on is one the lane will hold and grep for.
+
+    A key no skill names is "fix the call", and its message is the whole answer, so this runs
+    one way only: documenting a key no skill names stays allowed.
+    """
+    missing = skill_keys_missing_from_doc(RULES, _skill_texts(), _doc())
+    assert not missing, (
+        "these refusal keys are named in a skill but not in docs/REGISTRY.md, so a lane holding "
+        "one has nowhere to look it up - add a row to the refusal-key table:\n  "
+        + "\n  ".join(missing)
     )
 
 
@@ -353,7 +399,7 @@ def test_the_citation_reader_catches_a_dangling_section_and_passes_a_real_one() 
     assert dangling_citations({"q": "REGISTRY.md #Queue: x"}, mentions_only) == ["q -> #Queue"]
     assert resolves("Queue", headings("## `Queue` - claimable work, disjoint lanes")), (
         "the real doc spells its headings as a backticked name then a dash and a summary, so a "
-        "prefix must still resolve or this gate reds on all seven sections at once"
+        "prefix must still resolve or this gate reds on every cited section at once"
     )
 
 
@@ -461,3 +507,20 @@ def main():
         return 2
 """)
     assert labelled == {6: ["_do_thing body"], 8: ["main body"], 2: ["Boom"]}
+
+
+def test_the_key_matcher_counts_only_whole_tokens() -> None:
+    """A substring-only occurrence is not a mention: the gate would pass on the wrong key."""
+    assert names_key("deploy_held", "refused `deploy_held`: another builder holds it")
+    assert names_key("deploy_held", "deploy_held")
+    assert not names_key("deploy_held", "refused `deploy_held_x` instead")
+    assert not names_key("deploy_held", "refused `xdeploy_held` instead")
+    assert not names_key("held", "refused `deploy_held`")
+    assert not names_key("id_format", "the id1format key")
+
+
+def test_the_skill_key_gate_runs_one_way_and_names_what_is_missing() -> None:
+    rules = {"named_both": "m", "named_skill": "m", "named_doc": "m", "named_none": "m"}
+    skills = ["branch on `named_both` or `named_skill`", "and `named_skill_extra` is another key"]
+    doc = "the doc names `named_both` and `named_doc`, and `named_skill_extra` only as a substring"
+    assert skill_keys_missing_from_doc(rules, skills, doc) == ["named_skill"]

@@ -59,7 +59,8 @@ class GraphAdapter(ABC):
 
         ``create=False`` opens an EXISTING store only: storage that is missing
         or is not a store raises :class:`AdapterError` instead of being created,
-        so a wrong path cannot read as an empty corpus."""
+        so a wrong path cannot read as an empty corpus. A ``corpus_id`` the
+        store does not hold raises too, and nothing is written."""
 
     @abstractmethod
     def close(self) -> None:

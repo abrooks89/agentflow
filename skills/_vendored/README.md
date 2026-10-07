@@ -22,7 +22,9 @@ execution-time skills and 5.0.5 for the remainder):
 
 These copies are **not** byte-identical to upstream: they have been adapted
 to resolve paths and configuration through agentflow's config layer where
-needed. Treat this directory as a maintained fork, not a mirror.
+needed, and `writing-plans` returns to its caller without offering execution
+when `solution` invokes it. Treat this directory as a maintained fork, not a
+mirror.
 
 ## Derived first-party skills
 

@@ -296,3 +296,60 @@ def test_run_suite_exit_code_treats_skip_as_not_failing(
     monkeypatch.setattr(check, "build_registry",
                         _one_assertion_registry(check, getattr(check, status_name)))
     assert check.run_suite(config, None) == expected_exit
+
+
+@pytest.mark.parametrize("zero", [0x0660, 0xFF10], ids=["arabic-indic", "fullwidth"])
+def test_d4_refuses_a_seed_whose_ids_are_spelled_in_NON_ASCII_digits(
+    check, seed_text, tmp_path, zero
+) -> None:
+    """gh#1123: `\\d` took any Unicode decimal digit, so a seed whose Q- and E- ids were spelled in
+    Arabic-Indic digits resolved and D4 PASSED on it. Only ASCII digits spell a registry id."""
+
+    def spell(text: str) -> str:
+        for ascii_id in ("0101", "0102"):
+            text = text.replace(ascii_id, "".join(chr(zero + int(c)) for c in ascii_id))
+        return text
+
+    seed = spell(seed_text)
+    assert seed != seed_text, "seed ids drifted - this case stopped testing anything"
+    result = _run_d4(check, tmp_path, spell(_compliant_after(seed_text)), seed_text=seed)
+    assert result.status == check.FAIL, f"D4 resolved non-ASCII-digit ids: {result.detail}"
+    assert "malformed" in result.detail
+
+
+# --- gh#1136: D4 takes its Queue row ids from the registry's own rule -------
+#
+# D4 used to find Queue rows with a private `E-[0-9]+` pattern. That pattern missed every
+# named id (`E-0101-export`, which the registry parses as a row), and accepted ids the
+# registry drops (`E-1`, under the three-digit floor). Both cases below fail against the
+# private pattern and pass once D4 defers to `agentflow.registry._row_key_ok("Queue", ...)`.
+
+_NAMED = {"E-0101": "E-0101-export", "E-0102": "E-0102-docs"}
+
+
+def _rename_rows(text: str) -> str:
+    """Rename the parked and ready rows (table cells and the question's `work:`) to named ids."""
+    for old, new in _NAMED.items():
+        text = text.replace(f"| {old} |", f"| {new} |").replace(f"- work: {old}", f"- work: {new}")
+    return text
+
+
+def test_d4_resolves_named_queue_ids(check, seed_text, tmp_path) -> None:
+    seed = _rename_rows(seed_text)
+    assert all(f"| {new} |" in seed for new in _NAMED.values()), (
+        "seed row shape drifted - this case stopped testing anything"
+    )
+    result = _run_d4(check, tmp_path, _rename_rows(_compliant_after(seed_text)), seed_text=seed)
+    assert result.status == check.PASS, f"D4 could not resolve named Queue ids: {result.detail}"
+    assert "E-0101-export" in result.detail and "E-0102-docs" in result.detail
+
+
+def test_d4_refuses_a_parked_row_the_registry_would_drop(check, seed_text, tmp_path) -> None:
+    """`E-1` is under the registry's three-digit floor, so it is not a Queue row at all."""
+    seed = seed_text.replace("| E-0101 |", "| E-1 |").replace("- work: E-0101", "- work: E-1")
+    assert "| E-1 |" in seed, "seed row shape drifted - this case stopped testing anything"
+    after = _compliant_after(seed_text).replace("| E-0101 |", "| E-1 |")
+    result = _run_d4(check, tmp_path, after, seed_text=seed)
+    assert result.status == check.FAIL, f"D4 resolved a row id the registry drops: {result.detail}"
+    assert "fixture malformed" in result.detail, result.detail
+    assert "parked=None" in result.detail, result.detail

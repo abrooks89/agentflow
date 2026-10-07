@@ -31,6 +31,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import re
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -207,6 +208,147 @@ def _validate_page(rec: dict[str, Any], type_fields: dict[str, Any]) -> None:
         for key in ("dst_type", "dst_title"):
             if not isinstance(edge.get(key), str) or not edge[key].strip():
                 raise RecordsError(f"record {name!r}: edge {edge!r} needs {key}")
+
+
+# ------------------------------------------------------------ citation check
+class SymbolIndex:
+    """The symbol identities a ``documents`` citation can resolve to (gh#465).
+
+    Built from the store's symbol tier, NOT from ``.inventory.json``: both come
+    from the same tree-sitter extractor, but emit-graph also mints a ``module``
+    entity per file and member entities (TS class methods) the inventory never
+    lists, and the coverage checklists agents copy citations from carry those
+    too. Checking against the inventory would refuse every such citation that
+    `graph records` itself accepts.
+    """
+
+    def __init__(self, corpus: str, symbols: list[dict[str, Any]]) -> None:
+        self.corpus = corpus
+        self.ids = {e["id"] for e in symbols}
+        self.kinds = sorted({e["kind"] for e in symbols})
+        self.kinds_by_file_name: dict[tuple[str, str], set[str]] = {}
+        self.files: set[str] = set()
+        for e in symbols:
+            path = (e.get("span") or {}).get("file") or (e.get("source_paths") or [""])[0]
+            path = str(path).replace("\\", "/")
+            self.files.add(path)
+            self.kinds_by_file_name.setdefault((path, e["name"]), set()).add(e["kind"])
+
+    @classmethod
+    def from_adapter(cls, adapter: GraphAdapter) -> SymbolIndex:
+        corpus = adapter.corpus_id
+        if not corpus:
+            raise RecordsError("adapter is not open on a corpus")
+        return cls(corpus, adapter.find_entities({"tier": "symbol"}))
+
+
+def citation_problem(entry: dict[str, Any], index: SymbolIndex) -> str | None:
+    """Why a ``{file, kind, name}`` citation cannot resolve, or None when it does.
+
+    The reason is classified, because each one has a different fix: a wrong kind
+    is copied from the checklist, an absent symbol is dropped, and a kind the
+    extractor never indexes can never be cited at all.
+    """
+    file = str(entry["file"]).replace("\\", "/")
+    kind, name = entry["kind"], entry["name"]
+    if symbol_id(index.corpus, file, kind, name) in index.ids:
+        return None
+    cited = f"({file}, {kind}, {name})"
+    # wrong kind first: a name indexed under another kind resolves once the kind
+    # is copied, even when the cited kind is one the store never holds
+    other = index.kinds_by_file_name.get((file, name))
+    if other:
+        return (
+            f"{cited}: wrong kind — {name!r} in {file} is indexed as "
+            f"{', '.join(sorted(other))}, not {kind}; copy the kind verbatim from "
+            "the checklist row"
+        )
+    if kind not in index.kinds:
+        return (
+            f"{cited}: kind not indexed — the symbol index holds no {kind!r} symbols "
+            f"at all (indexed kinds: {', '.join(index.kinds)}), so a "
+            f"{kind!r} citation can never resolve; cite the enclosing symbol or leave "
+            "the file to source_paths"
+        )
+    if file not in index.files:
+        return (
+            f"{cited}: file not indexed — no symbol in the index lives in {file!r}; "
+            "check the repo-relative path against the checklist"
+        )
+    return (
+        f"{cited}: symbol absent — no {kind} named {name!r} is indexed in {file}"
+    )
+
+
+def _citation_problems(pages: list[dict[str, Any]], index: SymbolIndex) -> tuple[int, list[str]]:
+    count, problems = 0, []
+    for rec in pages:
+        for entry in rec.get("documents") or []:
+            if not index.ids:
+                # an empty index is a wrong --corpus/--db, not a bad citation:
+                # classifying would tell the agent to drop every citation it has
+                raise RecordsError(
+                    f"the store holds no symbol entities for corpus {index.corpus!r}, "
+                    "so no documents citation can be checked — check --corpus and "
+                    "--db (symbols are ingested by `graph build`)"
+                )
+            count += 1
+            problem = citation_problem(entry, index)
+            if problem is not None:
+                problems.append(f"record {rec['title']!r}: documents citation {problem}")
+    return count, problems
+
+
+def check_records(adapter: GraphAdapter, records: dict[str, Any]) -> dict[str, Any]:
+    """Check one agent's records the moment they are written, before any fan-out
+    finishes (gh#465): page structure plus every ``documents`` citation.
+
+    Read-only. Collects EVERY problem instead of stopping at the first, so one
+    run of ``graph check-records`` gives the agent the whole list to fix. Returns
+    ``{pages, citations, problems}``; an empty ``problems`` list means
+    ``graph records`` will not refuse these pages over per-page structure or
+    citations. Batch-wide refusals (a file path emitted twice, a concept-id
+    collision) need the whole fan-out and stay with ``write_records``.
+    """
+    if not isinstance(records, dict):
+        raise RecordsError("a records file must contain a JSON object, not "
+                           f"{type(records).__name__}")
+    type_fields = load_type_fields()
+    problems: list[str] = []
+    # a misshapen list is the agent's to fix, so it is a PROBLEM line, never a
+    # traceback the agent cannot act on
+    pages = _record_objects(records, "pages", problems)
+    well_formed = []
+    for rec in pages:
+        try:
+            _validate_page(rec, type_fields)
+        except RecordsError as e:
+            problems.append(str(e))
+            continue
+        well_formed.append(rec)
+    for rec in _record_objects(records, "meta_pages", problems):
+        try:
+            _validate_meta(rec, type_fields)
+        except RecordsError as e:
+            problems.append(str(e))
+    count, cite_problems = _citation_problems(well_formed, SymbolIndex.from_adapter(adapter))
+    return {"pages": len(pages), "citations": count, "problems": problems + cite_problems}
+
+
+def _record_objects(records: dict[str, Any], key: str, problems: list[str]) -> list[dict[str, Any]]:
+    """The JSON objects under ``records[key]``; anything else is noted in ``problems``."""
+    value = records.get(key) or []
+    if not isinstance(value, list):
+        problems.append(f"{key!r} must be a JSON array of record objects, not "
+                        f"{type(value).__name__}")
+        return []
+    objects = []
+    for i, rec in enumerate(value):
+        if isinstance(rec, dict):
+            objects.append(rec)
+        else:
+            problems.append(f"{key!r}[{i}] must be a record object, not {type(rec).__name__}")
+    return objects
 
 
 def _empty(v: Any) -> bool:
@@ -690,6 +832,18 @@ def write_records(
             )
         files_seen[key] = rec["title"]
 
+    # Every documents citation, checked at ingest before any store lookup or write,
+    # and ALL of them named at once: one refusal per retry is how a bad batch used
+    # to cost a re-run per citation (gh#465).
+    symbol_index = SymbolIndex.from_adapter(adapter)
+    _count, cite_problems = _citation_problems(pages, symbol_index)
+    if cite_problems:
+        raise RecordsError(
+            f"{len(cite_problems)} documents citation(s) resolve to no symbol entity "
+            "(run `graph check-records` on each records file as it is written to "
+            "catch these before the fan-out ends):\n  " + "\n  ".join(cite_problems)
+        )
+
     # Identity derivation + batch collision detection (slugs are lossy).
     ids: dict[str, dict[str, Any]] = {}
     for rec in pages:
@@ -803,18 +957,13 @@ def write_records(
             target["frontmatter"]["_diagram"] = d["mermaid"]
             target["frontmatter"]["_diagram_sha"] = source_sha
 
-    # Resolve documents citations and concept edges BEFORE any write.
+    # Documents citations were resolved against the symbol index above; concept
+    # edges resolve here, still BEFORE any write.
     documents_rows: list[dict[str, Any]] = []
     for rec in pages:
         src = concept_id(corpus, rec["type"], rec["title"])
         for entry in rec.get("documents") or []:
             dst = symbol_id(corpus, entry["file"], entry["kind"], entry["name"])
-            if adapter.get_entity(dst) is None:
-                raise RecordsError(
-                    f"record {rec['title']!r}: documents citation "
-                    f"({entry['file']}, {entry['kind']}, {entry['name']}) resolves to "
-                    f"no symbol entity ({dst}) — cite checklist symbols exactly"
-                )
             documents_rows.append({
                 "src_id": src, "dst_id": dst, "rel": "documents",
                 "origin": "agent", "evidence": {"file": entry["file"]},
@@ -1055,6 +1204,39 @@ def _members_moved_since(
     return False
 
 
+def _leaf_report_stale(adapter: GraphAdapter, row: dict[str, Any]) -> bool:
+    """The stored-timestamp half of the leaf rule: no usable report, no
+    ``summarized_at`` stamp, or a member's content moved after it. Shared by
+    the update-time check and the query-time one so the two cannot drift."""
+    payload = _report_payload(row)
+    if payload is None:
+        return True
+    stamp = payload.get("summarized_at")
+    return not stamp or _members_moved_since(adapter, row, stamp)
+
+
+def _parent_report_stale(
+    row: dict[str, Any],
+    kids: list[int],
+    child_row: Callable[[int], dict[str, Any] | None],
+    child_stale: Callable[[int], bool],
+) -> bool:
+    """A parent report is stale when it is unusable, its stamped child set is
+    not ``kids``, or any child is gone, dissolved, or itself stale."""
+    payload = _report_payload(row)
+    if payload is None:
+        return True
+    if payload.get("children") != kids:
+        return True  # child set changed since the report was written
+    for child in kids:
+        crow = child_row(child)
+        if crow is None or (crow.get("descriptor") or {}).get("dissolved"):
+            return True  # a dissolved child stales its parent
+        if child_stale(child):
+            return True
+    return False
+
+
 def stale_report_communities(
     adapter: GraphAdapter,
     churn: list[dict[str, Any]],
@@ -1086,12 +1268,7 @@ def stale_report_communities(
         row = _community_row(adapter, cid)
         if row is None:
             raise RecordsError(f"stale-report check names unknown community {cid}")
-        payload = _report_payload(row)
-        if cid in moved or payload is None:
-            stale.add(cid)
-            continue
-        stamp = payload.get("summarized_at")
-        if not stamp or _members_moved_since(adapter, row, stamp):
+        if cid in moved or _leaf_report_stale(adapter, row):
             stale.add(cid)
 
     # parents arrive children-first, so child staleness propagates upward
@@ -1100,26 +1277,64 @@ def stale_report_communities(
         row = _community_row(adapter, pid)
         if row is None:
             raise RecordsError(f"stale-report check names unknown parent {pid}")
-        payload = _report_payload(row)
         kids = sorted(p.get("children") or [])
-        if pid in moved or payload is None:
-            stale.add(pid)
-            continue
-        if payload.get("children") != kids:
-            stale.add(pid)  # child set changed since the report was written
-            continue
-        child_stale = False
-        for child in kids:
-            child_row = _community_row(adapter, child)
-            if child_row is None or (child_row.get("descriptor") or {}).get("dissolved"):
-                child_stale = True  # a dissolved child stales its parent
-                break
-            if child in stale:
-                child_stale = True
-                break
-        if child_stale:
+        if pid in moved or _parent_report_stale(
+            row, kids, lambda c: _community_row(adapter, c), stale.__contains__
+        ):
             stale.add(pid)
     return sorted(stale)
+
+
+def stale_live_reports(
+    adapter: GraphAdapter,
+    levels: dict[int, list[dict[str, Any]]],
+    community_ids: list[int],
+) -> set[int]:
+    """Which of ``community_ids`` carry a stale report, judged at QUERY time.
+
+    ``levels`` is the live hierarchy (graph-query's ``live_hierarchy``). The
+    leaf and parent predicates are the ones :func:`stale_report_communities`
+    applies, over timestamps the store already holds; children come from live
+    ``parent_id`` links instead of an artifact. What a query cannot see is the
+    artifact's churn list, which exists only during a run: any leaf in that
+    run's ``moved`` set (created, or membership changed) is NOT flagged here
+    unless a timestamp also gives it away. That covers a member that LEFT
+    without a content change and a member that JOINED by re-clustering with an
+    ``updated_at`` older than the report. So the update-time count can exceed
+    what a query flags; `graph reports-stale` is the authority (gh#698).
+
+    Lazy and memoized, so global search pays only for the reports it kept
+    (plus the child chains under kept parents), not the whole corpus."""
+    by_id: dict[int, tuple[int, dict[str, Any]]] = {
+        r["id"]: (lvl, r) for lvl, rows in levels.items() for r in rows
+    }
+    kids_of: dict[int, list[int]] = {}
+    for _lvl, r in by_id.values():
+        if r.get("parent_id") is not None:
+            kids_of.setdefault(r["parent_id"], []).append(r["id"])
+    memo: dict[int, bool] = {}
+
+    def is_stale(cid: int) -> bool:
+        if cid in memo:
+            return memo[cid]
+        entry = by_id.get(cid)
+        if entry is None:
+            raise RecordsError(
+                f"stale-report check names community {cid}, which is not in "
+                "the live hierarchy"
+            )
+        lvl, row = entry
+        if lvl == 0:
+            result = _leaf_report_stale(adapter, row)
+        else:
+            result = _parent_report_stale(
+                row, sorted(kids_of.get(cid, [])),
+                lambda c: by_id[c][1] if c in by_id else None, is_stale,
+            )
+        memo[cid] = result
+        return result
+
+    return {cid for cid in community_ids if is_stale(cid)}
 
 
 def require_reports(adapter: GraphAdapter, community_ids: list[int]) -> None:

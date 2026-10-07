@@ -56,6 +56,21 @@ wearing the row state's word. So `halted` must sit in a value position - after `
 `--urgency`, beside another value of those fields, or immediately followed by `:` - or attach to
 one of an enumerated set of CARRIER nouns (a `halted` row, a `halted` question, a `halted` lane).
 
+**The carrier's SIDE matters (E-0953, gh#264).** A carrier on the RIGHT ("a `halted` row") is the
+adjective attached to its noun. A carrier on the LEFT with nothing between ("the lane halted at
+3/3", "the row halted the loop", "a question halted the fleet") is a subject and its past-tense
+VERB - the stop sense again - so it reds. A left carrier still anchors in three shapes only: a
+copula stands directly between them ("the row is halted", `COPULAS`; an adverb or relative clause
+in between breaks it), `halted` sits inside an inline code span on the same line ("the Agents row
+`halted`"), or it is in a value position (`--state halted`, `--state=halted`, `halted:`). A left
+SIBLING state ("advisory/waiting/halted") anchors on either side, as it always has.
+
+THE LIMIT, STATED PLAINLY: **the gate checks grammar, never meaning.** It reads word order, a short
+copula list, backticks and field markers. It cannot tell "the lane was halted" (the row state)
+from "the lane was halted by a crash" (an event); both are green because both are grammatical
+adjective positions. A writer who wants to say the stop sense in carrier-adjacent grammar can, and
+only review catches that.
+
 WHICH WAY THIS ERRS, STATED PLAINLY: toward FALSE POSITIVES, the opposite of the queue_class
 vocabulary gate that shipped alongside it. That gate reads 33 real prose mentions and must not cry
 wolf, so it errs toward missing. This one governs ONE word across seven files whose whole content
@@ -190,6 +205,20 @@ _MIN_SIBLINGS = 2
 #: they were never attached to.
 GLUE = frozenset({"or", "and", "nor", "never", "only", "not", "no", "either", "neither"})
 
+#: Linking verbs that turn a LEFT carrier + `halted` from subject-and-verb ("the lane halted")
+#: into subject-and-adjective ("the lane is halted"). Explicit and short on purpose: every word
+#: added here is another way to put a left carrier back beside a bare `halted`.
+COPULAS = frozenset({"is", "was", "are", "were", "stays", "remains"})
+
+#: Raw field flags whose next token is a VALUE. Checked on the raw text, because `_neighbour`
+#: strips the dashes and `state` / `urgency` are carriers in their own right.
+VALUE_FLAGS = ("--state", "--urgency")
+#: A value flag ending right where `halted` begins: `--state halted`, `--state=halted`, with
+#: backticks or bold between. The lookbehind keeps `x--state` and `--states` from counting.
+_VALUE_FLAG_BEFORE = re.compile(
+    r"(?<![\w-])(?:" + "|".join(re.escape(f) for f in VALUE_FLAGS) + r")[\s`*=]*$"
+)
+
 #: (skill, token, reason). See the module docstring. Every entry must still match something.
 EXEMPTIONS: tuple[tuple[str, str, str], ...] = tuple(
     (jr, token, reason)
@@ -208,31 +237,49 @@ _WORD = re.compile(r"[A-Za-z]+(?:[-_][A-Za-z]+)*")
 _NOISE = "`*_\"'()[]<>,.;|/—–:= \t\n"
 
 
-def _neighbour(words: list[str], start: int, step: int) -> str | None:
-    """The nearest meaningful word from *start* in direction *step*, skipping GLUE."""
+def _neighbour_at(words: list[str], start: int, step: int) -> tuple[int, str | None]:
+    """(index, word) of the nearest meaningful word from *start* in direction *step*."""
     i = start + step
     while 0 <= i < len(words):
         w = words[i].strip(_NOISE).lstrip("-").lower()
-        if not w:
+        if not w or w in GLUE:
             i += step
             continue
-        if w in GLUE:
-            i += step
-            continue
-        return w
-    return None
+        return i, w
+    return i, None
+
+
+def _neighbour(words: list[str], start: int, step: int) -> str | None:
+    """The nearest meaningful word from *start* in direction *step*, skipping GLUE."""
+    return _neighbour_at(words, start, step)[1]
 
 
 def _is_anchored(text: str, match: re.Match, words: list[str], idx: int) -> bool:
-    """True when this `halted` sits where a value of its field belongs."""
+    """True when this `halted` sits where a value of its field belongs.
+
+    Grammar, never meaning - see the module docstring. A left carrier is a subject unless a
+    copula, a code span or a value flag says otherwise.
+    """
     # ASSIGNMENT: `halted: true`, `halted: Q-0007`. The colon makes it a key/value outright.
     tail = text[match.end():match.end() + 2].lstrip("`*")
     if tail.startswith(":"):
         return True
-    for step in (-1, 1):
-        neighbour = _neighbour(words, idx, step)
-        if neighbour is not None and (neighbour in CARRIERS or neighbour in SIBLINGS):
-            return True
+    # VALUE POSITION: `--state halted`, `--urgency halted`, read raw before dashes are stripped.
+    if _VALUE_FLAG_BEFORE.search(text, 0, match.start()):
+        return True
+    right = _neighbour(words, idx, 1)
+    if right is not None and (right in CARRIERS or right in SIBLINGS):
+        return True
+    at, left = _neighbour_at(words, idx, -1)
+    if left is None:
+        return False
+    if left in SIBLINGS:
+        return True
+    if left in COPULAS:
+        return _neighbour(words, at, -1) in CARRIERS
+    if left in CARRIERS:
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        return text.count("`", line_start, match.start()) % 2 == 1
     return False
 
 
@@ -538,6 +585,51 @@ _LEGITIMATE = (
     "`waiting`/`advisory` ONLY - never `halted` urgency.",
     "set your own Agents row `halted` via `status --state halted --waiting-on Q-NNNN`",
 )
+
+
+#: A LEFT carrier with nothing between it and bare `halted` is subject + past-tense verb - the
+#: stop sense (E-0953, gh#264). These three are the issue's own sentences; the first symmetric
+#: carrier check read each as anchored because the noun sat beside the word, on the wrong side.
+_LEFT_CARRIER_VERB = (
+    "the lane halted at 3/3 and never woke",
+    "the row halted the loop entirely",
+    "a question halted the fleet",
+    # A balanced code span earlier on the line must not make the bare word look quoted.
+    "the `row` halted the loop",
+    # A flag-like prefix that is not the flag itself is not a value position.
+    "the x--state halted the loop",
+)
+
+#: The shapes in which a left carrier still anchors, plus the unchanged right-carrier case. Each
+#: must stay green, or the left-side rule has started rejecting correct writing.
+_LEFT_CARRIER_ANCHORED = (
+    "the row is halted on Q-0001",
+    "the lane stays halted until the answer lands",
+    "set your own Agents row `halted` and keep firing",
+    "write `status --state halted` before ending the turn",
+    "raise it via `ask --urgency halted`",
+    "status --state halted --waiting-on Q-0001",
+    "status --state=halted --waiting-on Q-0001",
+    "the row **`halted`** today",
+    "a `halted` row is exempt from the missed-wake alarm",
+    "a halted row is exempt from the missed-wake alarm",
+)
+
+
+@pytest.mark.parametrize("passage", _LEFT_CARRIER_VERB, ids=range(len(_LEFT_CARRIER_VERB)))
+def test_the_predicate_reds_on_a_left_carrier_past_tense_verb(passage: str) -> None:
+    found = violations(passage)
+    assert found, f"a left carrier excused a past-tense `halted` (the stop sense):\n{passage}"
+    assert all(tok == ROW_STATE for _ln, tok, _w in found), (
+        f"these test the left-carrier rule; anything other than `halted` flagged is noise: {found}"
+    )
+
+
+@pytest.mark.parametrize("passage", _LEFT_CARRIER_ANCHORED, ids=range(len(_LEFT_CARRIER_ANCHORED)))
+def test_a_left_carrier_still_anchors_through_copula_code_span_or_value_flag(passage: str) -> None:
+    assert violations(passage) == [], (
+        f"the left-carrier rule flagged a correct row-state use:\n{passage}\n{violations(passage)}"
+    )
 
 
 @pytest.mark.parametrize("passage", _LEGITIMATE, ids=range(len(_LEGITIMATE)))

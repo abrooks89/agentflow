@@ -63,6 +63,11 @@ from agentflow.save_summariser import (
 )
 from agentflow.wiki import initial_pillar_files, write_page
 
+#: Every write here passes ``write_page``'s residue guard, which resolves the configured person
+#: from the environment config. A hermetic one (``conftest.residue_config``), so the suite does
+#: not depend on the machine's config: absent on a CI runner, it would refuse every write.
+pytestmark = pytest.mark.usefixtures("residue_config")
+
 #: The live spawn's own timeout, deliberately SHORTER than ``DEFAULT_TIMEOUT_S``. The module's
 #: default is sized for a real phase boundary where a slow page still beats no page; a smoke run
 #: is sized for a human waiting on a suite. Overridable for a slow machine without editing code.

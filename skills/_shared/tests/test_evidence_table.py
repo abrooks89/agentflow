@@ -15,19 +15,24 @@ nothing checks it.
 WHAT THIS GATE CAN AND CANNOT DO -- stated because a gate that overstates itself is worse
 than no gate:
 
-* It CAN prove that every row it runs produces the number printed beside it, that a
-  minimum number of rows were actually RUN rather than merely parsed, and that the list of
-  standing excuses cannot grow without a visible edit.
+* It CAN prove that every row it runs produces AT LEAST the number printed beside it, that
+  the printed floor is not stale (the command produces no more than `STALE_RATIO` times it),
+  that every Tests cell is written as a two-significant-figure floor, that a minimum number
+  of rows were actually RUN rather than merely parsed, and that the list of standing excuses
+  cannot grow without a visible edit.
+* It CANNOT catch a small loss of tests. Each cell is a floor (`**N+**`), not an exact
+  count, so only a count that falls below N is red (gh#344). That is the trade for a
+  test-adding pull request no longer editing README.md: an exact cell was a counter every
+  such branch incremented from its own base, which made any two of them conflict.
 * It CANNOT prove the number for a row it cannot run here (today: the Node/npm inventory
   row, whose command performs a network install; and, wherever the autodoc-graph
   dependencies or the orchestrator row's `node`/`bash` are absent, those rows too). Those are
   declared with reasons below. The orchestrator row may go unrun on a checkout without Node,
   but never under CI: `test_the_orchestrator_node_row_is_measured_under_ci` fails if it does.
-* It CANNOT prove the counts on a platform other than the one the table states them for.
-  Collection CAN differ by platform on one commit, so the comparison is enforced on the
-  baseline platform only. That limit is in the README beside the table, not just here.
-  No number is quoted for the divergence on purpose - see `BASELINE_PLATFORM` below, where a
-  quoted pair was found false and removed rather than refreshed.
+* The comparison runs on EVERY platform. It used to run on Linux only, because collection
+  can differ by platform on one commit and an exact count cannot be true on both; that left
+  the counts unchecked on Windows, where the fleet's lanes run. A two-significant-figure
+  floor absorbs a per-platform difference of a few tests, so the platform gate is gone.
 
 An earlier version of this file claimed to assert that the not-run set EQUALS the declared
 set. It did contain such an assertion, and that assertion was a tautology: both sides
@@ -103,30 +108,25 @@ MIN_ROWS = 4
 # bar it is supposed to hold.
 MIN_ROWS_EXECUTED = 3
 
-# The platform the table's counts are stated for. Collection CAN differ by platform on one
-# commit, so a single number in a row is not guaranteed true on both and the table therefore
-# names a
+# Every Tests cell is a FLOOR, written `**N+**` (gh#344). An exact count was edited by every
+# test-adding merge, so any two such branches conflicted on one cell from a shared base - nine
+# measured collisions in one session, and a pull request stranded for twelve hours by nothing
+# else. A floor moves only when it goes stale, which is what this ratio defines: the command
+# producing more than STALE_RATIO x N means the cell understates the suite enough to bump.
 #
-# WHAT USED TO BE HERE, AND WHY IT IS GONE (E-0766). This comment claimed the divergence was
-# "DEMONSTRATED, not assumed" and quoted it: the `_shared` collect at 1460 on Windows against
-# 1490 on Linux. Measured 2026-09-22 at 23392c0: the `_shared` row does NOT diverge - Windows
-# and Linux both collect 3369, matching `README.md`'s cell exactly. The row that DID diverge
-# on the box where this was re-measured is autodoc-graph, and by 5 rather than 30.
-#
-# So the pair was wrong about the row, the magnitude and the numbers, inside the one module
-# whose thesis is that an unenforced number rots. Nothing anywhere asserted it, which is how it
-# survived three epics. It is REMOVED rather than refreshed, and no replacement pair is quoted:
-# a fresh one would rot the same way, and naming the row that happens to diverge today invites
-# the next reader to treat that instance as the rule. The PROPERTY is what this guard needs -
-# collection can differ, so compare on one platform - and the property does not decay. The
-# table therefore names a
-# baseline platform and this guard enforces the comparison only there - on any other platform a
-# mismatch is expected and says nothing about drift. CI's ubuntu-latest leg is the baseline
-# because it is the one every job in the matrix shares with the published numbers.
-#
-# This is a real limit on the guard, not a tidy-up: on Windows the counts go unchecked. It is
-# stated in the README beside the table rather than left for a reader to infer from a green run.
-BASELINE_PLATFORM = "linux"
+# There is no platform gate any more. The comparison used to run on Linux only, because an
+# exact count cannot be true on two platforms that collect differently; that left every count
+# unchecked on Windows, where the fleet's lanes run. A floor rounded down to two significant
+# figures absorbs a difference of a few tests, so it is checked everywhere.
+STALE_RATIO = 1.25
+
+# A floor carries at most this many significant figures. More than two is an exact count in
+# disguise, and an exact count is the per-merge edit this form exists to end - a lane following
+# an older instruction to re-derive the row would otherwise reintroduce it with nothing to catch it.
+MAX_SIGNIFICANT_FIGURES = 2
+
+# The cell's required shape: bold, digits, a `+`, then optional words ("44+ wired assertions").
+_FLOOR_CELL = re.compile(r"^\*\*(?P<n>\d+)\+(?:\s+[^*]+)?\*\*$")
 
 # A declaration is an excuse, so the list of them is capped. The cheapest way to turn this
 # module green is to declare the awkward row unrunnable with a plausible reason; a cap makes
@@ -140,12 +140,17 @@ SUBPROCESS_TIMEOUT_S = 900
 
 @dataclass(frozen=True)
 class Row:
-    """One parsed Evidence row: what it claims, and how it says the claim was produced."""
+    """One parsed Evidence row: what it claims, and how it says the claim was produced.
+
+    `claim` is the cell's floor N; `cell` is the raw Tests cell, kept so its FORM can be checked
+    separately from its number.
+    """
 
     layer: str
     claim: int
     command: str
     line_no: int
+    cell: str
 
 
 @dataclass(frozen=True)
@@ -241,6 +246,42 @@ def _claim(cell: str, line_no: int) -> int:
     return int(match.group(0).replace(",", ""))
 
 
+def _form_problem(cell: str) -> str | None:
+    """Why a Tests cell is not a two-significant-figure floor, or None when it is.
+
+    Kept out of the parser on purpose: the parse runs at import, so a form failure there would
+    surface as a collection error that hides every other result in this module.
+    """
+    match = _FLOOR_CELL.match(cell.strip())
+    if match is None:
+        return (
+            f"Tests cell {cell!r} is not a floor. Write it as `**N+**` (words may follow the `+`, "
+            "as in `**44+ wired assertions**`). An exact count is the per-merge edit gh#344 ended."
+        )
+    digits = match.group("n")
+    significant = len(digits.lstrip("0").rstrip("0"))
+    if significant > MAX_SIGNIFICANT_FIGURES:
+        return (
+            f"Tests cell {cell!r} carries {significant} significant figures; a floor carries at "
+            f"most {MAX_SIGNIFICANT_FIGURES}. Round the measured count DOWN to two (4813 -> 4800+). "
+            "More digits make it an exact count again, and every test-adding merge edits it."
+        )
+    return None
+
+
+def _count_problem(floor: int, measured: int) -> str | None:
+    """Why `measured` breaks the printed floor, or None when the floor holds."""
+    if measured < floor:
+        return f"claims at least {floor}, command produces {measured} (the floor is false)"
+    if measured > STALE_RATIO * floor:
+        return (
+            f"claims at least {floor}, command produces {measured}, more than {STALE_RATIO} x the "
+            "floor (the floor is stale: bump it to the measured count rounded down to two "
+            "significant figures)"
+        )
+    return None
+
+
 def _command(cell: str, line_no: int) -> str:
     command = _plain(cell)
     assert command, (
@@ -310,6 +351,7 @@ def _parse_evidence_table(text: str) -> list[Row]:
                 claim=_claim(cells[1], line_no),
                 command=_command(cells[2], line_no),
                 line_no=line_no,
+                cell=cells[1],
             )
         )
         last_row_index = j
@@ -375,7 +417,13 @@ class Result:
 
 
 def _resolve(row: Row) -> tuple[Path, str]:
-    """Honour a leading `cd <dir> &&`: several rows only reproduce from their own tree."""
+    """Honour a leading `cd <dir> &&`, else run from the repository root.
+
+    No README row carries the prefix today; it stays so a row that genuinely needs its own tree
+    runs there instead of failing. A subshell row (`( cd <dir> && ... )`) cannot be executed by
+    this guard: `shlex` would hand `(` to the OS as the program, so such a row must stay declared
+    unrunnable.
+    """
     match = _CD_PREFIX.match(row.command)
     if match:
         return REPO_ROOT / match.group("dir"), match.group("rest").strip()
@@ -527,43 +575,57 @@ def test_rows_that_cannot_run_here_are_exactly_the_declared_set() -> None:
 
 
 def test_every_runnable_row_produces_the_number_the_table_claims() -> None:
-    """The table's premise: run the right-hand column, get the left-hand number."""
-    if not sys.platform.startswith(BASELINE_PLATFORM):
-        # NOT a skip: the test still runs and still asserts the parse and the floor via the
-        # other cases in this module. Only the count COMPARISON is platform-scoped, because
-        # the numbers are stated for one platform and are known to differ on another.
-        results = _results()
-        assert len(results) >= MIN_ROWS, (
-            f"parsed {len(results)} Evidence rows, expected at least {MIN_ROWS}."
-        )
-        return
+    """The table's premise: run the right-hand column, get at least the left-hand number.
 
+    Runs on every platform (gh#344). The Linux-only early return that stood here left every
+    count unchecked on Windows, where the fleet's lanes run, so a stale cell passed locally and
+    failed only in CI.
+    """
     results = _results()
     assert len(results) >= MIN_ROWS, (
         f"only {len(results)} Evidence row(s) to check; a thin parse would let this pass over "
         "nothing while the README's numbers went unverified."
     )
 
-    mismatches = [
-        r for r in results if r.ran and r.measured is not None and r.measured != r.row.claim
+    problems = [
+        (r, problem)
+        for r in results
+        if r.ran and r.measured is not None
+        and (problem := _count_problem(r.row.claim, r.measured)) is not None
     ]
-    assert not mismatches, "\n".join(
+    assert not problems, "\n".join(
         [
-            "README.md's Evidence table prints numbers that its own commands do not produce:",
+            "README.md's Evidence table prints floors that its own commands do not honour:",
             *[
-                f"  README.md:{r.row.line_no}  {r.row.layer}: claims {r.row.claim}, command "
-                f"produces {r.measured}\n"
+                f"  README.md:{r.row.line_no}  {r.row.layer}: {problem}\n"
                 f"      cwd:     {r.cwd}\n"
                 f"      command: {r.row.command}"
-                for r in mismatches
+                for r, problem in problems
             ],
             "",
-            "The whole point of this table is that a sceptical reader can reproduce every number "
-            "from the command printed beside it. A wrong number here is worse than no table at "
-            "all: the first row a reader checks and finds false discredits every other claim in "
-            "the README, including the true ones. Update the number to what the command "
-            "produces -- do not adjust the command to fit the number.",
+            "The table's promise is that a sceptical reader who runs the printed command gets at "
+            "least the printed number. Rewrite the cell as the measured count rounded DOWN to two "
+            "significant figures, followed by `+` (5359 -> 5300+) -- do not adjust the command to "
+            "fit the number. Touch the cell only when this test fails.",
         ]
+    )
+
+
+def test_every_tests_cell_is_a_two_significant_figure_floor() -> None:
+    """The cell's FORM, checked apart from its number (gh#344).
+
+    Without this a lane following an older instruction to "re-derive the row" writes an exact
+    count again, the floor comparison above still passes, and every test-adding merge is back to
+    editing - and conflicting on - this one cell, with nothing to catch it.
+    """
+    assert len(ROWS) >= MIN_ROWS, f"only {len(ROWS)} Evidence row(s) parsed; refusing to pass vacuously."
+    problems = [
+        f"  README.md:{row.line_no}  {row.layer}: {problem}"
+        for row in ROWS
+        if (problem := _form_problem(row.cell)) is not None
+    ]
+    assert not problems, "\n".join(
+        ["README.md's Evidence table has Tests cells that are not floors:", *problems]
     )
 
 
@@ -594,8 +656,8 @@ Some intro prose that is not a table.
 
 | Layer | Tests | Counted with |
 |---|---|---|
-| alpha | **11** | `cd a && run one` |
-| beta | **22** | `cd b && run two` |
+| alpha | **11+** | `cd a && run one` |
+| beta | **22+** | `cd b && run two` |
 
 ## Next section
 """
@@ -612,6 +674,59 @@ def test_the_synthetic_fixture_parses_so_every_negative_below_discriminates() ->
     assert [r.layer for r in rows] == ["alpha", "beta"]
     assert [r.claim for r in rows] == [11, 22]
     assert [r.command for r in rows] == ["cd a && run one", "cd b && run two"]
+    assert [_form_problem(r.cell) for r in rows] == [None, None]
+
+
+@pytest.mark.parametrize(
+    "cell",
+    ["**4800+**", "**350+**", "**44+**", "**9+**", "**44+ wired assertions**", "**1000000+**"],
+)
+def test_a_two_significant_figure_floor_is_accepted(cell: str) -> None:
+    """The control for the refusals below: the decided form, with and without trailing words."""
+    assert _form_problem(cell) is None, _form_problem(cell)
+
+
+@pytest.mark.parametrize(
+    ("cell", "expected"),
+    [
+        ("**5359**", "is not a floor"),
+        ("**44 wired assertions**", "is not a floor"),
+        ("5300+", "is not a floor"),
+        ("**5,300+**", "is not a floor"),
+        ("**5359+**", "4 significant figures"),
+        ("**481+**", "3 significant figures"),
+        ("**4810+**", "3 significant figures"),
+    ],
+    ids=["exact", "exact-with-words", "not-bold", "comma", "4-sigfig", "3-sigfig", "3-sigfig-zero"],
+)
+def test_a_tests_cell_that_is_not_a_floor_is_refused(cell: str, expected: str) -> None:
+    """An exact count, or a floor with too many digits, is the per-merge edit coming back."""
+    problem = _form_problem(cell)
+    assert problem is not None and expected in problem, problem
+
+
+@pytest.mark.parametrize(
+    ("floor", "measured", "expected"),
+    [
+        (5300, 5299, "the floor is false"),
+        (44, 43, "the floor is false"),
+        (5300, 6626, "the floor is stale"),
+        (40, 51, "the floor is stale"),
+        (5300, 5300, None),
+        (5300, 6625, None),
+        (40, 50, None),
+    ],
+    ids=["below", "below-small", "stale", "stale-small", "at-floor", "at-ratio", "at-ratio-small"],
+)
+def test_the_count_comparison_fails_below_the_floor_and_above_the_ratio(
+    floor: int, measured: int, expected: str | None
+) -> None:
+    """Both directions and both boundaries, so neither bound can be loosened or dropped green."""
+    problem = _count_problem(floor, measured)
+    if expected is None:
+        assert problem is None, problem
+    else:
+        assert problem is not None and expected in problem, problem
 
 
 def test_a_missing_separator_row_is_refused() -> None:
@@ -637,7 +752,7 @@ def test_a_row_outside_the_contiguous_block_is_refused() -> None:
     """
     text = _GOOD_TABLE.replace(
         "## Next section",
-        "| gamma | **33** | `cd c && run three` |\n\n## Next section",
+        "| gamma | **33+** | `cd c && run three` |\n\n## Next section",
     )
     with pytest.raises(AssertionError, match="sits outside the Evidence table's contiguous block"):
         _parse_evidence_table(text)
@@ -646,8 +761,8 @@ def test_a_row_outside_the_contiguous_block_is_refused() -> None:
 @pytest.mark.parametrize(
     "row",
     [
-        "| alpha | **11** |",
-        "| alpha | **11** | `cd a && run one` | extra |",
+        "| alpha | **11+** |",
+        "| alpha | **11+** | `cd a && run one` | extra |",
     ],
     ids=["two-cells", "four-cells"],
 )
@@ -658,7 +773,7 @@ def test_a_row_that_is_not_three_cells_is_refused(row: str) -> None:
     longer describes the data beneath it. Either way the row cannot be verified, which is the only
     thing this table exists for.
     """
-    text = _GOOD_TABLE.replace("| alpha | **11** | `cd a && run one` |", row)
+    text = _GOOD_TABLE.replace("| alpha | **11+** | `cd a && run one` |", row)
     with pytest.raises(AssertionError, match="expected 3"):
         _parse_evidence_table(text)
 
@@ -693,7 +808,7 @@ def test_a_missing_evidence_heading_is_refused_rather_than_parsed_as_empty() -> 
     ("row", "expected"),
     [
         ("| alpha | many | `cd a && run one` |", "carries no number"),
-        ("| alpha | **11** |  |", "empty 'Counted with' cell"),
+        ("| alpha | **11+** |  |", "empty 'Counted with' cell"),
     ],
     ids=["no-number", "no-command"],
 )
@@ -704,7 +819,7 @@ def test_a_row_missing_its_number_or_its_command_is_refused(row: str, expected: 
     silently. A row with no command is an assertion rather than a measurement, leaving this guard
     nothing to run. Both are refused where they are parsed rather than somewhere downstream.
     """
-    text = _GOOD_TABLE.replace("| alpha | **11** | `cd a && run one` |", row)
+    text = _GOOD_TABLE.replace("| alpha | **11+** | `cd a && run one` |", row)
     with pytest.raises(AssertionError, match=expected):
         _parse_evidence_table(text)
 

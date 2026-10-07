@@ -522,26 +522,63 @@ After the pages exist, a deterministic graph-reviewer
 It runs in the **skill main-loop** (via Bash), not inside a Workflow — the Workflow sandbox
 has no filesystem/Node access. It reports five dimensions:
 
-- **broken wikilinks** — a `[[Target]]` whose stem matches no page (records any
-  case-insensitive candidates for the fixer);
+- **broken wikilinks** — a `[[Target]]` whose stem, title or alias matches no page. No
+  candidates are recorded at check time: a case-insensitive match resolves, so it is never broken.
+  `--fix` finds a single near-match (edit distance 1 on the normalized name) itself;
 - **orphans** — non-nav pages with zero inbound wikilinks;
 - **missing frontmatter** — pages missing any universal required field;
 - **non-existent `source_paths`** — a `source_paths` entry not found under the repo clone;
 - **symbol coverage** — file-level gaps against the tree-sitter `.inventory.json`.
 
-**Safe auto-fix scope** (`--fix`): only a broken link with exactly ONE stem candidate is
-rewritten (alias preserved), and missing `status`/`updated` frontmatter defaults are filled.
+**Safe auto-fix scope** (`--fix`): six repairs, each made only when exactly one answer exists:
+
+- a broken wikilink, in the body or the frontmatter, with exactly ONE near-match candidate
+  (stem, title or alias) is rewritten to that page (alias preserved);
+- missing `status`/`updated` frontmatter defaults are filled;
+- an unresolved frontmatter endpoint link written in another separator form
+  (`[[GET v1-notes]]`) that matches exactly ONE endpoint page is rewritten to that page's alias
+  (its title when no alias matches);
+- a one-way `contract_with` pair gets the reciprocal entry on the side missing it;
+- on a route-family endpoint page (`method: multiple`), a `routes:` entry with no matching alias
+  gets its slash-form alias added;
+- a sanitized title with no alias gets the full title added as an alias.
+
 It NEVER auto-generates pages, NEVER guesses ambiguous (>1 candidate) links, and never
 touches source-of-truth code.
 
-**Blocker gate:** the run fails (exit 1) on exactly two residual classes after `--fix`:
-**unexplained symbol-coverage gaps** and **non-existent `source_paths`** (a page citing a file
-that isn't in the repo). Broken wikilinks are **ADVISORY** gap-markers — reported (and
-auto-fixed where safe), never fatal — with one exception: an endpoint page's
-`request_model`/`response_model` links MUST resolve. If the data-model page doesn't exist,
-create it or inline the shape on the endpoint page; a dangling link there means the endpoint's
-contract is undocumented. Orphans and remaining auto-fixable items are **warnings** — reported,
-not fatal.
+**Blocker gate:** graph-check's `classify()` sorts every finding into a blocker or a warning.
+It emits five blocker kinds:
+
+- **unexplained symbol-coverage gaps** (`coverageGap`);
+- **non-existent `source_paths`** (`missingSourcePath`): a page citing a file that isn't in the
+  repo;
+- **an endpoint page's unresolved `request_model`/`response_model` link** (`brokenModelLink`);
+- **an unresolved frontmatter relational link** (`frontmatterLinkUnresolved`);
+- **a diagram `%% source:` path that does not exist in the clone** (`diagramSourceMissing`).
+
+Neither gate runs `--fix` first, and they differ on fixable findings:
+
+- `/autodoc-init` Step 5a runs graph-check over the rendered tree with no flag. A blocker exits 1;
+  fixable findings are not computed, and the ones that are not blockers stay warnings. The block
+  saves the exit status in `GRAPH_RC` and does not exit itself: a non-zero `GRAPH_RC` means fix
+  the records and re-render.
+- `/autodoc-update` Step 4.5 runs it with `--fail-on-fixable`, which exits 1 on any blocker or
+  any fixable finding, so both are fatal there.
+
+Other broken wikilinks are **ADVISORY** gap-markers: never a blocker. On Step 5a they are
+reported as warnings. On Step 4.5 one that `--fix` could rewrite is a fixable finding, and so
+fatal. The model-link blocker means the endpoint's contract is undocumented: if the data-model
+page doesn't exist, create it or inline the shape on the endpoint page. Orphans, and any other
+warning that `--fix` cannot repair, are reported and not fatal on either gate.
+
+**The update path is stricter.** `/autodoc-update` Step 4.5 runs graph-check over
+`$RENDER_TARGET` with `--fail-on-fixable` and no `--fix` (the two are mutually exclusive). That
+mode computes what `--fix` would repair, writes nothing, records each finding in the report's
+`fixable` list, names its page on stderr, and exits 1: there, a fixable finding is **fatal**, the
+same as a blocker. The reason is store-primacy: a repair written into a rendered page is dropped
+by the next render, and the next run's golden gate then blames an agent for the lost link. So a
+fixable finding on the update path is repaired in the page's record and re-rendered, never
+applied to the page.
 
 ---
 
@@ -556,7 +593,21 @@ the coverage/graph gates:
   the generating agent fixes it from the validator's own error output (max 2 attempts),
   then omits the diagram with a `> [!warning] diagram omitted: <reason>` callout rather than
   embedding broken source.
-- **Staleness (currency):** `/autodoc-update` compares each diagrammed page's
-  `diagram_source_sha` against the current sha of its `source_paths`. A mismatch FLAGS the
-  diagram as stale in the staleness report — it does NOT silently regenerate. Default is
-  flag-don't-regenerate; regeneration is an explicit, budgeted follow-up action.
+- **Staleness (currency):** `/autodoc-update` walks the source clone's git history for each
+  diagrammed page: the diagram is stale when some commit after its `diagram_source_sha`, up to
+  the manifest's `last_sha`, touched any of its `source_paths` (the newest commit touching them is
+  not already an ancestor of the commit the diagram was drawn at). An unrelated commit leaves it
+  fresh. A `diagram_source_sha` that is not a sha, or resolves to no commit in the clone, reads
+  stale; a page with no `source_paths`, or whose paths exist nowhere in that history, is
+  reported UNPROVEN and counted fresh. Only when the manifest has no `source_path` or
+  `last_sha`, or the clone is missing, does it take a labelled FALLBACK that compares the sha
+  against per-page `source_sha` heads or `last_sha` directly. A stale verdict FLAGS the diagram
+  in the staleness report — it does NOT silently regenerate. Default is
+  flag-don't-regenerate; regeneration is an explicit, budgeted follow-up action. The report
+  (`references/inventory/diagram-staleness.js`) carries two classes: **STALE**, a diagrammed page
+  whose sources changed after its `diagram_source_sha`, and **MISSING**, a `type: flow` or
+  `type: data-model` page whose `diagram` frontmatter is not `true`, so it never had a diagram to
+  go stale. Its budget estimate is `(stale + missing) * 8000` tokens, one agent pass per diagram
+  drawn or redrawn. Both classes are advisory: the script exits 0 on them, and exits non-zero
+  only on an error (a failed git call, a `last_sha` that resolves to no commit), because an error
+  is not a verdict.

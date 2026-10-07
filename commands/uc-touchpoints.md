@@ -1,5 +1,5 @@
 ---
-description: Print the advisory touchpoint floor for one opaque use-case id (UC-NNNN), grouped by SDLC stage — refine, solution, commits, code, flow. Read-only, never edits, always exits 0.
+description: Print the advisory touchpoint floor for one opaque use-case id (UC-NNNN), grouped by SDLC stage — refine, solution, commits, code, flow. Read-only, never edits, exits 0 except for an unusable autodoc root (exit 2).
 ---
 
 Run the use-case impact tool for the given id, forwarding this invocation's arguments verbatim.
@@ -17,7 +17,11 @@ What it does:
 - `git grep` over the code repo for source references.
 - Grep-scans `<autodoc_root>/flows/` for the flow pages that host the id.
 
-Contract (do not change): this is **advisory only** — it never edits a file, never gates or blocks, and **always exits 0**, even when config is unresolvable or `git` is absent. The output is a *floor*, not a proof of completeness: a missing commit trailer just means that hop won't appear, not that the work is absent. The opaque id is matched literally, so nothing here touches graph-check or the relational-link set.
+Contract (do not change): this is **advisory only** — it never edits a file, never gates or blocks, and **exits 0**, even when config is unresolvable or `git` is absent.
+
+The single exception is an unusable autodoc root (`AutodocRootError`): the resolved root has no `.manifest.json` while the legacy root still holds a corpus. The tool then prints no report, prints the error and its remediation to stderr, and **exits 2**, because a report from the empty root would be a confident zero that reads downstream as evidence the code is missing. Exit 2 means "fix the autodoc root config", not "the tool is broken": move the corpus to the resolved root before repointing config, or clear the legacy root, then run it again.
+
+Git output is decoded as UTF-8 on every host, so a non-ASCII line in a commit subject or a source file is reported intact. The output is a *floor*, not a proof of completeness: a missing commit trailer just means that hop won't appear, not that the work is absent. The opaque id is matched literally, so nothing here touches graph-check or the relational-link set.
 
 Invocation:
 

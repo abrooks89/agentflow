@@ -60,8 +60,9 @@ resolver moves to its own module. What it buys: a refusal whose slug resolves to
 live file is captioned MOVED, and this tree's human-facing call-list went 68 to 10.
 
 WHAT IT DOES NOT REACH, NAMED SO IT IS NOT MISTAKEN FOR COVERAGE. `skills/autodoc-init/SKILL.md`
-mandates `mv "$AUTODOC" "${AUTODOC}.pre-store.bak"` - a marker-last shape whose subject is a
-DIRECTORY. `iter_backups` filters on `is_file()`, so the reaper never sees it: it is safe from
+moves the live tree to `${AUTODOC}.pre-store.bak`, or to `${AUTODOC}.pre-store.<stamp>.bak` when
+a re-init finds that name taken - marker-last shapes whose subject is a DIRECTORY.
+`iter_backups` filters on `is_file()`, so the reaper never sees it: it is safe from
 this module, and equally it is not bounded by it or by the format above. Leave it that way.
 Extending the reaper to directories is new destructive reach - a wrong removal there takes a
 whole tree, not a file - and the destructive half of this module is human-gated on purpose.
@@ -919,6 +920,20 @@ def _make_live_resolver(root: Path):
     return resolve
 
 
+def _keep_count(value: str) -> int:
+    # Refused at parse time so it exits 2. Left to `plan_reap`, the ValueError escaped as a
+    # traceback on exit 1, which the steward reads as "the tree is not bounded".
+    try:
+        keep = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
+    if keep < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be at least 1, got {keep}; a keep of 0 is deletion, not retention"
+        )
+    return keep
+
+
 def main(argv=None) -> int:
     """The CLI. Report-only unless `--apply` is typed.
 
@@ -971,7 +986,7 @@ def main(argv=None) -> int:
     )
     reap.add_argument(
         "--keep",
-        type=int,
+        type=_keep_count,
         default=KEEP_DEFAULT,
         help=f"backups to keep per file, newest first (default {KEEP_DEFAULT})",
     )

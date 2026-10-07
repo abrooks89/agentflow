@@ -70,7 +70,7 @@ Task tool (general-purpose):
       {plan_test_commands}
       ```
 
-      If the plan declares no global test commands, use the union of every per-task `verification.test_commands` instead. Either way they are plan-authored strings with no tree in them: give each one `{worktree}` explicitly — the runner's own path flag where it has one (`python -m pytest {worktree}/<path>`, `npm --prefix {worktree} ...`), otherwise the tree named in the command itself (`cd {worktree} && <command>`).
+      If the plan declares no global test commands, use the union of every per-task `verification.test_commands` instead. Either way they are plan-authored strings with no tree in them: give each one `{worktree}` explicitly — the runner's own path flag where it has one (`python -m pytest {worktree}/<path>`, `npm --prefix {worktree} ...`), otherwise the tree named in the command itself inside a subshell (`( cd {worktree} && <command> )`). Never a bare `cd`: it persists in the shell after the command, and on Windows a shell left inside the tree wedges its removal.
 
     ## Tier rules — what you may and may not apply
 

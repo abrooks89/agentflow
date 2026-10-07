@@ -6,8 +6,8 @@
 //
 //   node golden-gate.js <renderedDir> <baselineDir> <config.json> <repoPath|-> <inventoryPath|->
 //
-// config.json: { "pageSetSymmetricDiffBudget": <int> }          (default: fresh init)
-//              { "pageSetLostBudget": <int> }                   (opt-in: refresh)
+// config.json: { "pageSetSymmetricDiffBudget": <int> }   (default: re-init over a populated tree)
+//              { "pageSetLostBudget": <int> }            (opt-in: refresh, or a first init build)
 //
 // Assertions (one PASS/FAIL line each; exit 1 on any FAIL):
 //   page-set        symmetric difference of content-page paths <= budget,
@@ -49,6 +49,26 @@ function loadTree(dir) {
   return { dir, pages, byFile, index };
 }
 
+// A page the renderer never produces: a `type: meta` note (the renderer's own
+// meta pages are the nav set, already excluded by listPages) or a Review
+// Backlog file at the corpus root, which the update intake reads and writes
+// back by name whatever its frontmatter says. Root only: the intake never looks
+// in a subfolder, so a content page there named "Review Backlog..." is the
+// renderer's. Used by page-set only; every other assertion still sees these pages.
+const BACKLOG_RE = /^Review Backlog[^/]*\.md$/;
+export function rendererOwned(pg) {
+  return pg.frontmatter.type !== 'meta' && !BACKLOG_RE.test(pg.file);
+}
+
+// ownedPages(listPages(dir, ...)) -> the subset page-set compares. Init Step 5c
+// counts its baseline with this, so "empty baseline" means the same thing there
+// as in page-set: a tree holding only a Review Backlog is a first build.
+export function ownedPages(pages) {
+  return pages
+    .map((p) => ({ ...p, ...parsePage(readFileSync(p.abspath, 'utf8')) }))
+    .filter(rendererOwned);
+}
+
 const empty = (v) => v === undefined || v === null || v === ''
   || (Array.isArray(v) && v.length === 0);
 
@@ -64,9 +84,14 @@ function resolvedOutbound(page, index) {
 
 // Two page-set modes, because the two callers are asking different questions.
 //
-// A FRESH init re-renders a tree that already exists and must reproduce it: any
-// difference in either direction is a regression, so the default compares the
-// SYMMETRIC difference against `pageSetSymmetricDiffBudget`.
+// A RE-INIT (--force over a populated tree) re-renders a tree that already exists
+// and must reproduce it: any difference in either direction is a regression, so
+// the default compares the SYMMETRIC difference against `pageSetSymmetricDiffBudget`.
+//
+// A FIRST init build has an empty baseline, so every rendered page is "created"
+// and a symmetric budget can only fail (gh#592). /autodoc-init Step 5c counts the
+// baseline's content pages with listPages(..., {excludeNav: true}) and, at zero,
+// passes `pageSetLostBudget: 0` instead. The choice is the caller's, not this file's.
 //
 // A REFRESH documents new code, so creating pages IS the job and losing one is
 // silent damage. Measured on the first end-to-end /autodoc-update run (gh#431,
@@ -103,8 +128,14 @@ export function runGoldenGate({ renderedDir, baselineDir, config, repoPath, inve
   const pass = (id, detail) => results.push({ id, ok: true, detail });
 
   // page-set --------------------------------------------------------------
-  const rSet = new Set(rendered.pages.map((p) => p.file));
-  const bSet = new Set(baseline.pages.map((p) => p.file));
+  // Only pages the renderer owns are compared. The live tree also holds
+  // human-owned pages it never produces (see rendererOwned), and counting those
+  // as lost failed every refresh of a corpus that keeps a Review Backlog.
+  const owned = (pages) => pages.filter(rendererOwned);
+  const unownedCount = baseline.pages.length - owned(baseline.pages).length;
+  const unowned = unownedCount ? `; ${unownedCount} not renderer-owned (excluded)` : '';
+  const rSet = new Set(owned(rendered.pages).map((p) => p.file));
+  const bSet = new Set(owned(baseline.pages).map((p) => p.file));
   const onlyRendered = [...rSet].filter((f) => !bSet.has(f)).sort();
   const onlyBaseline = [...bSet].filter((f) => !rSet.has(f)).sort();
   const symDiff = onlyRendered.length + onlyBaseline.length;
@@ -114,13 +145,13 @@ export function runGoldenGate({ renderedDir, baselineDir, config, repoPath, inve
     const created = `${onlyRendered.length} created${onlyRendered.length ? ` (${sample(onlyRendered)})` : ''}`;
     if (onlyBaseline.length <= lostBudget) {
       pass('page-set', `${onlyBaseline.length} lost <= budget ${lostBudget}; `
-        + `${created}, uncapped; ${common.length} common`);
+        + `${created}, uncapped; ${common.length} common${unowned}`);
     } else {
       fail('page-set', `${onlyBaseline.length} lost > budget ${lostBudget}; `
-        + `only-baseline: ${sample(onlyBaseline)}; ${created}`);
+        + `only-baseline: ${sample(onlyBaseline)}; ${created}${unowned}`);
     }
   } else if (symDiff <= budget) {
-    pass('page-set', `symmetric difference ${symDiff} <= budget ${budget} (${common.length} common)`);
+    pass('page-set', `symmetric difference ${symDiff} <= budget ${budget} (${common.length} common)${unowned}`);
   } else {
     fail('page-set', `symmetric difference ${symDiff} > budget ${budget}; `
       + `only-rendered: ${onlyRendered.slice(0, 5).join(', ')}${onlyRendered.length > 5 ? ', …' : ''}; `

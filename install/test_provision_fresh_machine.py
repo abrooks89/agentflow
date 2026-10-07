@@ -26,6 +26,7 @@ Run: `python -m pytest install/test_provision_fresh_machine.py -v`
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -164,7 +165,7 @@ def test_config_presence_precreates_missing_data_root(tmp_path):
     opts = _make_opts(tmp_path, config_home=config_home)
     assert not data_root.exists()
 
-    provision._do_config_presence(opts)
+    provision._ensure_required_dirs(opts)
 
     assert data_root.is_dir()
 
@@ -177,19 +178,90 @@ def test_config_presence_data_root_precreate_is_idempotent(tmp_path):
     _write_env_md(config_home, data_root=str(data_root))
     opts = _make_opts(tmp_path, config_home=config_home)
 
-    provision._do_config_presence(opts)
+    provision._ensure_required_dirs(opts)
 
     assert (data_root / "keep.txt").read_text(encoding="utf-8") == "kept"
 
 
-def test_config_presence_without_data_root_key_leaves_failure_to_resolver(tmp_path):
-    # No data_root in the yaml block: provision must not crash here — the strict
-    # resolver in step 9 owns the loud failure for a broken config.
+def test_config_presence_hard_fails_a_broken_environment_at_step_2(tmp_path):
+    # gh#985: step 2 is "exists + resolves", so an environment.md the resolver rejects
+    # (here: no data_root) fails here, before the venv is built, with the hard-fail
+    # wording and the ConfigError's file and remediation - not later, and not raw.
     config_home = tmp_path / "config"
     _write_env_md(config_home, data_root=None)
     opts = _make_opts(tmp_path, config_home=config_home)
 
-    provision._do_config_presence(opts)  # must not raise
+    with pytest.raises(RuntimeError) as excinfo:
+        provision._do_config_presence(opts)
+
+    msg = str(excinfo.value)
+    assert msg.startswith("config presence-check FAILED (hard-fail):")
+    assert str(config_home / "environment.md") in msg
+    assert "remediation:" in msg
+
+
+# --------------------------------------------------------------------------- #
+# gh#985 item 1 - a broken profile ends as the designed hard-fail, never a traceback
+# --------------------------------------------------------------------------- #
+_SUITE = Path(__file__).resolve().parent.parent
+
+
+def _home_with_misnamed_profile(tmp_path: Path) -> Path:
+    """The issue's repro: a valid environment.md and projects/toy.md declaring name 'toyy'."""
+    home = tmp_path / "cfg"
+    (home / "projects").mkdir(parents=True)
+    dirs = {k: tmp_path / k for k in ("data", "worktrees", "lock")}
+    for d in dirs.values():
+        d.mkdir()
+    (home / "environment.md").write_text(
+        "```yaml\nschema_version: 1\nperson:\n  name: \"Test\"\n"
+        f"data_root: \"{dirs['data'].as_posix()}\"\ngit_host:\n  kind: local\n"
+        f"notify:\n  kind: none\nlock_dir: \"{dirs['lock'].as_posix()}\"\nshell: posix\n"
+        f"suite_root: \"{tmp_path.as_posix()}\"\n"
+        f"worktree_root: \"{dirs['worktrees'].as_posix()}\"\n```\n",
+        encoding="utf-8",
+    )
+    (home / "projects" / "toy.md").write_text(
+        "```yaml\nschema_version: 1\nname: toyy\n```\n", encoding="utf-8")
+    return home
+
+
+def _main_with_steps(tmp_path, monkeypatch, capsys, steps) -> tuple:
+    home = _home_with_misnamed_profile(tmp_path)
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    with mock.patch.object(provision, "build_steps", lambda _o: steps):
+        rc = provision.main(["--suite-root", str(_SUITE), "--config-home", str(home),
+                             "--settings-file", str(tmp_path / "settings.json"),
+                             "--claude-root", str(tmp_path / "claude")])
+    out, err = capsys.readouterr()
+    return rc, out, err
+
+
+def _assert_hard_fail(rc: int, err: str) -> None:
+    assert rc == 1
+    assert "agentflow provision FAILED:\nconfig presence-check FAILED (hard-fail):" in err
+    # The ConfigError's field, file and remediation, carried whole.
+    assert "[name]" in err and "toyy" in err
+    assert str(Path("projects") / "toy.md") in err
+    assert "remediation:" in err
+    assert "Traceback" not in err
+
+
+def test_a_misnamed_profile_fails_at_step_2_before_the_venv(tmp_path, monkeypatch, capsys):
+    steps = [provision.Step(2, "config presence", run=provision._do_config_presence),
+             provision.Step(5, "autodoc re-check", run=provision._confirm_autodoc_against_config)]
+    rc, out, err = _main_with_steps(tmp_path, monkeypatch, capsys, steps)
+    _assert_hard_fail(rc, err)
+    assert "2. done." not in out, "step 2 must catch it, before step 4 builds the venv"
+
+
+def test_a_misnamed_profile_reaching_step_5_still_ends_as_the_hard_fail(
+        tmp_path, monkeypatch, capsys):
+    # Step 5 is where a fresh machine (no PyYAML before the venv) first resolves config,
+    # and where the issue saw the raw ConfigError traceback.
+    steps = [provision.Step(5, "autodoc re-check", run=provision._confirm_autodoc_against_config)]
+    rc, _out, err = _main_with_steps(tmp_path, monkeypatch, capsys, steps)
+    _assert_hard_fail(rc, err)
 
 
 def test_config_presence_step_runs_before_resolver_step():
@@ -228,7 +300,7 @@ def test_config_presence_REFUSES_to_create_at_the_drive_root(tmp_path, monkeypat
     opts = _make_opts(tmp_path, config_home=config_home)
     calls = _record_mkdirs(monkeypatch)
 
-    provision._do_config_presence(opts)
+    provision._ensure_required_dirs(opts)
 
     assert calls == [], f"step 2 created an unvalidated drive-root path: {calls}"
 
@@ -241,7 +313,7 @@ def test_config_presence_REFUSES_a_relative_scraped_path(tmp_path, monkeypatch):
     opts = _make_opts(tmp_path, config_home=config_home)
     calls = _record_mkdirs(monkeypatch)
 
-    provision._do_config_presence(opts)
+    provision._ensure_required_dirs(opts)
 
     assert calls == [], f"step 2 created a relative scraped path: {calls}"
 
@@ -256,7 +328,7 @@ def test_config_presence_STILL_creates_a_nested_tree_under_an_existing_dir(tmp_p
     opts = _make_opts(tmp_path, config_home=config_home)
     calls = _record_mkdirs(monkeypatch)
 
-    provision._do_config_presence(opts)
+    provision._ensure_required_dirs(opts)
 
     assert calls == [legit], f"step 2 refused a legitimate nested data_root: {calls}"
 
@@ -274,7 +346,7 @@ def test_config_presence_guards_worktree_root_the_same_way(tmp_path, monkeypatch
     opts = _make_opts(tmp_path, config_home=config_home)
     calls = _record_mkdirs(monkeypatch)
 
-    provision._do_config_presence(opts)
+    provision._ensure_required_dirs(opts)
 
     assert calls == [legit], f"expected only the valid worktree_root, got {calls}"
 
@@ -436,3 +508,174 @@ def test_secrets_step_notify_none_requires_nothing(tmp_path, monkeypatch):
     opts = _make_opts(tmp_path, config_home=config_home)
 
     provision._do_secrets(opts)  # must not raise
+
+
+# --------------------------------------------------------------------------- #
+# gh#985 review - step 2's resolve keeps step 3's messages and its own env clean
+# --------------------------------------------------------------------------- #
+def _full_env_home(tmp_path: Path, notify_yaml: str) -> Path:
+    home = tmp_path / "cfg"
+    home.mkdir()
+    dirs = {k: tmp_path / k for k in ("data", "worktrees", "lock")}
+    for d in dirs.values():
+        d.mkdir()
+    (home / "environment.md").write_text(
+        "```yaml\nschema_version: 1\nperson:\n  name: \"Test\"\n"
+        f"data_root: \"{dirs['data'].as_posix()}\"\ngit_host:\n  kind: local\n"
+        f"{notify_yaml}lock_dir: \"{dirs['lock'].as_posix()}\"\nshell: posix\n"
+        f"suite_root: \"{tmp_path.as_posix()}\"\n"
+        f"worktree_root: \"{dirs['worktrees'].as_posix()}\"\n```\n",
+        encoding="utf-8",
+    )
+    return home
+
+
+def test_step_2_gives_the_secrets_message_not_the_resolvers(tmp_path, monkeypatch):
+    # The resolver presence-checks the notify NAMES too, but its ConfigError does not say
+    # where to persist them; step 3's message does, so it must win at step 2 as well.
+    monkeypatch.delenv("AF_B1_TEST_NTFY_URL", raising=False)
+    monkeypatch.delenv("AF_B1_TEST_NTFY_TOPIC", raising=False)
+    home = _full_env_home(tmp_path, NOTIFY_NTFY)
+    opts = _make_opts(_SUITE, config_home=home)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        provision._do_config_presence(opts)
+
+    msg = str(excinfo.value)
+    assert msg.startswith("secrets check FAILED"), msg
+    assert "AF_B1_TEST_NTFY_URL" in msg and "settings.local.json" in msg
+    assert "hard-fail" not in msg
+
+
+def test_step_2_defers_resolution_when_pyyaml_is_not_importable(tmp_path, capsys):
+    config_home = tmp_path / "config"
+    _write_env_md(config_home, data_root=None)   # the resolver would reject this
+    opts = _make_opts(tmp_path, config_home=config_home)
+
+    with mock.patch.object(provision, "_parent_can_import_deps", lambda: False):
+        provision._do_config_presence(opts)   # must not raise: step 5 resolves instead
+
+    assert "resolution deferred to step 5" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("prior", ["sentinel-config-home", None])
+def test_load_config_or_fail_restores_agentflow_config_when_it_raises(
+        tmp_path, monkeypatch, prior):
+    if prior is None:
+        monkeypatch.delenv("AGENTFLOW_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("AGENTFLOW_CONFIG", prior)
+    config_home = tmp_path / "config"
+    _write_env_md(config_home, data_root=None)
+    opts = _make_opts(_SUITE, config_home=config_home)
+
+    with pytest.raises(RuntimeError, match="hard-fail"):
+        provision._load_config_or_fail(opts)
+
+    assert os.environ.get("AGENTFLOW_CONFIG") == prior
+
+
+# --------------------------------------------------------------------------- #
+# gh#1047 - a delegated path to a skill provision deploys at step 7 resolves at steps
+# 2 and 5 (before the deploy) from its suite source; step 10 stays strict.
+# --------------------------------------------------------------------------- #
+_SHIPPED = "polish-mode"
+
+
+def _deploy_target_machine(tmp_path: Path, polishing: str) -> provision.Options:
+    """A suite shipping one skill, a FRESH Claude dir, and a profile whose
+    generation_skills.polishing is *polishing* (`{claude}` stands for the Claude dir)."""
+    suite = tmp_path / "suite"
+    (suite / "skills" / _SHIPPED).mkdir(parents=True)
+    (suite / "skills" / _SHIPPED / "SKILL.md").write_text("# polish\n", encoding="utf-8")
+    (suite / "skills" / "_shared").mkdir()   # the pip package: never deployed
+    (suite / "skills" / "_shared" / "SKILL.md").write_text("x\n", encoding="utf-8")
+    claude = tmp_path / "claude"             # deliberately absent: a fresh machine
+    home = _full_env_home(tmp_path, "notify:\n  kind: none\n")
+    checkout = tmp_path / "repo"
+    checkout.mkdir()
+    (home / "projects").mkdir()
+    (home / "projects" / "toy.md").write_text(
+        "```yaml\nschema_version: 1\nname: toy\ncanonical_repo:\n  host_ref: owner/toy\n"
+        f"  local_checkout: \"{checkout.as_posix()}\"\nverification:\n  strategy: test-suite\n"
+        f"generation_skills:\n  polishing: \"{polishing.format(claude=claude.as_posix())}\"\n```\n",
+        encoding="utf-8",
+    )
+    opts = _make_opts(suite, config_home=home)
+    opts.claude_root = claude
+    return opts
+
+
+def _hard_fail_naming(opts, step, needle: str) -> None:
+    with pytest.raises(RuntimeError) as excinfo:
+        step(opts)
+    msg = str(excinfo.value)
+    assert msg.startswith("config presence-check FAILED (hard-fail):"), msg
+    assert "generation_skills.polishing" in msg and needle in msg, msg
+
+
+def test_a_to_be_deployed_skill_passes_steps_2_and_5_then_strict_step_10(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    opts = _deploy_target_machine(tmp_path, "{claude}/skills/" + _SHIPPED + "/SKILL.md")
+    target = opts.claude_root / "skills" / _SHIPPED / "SKILL.md"
+
+    provision._do_config_presence(opts)               # step 2
+    provision._confirm_autodoc_against_config(opts)   # step 5
+    # Step 10 before the deploy is still the strict check: nothing was relaxed for it.
+    _hard_fail_naming(opts, provision._do_presence_checks, "delegated path missing")
+
+    provision._do_deploy_skills(opts)                 # step 7
+    assert target.is_file()
+    provision._do_presence_checks(opts)               # step 10, strict, now satisfied
+
+
+def test_a_typod_skill_path_still_fails_at_step_2(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    opts = _deploy_target_machine(tmp_path, "{claude}/skills/polish-mod/SKILL.md")
+    _hard_fail_naming(opts, provision._do_config_presence, "delegated path missing")
+
+
+def test_a_file_the_shipped_skill_does_not_hold_still_fails_at_step_2(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    opts = _deploy_target_machine(tmp_path, "{claude}/skills/" + _SHIPPED + "/SKIL.md")
+    _hard_fail_naming(opts, provision._do_config_presence, "delegated path missing")
+
+
+def test_a_path_climbing_out_of_skills_is_not_accepted(tmp_path, monkeypatch):
+    """`skills/polish-mode/../../polish-mode/SKILL.md` is <claude>/polish-mode/SKILL.md, which
+    nothing deploys. A string-prefix check would accept it, and a naive join onto the suite
+    lands on <suite>/polish-mode/SKILL.md - planted here so that mistake would pass."""
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    opts = _deploy_target_machine(
+        tmp_path, "{claude}/skills/" + _SHIPPED + "/../../" + _SHIPPED + "/SKILL.md")
+    (opts.suite_root / _SHIPPED).mkdir()
+    (opts.suite_root / _SHIPPED / "SKILL.md").write_text("decoy\n", encoding="utf-8")
+    _hard_fail_naming(opts, provision._do_config_presence, "delegated path missing")
+
+
+def test_the_shared_package_is_not_a_deployed_skill(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTFLOW_PROJECT", raising=False)
+    opts = _deploy_target_machine(tmp_path, "{claude}/skills/_shared/SKILL.md")
+    _hard_fail_naming(opts, provision._do_config_presence, "delegated path missing")
+
+
+def test_config_skill_check_is_strict_unless_a_pending_deploy_is_passed(tmp_path):
+    from agentflow.config import ConfigError, PendingSkillDeploy, _check_skill_path_if_set
+
+    suite, claude = tmp_path / "suite", tmp_path / "claude"
+    (suite / "skills" / _SHIPPED).mkdir(parents=True)
+    (suite / "skills" / _SHIPPED / "SKILL.md").write_text("# polish\n", encoding="utf-8")
+    value = str(claude / "skills" / _SHIPPED / "SKILL.md")
+    pending = PendingSkillDeploy(claude, suite, frozenset({_SHIPPED}))
+
+    with pytest.raises(ConfigError, match="delegated path missing"):
+        _check_skill_path_if_set(value, "generation_skills.polishing", tmp_path / "p.md")
+    # The configured path comes back, not the suite source: it is where the seat will read.
+    assert _check_skill_path_if_set(value, "generation_skills.polishing", tmp_path / "p.md",
+                                    pending=pending) == value
+    if os.name == "nt":   # Windows paths are case-insensitive, so the comparison is too
+        upper = os.path.join(str(claude).upper(), "SKILLS", _SHIPPED, "SKILL.md")
+        assert _check_skill_path_if_set(upper, "f", tmp_path / "p.md", pending=pending) == upper
+    with pytest.raises(ConfigError, match="delegated path missing"):
+        _check_skill_path_if_set(value, "f", tmp_path / "p.md",
+                                 pending=PendingSkillDeploy(claude, suite, frozenset()))

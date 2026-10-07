@@ -1001,6 +1001,23 @@ def test_open_without_create_opens_an_existing_store(db_path):
         b.close()
 
 
+def test_open_without_create_refuses_an_unknown_corpus_and_inserts_nothing(db_path):
+    """gh#778: the corpus row was inserted on every open, so a wrong --corpus on a
+    read wrote to the store and then read as an empty corpus."""
+    a = SqliteGraphAdapter(db_path)
+    a.open("corp")
+    a.close()
+    b = SqliteGraphAdapter(db_path)
+    with pytest.raises(AdapterError, match=r"no corpus 'corpx'.*'corp'"):
+        b.open("corpx", create=False)
+    assert b.corpus_id is None
+    con = sqlite3.connect(db_path)
+    try:
+        assert [r[0] for r in con.execute("SELECT id FROM corpus")] == ["corp"]
+    finally:
+        con.close()
+
+
 def test_a_freshly_opened_store_is_never_zero_bytes(db_path):
     # The 0-byte refusal relies on this: open() writes page 1 (the WAL switch)
     # before returning, so a store under construction already carries the header.

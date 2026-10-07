@@ -1,6 +1,6 @@
 ---
 name: choose-next
-description: Use when the user wants to pick the next epic to work on from the status dashboard's queue — "/choose-next", "suggest something to do", "pick an epic", "what should I work on next", "give me 3 options". Surveys all speccing/planning epics on the dashboard, computes which are blocked (deps not yet done) vs ready, and proposes three deliberately diverse options (quick win + strategic-unblocker + drift-recovery). On selection, invokes `/project <spec-path>` to start the planning + dispatch pipeline. Note for "what's next?" routing — if the current TaskList has pending/in-progress items, suggest those FIRST and only invoke this skill if the TaskList is empty or fully done.
+description: Use when the user wants to pick the next epic to work on from the status dashboard's queue — "/choose-next", "suggest something to do", "pick an epic", "what should I work on next", "give me 3 options". Surveys every queued epic (speccing, drafted, approved-for-autonomous, planning) on the dashboard, computes which are blocked (deps not yet done) vs ready, and proposes three deliberately diverse options (quick win + strategic-unblocker + drift-recovery). On selection, invokes `/project <spec-or-plan-path>` to start the planning + dispatch pipeline. Note for "what's next?" routing — if the current TaskList has pending/in-progress items, suggest those FIRST and only invoke this skill if the TaskList is empty or fully done.
 ---
 
 # Orc's Choice
@@ -31,7 +31,9 @@ The name is a tip of the hat to "orchestrator's choice": the pick it hands over 
 
 ```python
 from agentflow.config import load_environment
-from agentflow.epic_survey import survey_epics, ready_set, blocked_status, blocks_count
+from agentflow.epic_survey import (
+    survey_epics, ready_set, blocked_status, blocks_count, is_candidate, handoff_path,
+)
 
 env = load_environment()
 records = survey_epics(env.data_root, env.mtime_cutoff_iso, include_archived=True)
@@ -56,9 +58,10 @@ Build these sets:
 - **In-flight**: `lifecycle_state == "running"` — these are blockers for anything that depends on them (transitively)
 - **Terminal**: what `_done_slugs` counts (`done`, `archived` and the rest of `TERMINAL_CURRENT_STATES`) — the only states that satisfy a dep
 - **Ended boards**: an orchestrator run that ended without delivering. `abandoned` and `failed` will never land. `done_on_hold` ended with its PR open for a human merge decision: not in flight, not done, and it satisfies nothing until the merge
-- **Candidates**: `lifecycle_state in ("speccing", "planning")` — these are what you'll suggest from
+- **Unreadable boards**: `unrecognised-board-status` (the board's `status:` is outside the vocabulary) or `duplicate-status-boards` (more than one board for the slug). The survey refuses to guess a run out of either: the epic is not a candidate, satisfies no dep, and a dependant buckets MISSING-DEP. The survey's warning names the board, or every board; the fix is a known `status:`, or exactly one board left
+- **Candidates**: `[r for r in records if is_candidate(r) and not r.paused]` — these are what you'll suggest from. `is_candidate` is the one definition `blocked_status` also uses: `speccing`, `drafted`, `approved-for-autonomous` and `planning`, the four stages before a run. Placeholder states (`pinned`, `parked`, `reference`) are not candidates; do not widen the set by hand. A `speccing` or `drafted` candidate has no approval for autonomous builds yet, so Steps 6 and 7 say so wherever it appears
 
-Skip any epic with `paused: true`.
+Skip any epic with `paused: true` (the list above already does).
 
 ### Step 3: Compute blocked status per candidate
 
@@ -70,7 +73,7 @@ evaluates in this order, first match wins (quoted from its docstring):
 * every dep terminal (``_done_slugs``)    → ``READY``
 * any dep's board ended undelivered (``abandoned``/``failed``) → ``MISSING-DEP``
 * any dep is a running epic               → ``NEAR-READY``
-* any dep is a candidate (speccing/planning) → ``CHAINED``
+* any dep is a candidate (``is_candidate``) → ``CHAINED``
 * any dep is unknown (not surveyed)       → ``MISSING-DEP``
 * otherwise, e.g. a ``done_on_hold`` dep awaiting a human merge → ``CHAINED``
 ```
@@ -78,15 +81,30 @@ evaluates in this order, first match wins (quoted from its docstring):
 What each bucket tells the operator:
 - **READY** — every dep is terminal.
 - **NEAR-READY** — a dep is running; it unblocks when that epic finishes.
-- **MISSING-DEP** — no dep the survey can resolve, for one of three reasons; name which:
+- **MISSING-DEP** — no dep the survey can resolve, for one of five reasons; name which:
   - a cross-project dep, which is unsatisfiable by construction;
   - an `abandoned` or `failed` parent, which will never land. `warn_stranded_terminal_dependencies` names the stranded edge; the fix is to re-plan the parent or re-point the edge, not to wait;
-  - a dep slug that is not surveyed at all, which may be a future epic that does not exist yet.
-- **CHAINED** — deeper queue ahead: a dep is itself a candidate (speccing/planning), or a `done_on_hold` parent is awaiting a human merge (it unblocks when that PR merges), or a dep sits at another unfinished state.
+  - a parent on an unreadable board (`unrecognised-board-status` or `duplicate-status-boards`), which nothing can say will land. The survey's warning names the board, or every board; the fix is to give it a known `status:` or leave exactly one board, not to wait;
+  - dep spelled as a file stem; maps to `<slug>` (done) — the dep carries a date prefix, a `-design` suffix or a `.md` that the record's slug does not, so it never matches. Report the state the mapped record is at; when that is done, the prerequisite is finished and the fix is one frontmatter line, not waiting;
+  - a dep slug that is not surveyed at all, even once normalized, which may be a future epic that does not exist yet.
+- **CHAINED** — deeper queue ahead: a dep is itself a candidate (`is_candidate`), or a `done_on_hold` parent is awaiting a human merge (it unblocks when that PR merges), or a dep sits at another unfinished state.
+
+To tell the file-stem cause from the not-surveyed one, check every candidate's deps, not only the dependency warnings: `warn_unresolvable_dependencies` looks at dispatchable records only, so it is silent about most candidates.
+
+```python
+from agentflow.epic_survey import resolves_after_normalization
+
+known = {r.slug for r in records}
+by_slug = {r.slug: r for r in records}
+for dep in candidate.depends_on:
+    if dep not in known:
+        mapped = resolves_after_normalization(dep, known)
+        # mapped is None -> not surveyed at all; otherwise a file stem for by_slug[mapped]
+```
 
 The fully-unblocked subset is `ready_set(records)` — use it to prefer READY candidates.
 
-Also call `blocks_count(record, records)` for each candidate — how many other surveyed epics list this candidate as a dep. High count = strategic value (working on it unblocks downstream work).
+Also call `blocks_count(record, records)` for each candidate — how many other surveyed epics that are still to run list this candidate as a dep (a dependent that is terminal or on an ended board is not counted). High count = strategic value (working on it unblocks downstream work).
 
 ### Step 4: Pick 3 with deliberate diversity
 
@@ -102,10 +120,10 @@ If the candidate set has fewer than 3 items: present what's there with a note. D
 
 If two of the three "best" candidates are the same item (e.g., a small quick-win that also unblocks a lot): pick that one + two distinct alternatives, don't repeat.
 
-### Step 5: Read each picked candidate's spec to enrich the suggestion
+### Step 5: Read each picked candidate's spec or plan to enrich the suggestion
 
 For each of the 3 picks:
-- Locate the spec file at `<data_root>/projects/<name>/design/specs/YYYY-MM-DD-<slug>.md` (the record's `project` gives `<name>`; filename usually has a date prefix; if multiple match the slug, take the most recent)
+- Locate the file with `handoff_path(record, env.data_root)`. It returns `record.source_path` — the spec or plan the survey read, which is a plan for a plan-only record — and only when that file has moved does it fall back to the record's own `<data_root>/projects/<name>/design/{specs,plans}/`, returning a file there only when exactly one stem normalizes to the slug. It returns None rather than guess: for a path outside `data_root`, a record with no plain `project:` name, two matching files, or none. Do not rebuild the path from `project` and `slug` yourself: a plan-only record has no spec, a record with no `project:` has no `<name>`, and a `-design` filename does not end in the slug
 - Read the first ~40 lines (frontmatter + Problem + Goal sections)
 - Extract: tier hint, problem one-liner, key context
 
@@ -113,24 +131,25 @@ This gives the user enough to make a real choice without re-reading specs themse
 
 ### Step 6: Present 3 options via AskUserQuestion
 
-Use AskUserQuestion with one question and 3 options. Each option's `label` is the slug; each `description` is one short line stating: tier, blocking status, and the why-pick-this rationale.
+Use AskUserQuestion with one question and 3 options. Each option's `label` is the slug; each `description` is one short line stating: tier, blocking status, lifecycle state, and the why-pick-this rationale. For a `speccing` or `drafted` pick, write the state as `drafted - not yet approved for autonomous builds` (or `speccing - ...`), so the human sees the approval gap before choosing.
 
 Format example:
 - **Label**: `aggregator-peer-federation-resilience`
-- **Description**: `small (single-function fix, READY). Quick win — federation timeout fix shippable in ~30 min, unblocks no one but cleans up dashboard noise.`
+- **Description**: `small (single-function fix, READY, approved-for-autonomous). Quick win — federation timeout fix shippable in ~30 min, unblocks no one but cleans up dashboard noise.`
 
 The 4th "Other" option is auto-included by AskUserQuestion — lets user say "show me different ones" or pick an epic the skill didn't suggest.
 
 ### Step 7: On selection, invoke `/project`
 
 After the user picks one of the 3:
-- Locate the spec path on disk (the same file you read in Step 5)
-- Invoke `/project <spec-path>` via the Skill tool with `skill: project, args: <path>`
+- Use the path `handoff_path` returned in Step 5 (the same file you read there), spec or plan
+- If the pick is `speccing` or `drafted`, say so in one line when handing off: "note: `<slug>` is drafted - not yet approved for autonomous builds; /project will plan it, but no builder may claim it until a human approves it."
+- Invoke `/project <path>` via the Skill tool with `skill: project, args: <path>`; `/project` routes a spec path and a plan path alike
 - This routes the chosen epic into the brainstorm-or-plan-then-orchestrator pipeline
 
 If the user picks "Other" with a custom slug:
 - Look up that slug in the survey records
-- If found: read the spec path, invoke `/project <path>`
+- If found: take `handoff_path(record, env.data_root)`, invoke `/project <path>`; if it returns None, tell the user that epic can't be handed off (see the `handoff_path` None row under Failure modes) and ask for another pick
 - If not found: ask the user to clarify (slug typo? new placeholder needed via `backlog` first?)
 
 If the user picks "Other" asking for different filtering (e.g., "show me speccing only" / "show me only blockers" / "give me a bigger one"): re-run Steps 4-6 with the requested filter. Don't iterate forever — if a third re-roll happens, ask the user to just pick one.
@@ -143,7 +162,7 @@ User: *"What's next?"*
 
 You first check TaskList — empty (or all `completed`). Fall through to this skill.
 
-You survey the disk, find 5 candidates (3 speccing, 2 planning). Pick 3 with diversity:
+You survey the disk, find 5 candidates (2 speccing, 1 drafted, 2 planning). Pick 3 with diversity:
 - `aggregator-peer-federation-resilience` (small, READY, quick win)
 - `platform-cutover-pre-flight-blockers` (medium, READY, blocks 1 other epic — strategic)
 - `production-bug-fixes-plan` (planning state, last_modified 4 days ago, drift recovery)
@@ -179,7 +198,7 @@ User: *"Pick an epic"*
 
 You survey, find 0 candidates (everything is done or running). Surface plainly:
 
-> "Nothing pending — 0 speccing, 0 planning. The 3 in-flight epics are: ... You're either at inbox-zero or behind the orchestrator catching up. Want to pin something new with `/backlog`?"
+> "Nothing pending — 0 speccing, 0 drafted, 0 approved, 0 planning. The 3 in-flight epics are: ... You're either at inbox-zero or behind the orchestrator catching up. Want to pin something new with `/backlog`?"
 
 Don't invent suggestions.
 
@@ -199,6 +218,6 @@ Don't invent suggestions.
 |---|---|
 | Survey returns 0 records | Inbox-zero — report "nothing pending — pin something or queue planning." (The disk survey can't be "down", so empty unambiguously means inbox-zero; if you suspect a mis-config, confirm `data_root` points at the right tree rather than probing a health endpoint.) |
 | All candidates are CHAINED behind one stuck dep | Suggest the dep itself as #1 (strategic unblocker). Note explicitly that the rest of the queue waits on it. |
-| Spec file for a slug can't be located on disk | Skip that candidate, pick another. Note in the final summary: "couldn't locate spec for `<slug>` — record exists in the survey but no file matches." |
+| `handoff_path` returns None for a pick | Skip that candidate, pick another. It returns None rather than guess: for a path outside `data_root`, a record with no plain `project:` name, two matching files, or none. Note in the final summary: "couldn't hand off `<slug>` — no single spec or plan for it inside `data_root`." |
 | User picks "Other" without specifying | Ask once: "different filter, or a specific slug?" Don't loop. |
 | User picks an epic whose deps aren't met | `/project` will accept it anyway; the orchestrator's gate #2 will surface the issue. Add a one-line warning when handing off: "note: this epic's dep `<slug>` isn't done yet — orchestrator may flag it." |

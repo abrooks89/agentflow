@@ -8,6 +8,17 @@ value that is real but non-dispatchable taught in a context implying it dispatch
 those fails the same silent way: dev-manager assigns the value at promotion, ``dispatchable()``
 drops the spec, and the epic sits approved and unclaimable forever with nothing reporting why.
 
+THIS GATE CLOSES THE FIRST TWO OF THOSE, NOT THE THIRD (gh#938). It checks membership: a value
+outside the vocabulary is a violation, and every value inside it passes. A real
+non-dispatchable value taught as though the fleet builds it is inside the vocabulary, so it
+passes here; ``test_a_non_dispatchable_value_taught_as_buildable_is_not_caught_here`` pins that
+boundary so this docstring cannot quietly overclaim again. The third case is caught at runtime:
+dev-manager's promotion gate refuses to promote a spec whose class is not dispatch-eligible
+(``skills/dev-manager/SKILL.md``, promotion gate), and the steward's backlog-truth sweep
+(``skills/steward/SKILL.md``, domain A) reports a ``queue_class`` contradicting
+``current_state`` as FIXABLE. A dispatch-context rule here was not added: the block-proximity
+rule described below measured 14 false positives on this prose, and the runtime checks exist.
+
 So the expectation is DERIVED from the thing that actually decides dispatch. This module
 imports ``DISPATCHABLE_QUEUE_CLASSES`` and ``NON_DISPATCHABLE_QUEUE_CLASSES`` and unions them;
 it restates neither, and ``test_this_module_spells_no_vocabulary_value_literally`` enforces
@@ -387,3 +398,40 @@ def test_a_counter_example_value_is_not_a_candidate() -> None:
     known = sorted(VOCABULARY)[0]
     text = f"- Selection keeps unset / `{known}`; an unknown class like `bug`/`feature` is not.\n"
     assert violations(text) == []
+
+
+@pytest.mark.parametrize("value", sorted(NON_DISPATCHABLE_QUEUE_CLASSES))
+def test_a_non_dispatchable_value_taught_as_buildable_is_not_caught_here(value: str) -> None:
+    """The boundary of this gate, pinned so the docstrings cannot overclaim it again (gh#938).
+
+    A real non-dispatchable class taught as though the fleet builds it is IN the vocabulary, so
+    a membership gate passes it. That case is caught at runtime by the promotion step and the
+    steward's backlog-truth sweep, not here. If this test ever fails, the gate has grown a
+    dispatch-context rule: update both module docstrings to say it now catches the third case,
+    then delete this test.
+    """
+    text = f"- Carve the spec with `{FIELD}: {value}` so the fleet builds it.\n"
+    assert value in {v for _ln, v in taught_values(text)}, (
+        "the assignment position no longer sees the value at all, so this test proves nothing"
+    )
+    assert violations(text) == [], (
+        "the gate now flags a non-dispatchable value taught as buildable; the docstrings in "
+        "this module and in agentflow/vocabulary.py still say it does not - update them"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# The steward's sweep states the same migration rule doctor applies
+# --------------------------------------------------------------------------------------
+
+
+def test_the_steward_keys_the_queue_class_migration_on_retired_membership_not_count() -> None:
+    """Doctor decides migration vs. hand-fix by membership in QUEUE_CLASS_REWRITES, the only
+    values the migration rewrites. A steward told that "many specs" on a value means migration
+    sends an unknown value to a run that changes nothing, and hand-edits a few retired ones.
+    """
+    text = (SKILLS_ROOT / "steward" / "SKILL.md").read_text(encoding="utf-8")
+    assert "QUEUE_CLASS_REWRITES" in text, "the steward's queue_class sweep no longer names the rewrite table"
+    assert "MANY specs on the same out-of-vocabulary value" not in text, (
+        "the steward again keys the queue_class migration on spec count"
+    )

@@ -20,6 +20,12 @@ real-but-non-dispatchable value taught as though it dispatched.
 value taught in a tracked SKILL.md must be a member of the two frozensets in `epic_survey`,
 which it imports rather than restates. The retired spelling is caught there for the right
 reason, that it is not in the vocabulary, rather than because it is on a list of banned words.
+
+WHAT THAT GATE DOES NOT CATCH. It checks MEMBERSHIP only, so it closes the first two of those
+three cases and not the third: a real non-dispatchable value taught as though the fleet would
+build it is in the vocabulary, so the gate passes it (gh#938). Where that case IS caught is
+written once, in the docstring of `test_vocabulary_gate.py`.
+
 That gate reads SKILL.md files only, so it never sees this module, the CHANGELOG or the harness
 fixtures, and the three permanent exemptions named in `skills/_shared/SCHEMA.md` need no
 exemption from it.

@@ -43,8 +43,14 @@ ignored).
   controlled target for orchestrator/skill runs. Gitignored from the outer
   repo; reconstruct it any time with `python harness/seed_toy_repo.py` (see
   below).
+- `toy-profile/harness-toy.md` — **tracked** project-profile template for
+  `harness-toy`, the non-fleet project every live A/B/D launch names with
+  `--project harness-toy`. Its only repository is `toy-repo/`. Installed into
+  `<config_home>/projects/` per [`run-scenario.md`](run-scenario.md), *Setup*, and
+  removed after recording.
 - `records/` — captured run records (gitignored, machine-local).
-- `stubs/` — test stubs, e.g. `schedulewakeup_log.md` (gitignored).
+- `stubs/` — the hand-written wake log `schedulewakeup_log.md` (gitignored) and its
+  format README.
 - `BASELINE.md` / `POST-PORT-RESULT.md` — gitignored names left from the
   Phase-0 port, where hand-written pre/post-port notes lived. Nothing reads
   them: `check.py` never compares against a baseline.
@@ -88,7 +94,7 @@ pip install -e skills/_shared
 |---|---|---|
 | `python harness/check.py --self-test` | **yes** | config loads, `parse_plan` imports, all the full assertion registry wired and crash-free against a synthesized records-absent world (gh#302) and, when `records/` or the wake log is on disk, crash-free against those recordings too, verdicts not graded (step 4d, gh#341) - and that every record-backed row (A1-A9, B1-B9, C4, D1-D4, E2) SKIPs as unrecorded there rather than FAILing (gh#628). Prints `# tree:` lines naming the file `agentflow.plan_parser` was imported from and the registry CLI root, and a `WARN self-test.tree` line if the imported package is not under this clone's `skills/_shared` while the registry CLI is (fix: `pip install -e skills/_shared` from this clone). Always grades against the tracked `harness.config.example.json` and prints `# config:` naming it; a machine-local `harness.config.json` is not read, so the local config does not move the verdict (gh#340) - `check.py <config>` exercises yours, and `--self-test <config>` is refused rather than silently ignored. Step 4d is the one deliberately machine-dependent part: it can FAIL only on a machine that holds recordings, and SKIPs everywhere else, CI included. |
 | `python harness/check.py harness/harness.config.example.json --only C,F,G` | **yes** | Scenarios F and G in full (F1-F4, G1: an issue-intake triage pass replayed over tracked fixtures through `issue_intake`'s injectable `Runner`, no account and no network - see *Scenarios F and G* below), and Scenario C end-to-end (loud hard-fail on a malformed plan, that the failing parse creates no status board, plus C14's complement: a plan without `epic` parses) — C1-C3, C5, C6 and C8-C15 assert here from tracked fixtures alone, never a live recording. The other two rows cannot run here and report SKIP rather than passing on an input they never examined (gh#139): C4 (no wake scheduled), whose only evidence is `stubs/schedulewakeup_log.md`, which only a live recording of B or D writes (A schedules no wake) - it prints a `# unrecorded:` line marked outside `--only`, and does not affect the exit code, because neither of those scenarios was selected; and C7 (no server-IP literal), whose needle list `preport_ip_literals` the tracked example config ships empty on purpose — C7 needs a machine-local config key rather than a recording, but it does not assert on this command either, so it is excluded from the range above. Exits 0. |
-| `python harness/seed_toy_repo.py` then `cd harness/toy-repo && python -m pytest tests -q` | **yes** | the toy-repo fixture reconstructs deterministically (same seed sha on every machine) and its suite is green. |
+| `python harness/seed_toy_repo.py` then `( cd harness/toy-repo && python -m pytest tests -q )` | **yes** | the toy-repo fixture reconstructs deterministically (same seed sha on every machine) and its suite is green. |
 | `python harness/check.py --auditor-scenario` | **yes** | the auditor loop's deterministic machinery against canned subagent verdicts in a temp `data_root`: ledger rows, one drafted gap spec reusing the original UC-ID, a dev-manager blocker, writes confined to `design/specs/` + `status/`, all coordination through the shipped `agentflow.registry` CLI, and a second pass that is a no-op - graded against the pinned `AUDITOR_EXPECTED_IDS` set. Reads no machine-local config and no records. The same rows also run as step 6 of `--self-test`. See [`auditor-scenario/README.md`](auditor-scenario/README.md). |
 | `python harness/uc-scenario/uc_scenario.py` | **yes** (not a CI row) | the use-case traceability spine end to end: one minted `UC-NNNN` found by a single grep across refine, solution, commit, code and flow page, and a code removal plus reconcile flipping that use case to `deprecated` without touching the plan. Rebuilds throwaway fixtures under `uc-scenario/_scratch/` (gitignored) every run and reads no machine-local state. Nothing in CI runs it. See [`uc-scenario/README.md`](uc-scenario/README.md). |
 | `python harness/check.py <config>` (full suite, including A/B/D) | **no** (runs, exits 3) | needs `records/` + `stubs/schedulewakeup_log.md` from a live recording session — see below. Without them every A/B/D row and E2 (and C4) SKIPs as unrecorded, never FAILs (gh#628); a `# unrecorded:` line names each missing artifact and the run exits 3, so a fresh clone reads neither green nor as a regression. |
@@ -111,8 +117,10 @@ the tracked fixtures in `fixtures/` are the inputs.
 
 ### Recording the missing scenarios
 
-The complete operator runbook is [`run-scenario.md`](run-scenario.md). Summary
-of what each scenario produces:
+The complete operator runbook is [`run-scenario.md`](run-scenario.md). Before A, B or
+D, install the `harness-toy` profile per its *Setup* section: every live launch passes
+`--project harness-toy`, because a launch without it resolves the session default, a
+real fleet project. Summary of what each scenario produces:
 
 - **Scenario A** — invoke the `solution_skill` on `fixtures/refine-toy.md`;
   record the emitted plan to `records/scenarioA/plan.md` (assertions A1-A9).
@@ -161,16 +169,24 @@ Copy `harness.config.example.json` to `harness.config.json` and edit:
   tree, where C6 and C7 FAIL: retire that config and regenerate it from
   `harness.config.example.json` rather than editing it.
 - `skills_root` — where the skills live. May be relative; resolves against
-  the config file's directory (`"../skills"` = this repo's `skills/`).
+  the config file's directory (`"../skills"` = this repo's `skills/`). When
+  neither this key nor `AGENTFLOW_SKILLS_ROOT` is set it defaults to
+  `~/.claude/skills`, the deployed install, which never carries `_shared`; the
+  executed-CLI checks (C11-C13, C15) therefore run the `agentflow` package from
+  this clone's `skills/_shared` first and fall back to `<skills_root>/_shared`,
+  and FAIL naming both paths if neither has it (gh#944).
 - `preport_ip_literals` — infra literals the C7 grep hunts for; keep personal
   values out of tracked files by putting them only in your local config. The
   tracked example ships this empty, so C7 reports SKIP there rather than
   passing over a needle list it does not have (gh#139); set it locally to make
   C7 assert. The whole-tree sanitize gate in `.github/workflows/ci.yml` covers
-  this class only when the `SANITIZE_EXTRA_PATTERN` repository variable carries
+  this class only when the `SANITIZE_EXTRA_PATTERN` repository secret carries
   install-specific alternatives for it; the publish cut applies the same
   alternatives from the local extra pattern file. The gate's shipped pattern
   covers only home-directory paths and the mangled session-directory name.
+- `toy_project` — the project the live A/B/D launch lines pass as `--project`
+  (`harness-toy`). No assertion reads it; a test pins it equal to the shipped
+  profile's `name` and to the runbook's launch lines, so leave it as shipped.
 
 If `check.py` is run without a config it prints these instructions and exits 2.
 
@@ -180,7 +196,7 @@ If `check.py` is run without a config it prints these instructions and exits 2.
 |---|---|
 | 0 | every selected assertion PASSed or honestly SKIPped |
 | 1 | at least one **behavioral** assertion FAILed - a recording (or fixture) that exists and is wrong. Structural-only FAILs warn and do not set it. Takes precedence over 3. |
-| 2 | usage error - argparse, an unknown `--only` group, a config file that is missing or not readable JSON - with the reason on stderr |
+| 2 | usage error - argparse, an unknown `--only` group, a config file that is missing, not readable JSON, not a JSON object, or missing a required key - with the reason on stderr |
 | 3 | no behavioral FAIL, but a scenario selected by `--only` (all of them, without it) was never recorded on this machine. Its rows SKIP as unrecorded and a `# unrecorded: scenario <X> - <artifact> (<ids>)` line names what to record. An unrecorded artifact owned by a scenario outside `--only` is still listed, marked as not holding the exit - that is why `--only C,F,G` exits 0 while C4 SKIPs - and the `# EXIT 3` line names only selected scenarios. |
 
 A missing recording is always SKIP and a present-but-wrong one always FAIL (gh#628),
@@ -202,15 +218,29 @@ contents, fixed author/committer/date):
 Reset the fixture to a clean state at any time with:
 
 ```
-cd harness/toy-repo && git reset --hard 1292c9ae2ff279c45ea0a026785c9f075bc1fe6b && git clean -fd
+git -C harness/toy-repo reset --hard 1292c9ae2ff279c45ea0a026785c9f075bc1fe6b && git -C harness/toy-repo clean -fd
 ```
 
 or wipe and reseed with `python harness/seed_toy_repo.py --force`. If you
 change a seed fixture, update `EXPECTED_SEED_SHA` in `seed_toy_repo.py` and
 the sha above in the same commit — the script fails loudly on drift.
 
+The seed also gives Scenario B what the orchestrator's Step 1.1 pre-flights and never
+creates (gh#1105): an `origin` that is a local bare repo at
+`harness/toy-origin/example/harness-toy.git` (gitignored, `file://` URL, so it matches the
+toy profile's `host_ref` with no network traffic), and the epic worktree
+`<worktree_root>/harness-toy/toy-calc-single-task`. `<worktree_root>` is `--worktree-root
+<dir>` or `environment.md`'s; with neither, as in CI or on a machine with no `environment.md`, the worktree is
+skipped with a note on stderr. Neither adds a commit, so the seed sha above is unchanged;
+`--force` removes and prunes the worktree before reseeding.
+
 ## Running the fixture tests
 
 ```
-cd harness/toy-repo && python -m pytest tests -q
+( cd harness/toy-repo && python -m pytest tests -q )
 ```
+
+The subshell is deliberate. The suite imports `calc` from the fixture root, which is on
+`sys.path` only when pytest runs from there, so an explicit-path run from the repo root
+fails to collect. In a POSIX shell the parentheses restore the parent shell's directory on
+exit; a bare `cd` would leave the shell inside the fixture.

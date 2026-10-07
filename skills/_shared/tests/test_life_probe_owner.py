@@ -23,7 +23,7 @@ REPO_ROOT = SKILLS_ROOT.parent
 # Same idiom as test_skill_call_sites.py: prefer the tree under test over an editable install.
 sys.path.insert(0, str(SKILLS_ROOT / "_shared"))
 
-from agentflow.registry import ACTOR_CAPABILITY, AGENTS  # noqa: E402
+from agentflow.registry import ACTOR_CAPABILITY, AGENTS, ETA_HORIZON_EXEMPT, RULES  # noqa: E402
 
 _BULLET_HEAD = "- **A measurement, not a liveness verdict.**"
 _SEATS = "|".join(re.escape(a) for a in sorted(AGENTS, key=len, reverse=True))
@@ -151,3 +151,28 @@ def test_the_ping_passage_says_second_sighting_probes_then_reaps() -> None:
     assert re.search(r"registry reap --actor steward --project <name> --agent <lane>", flat), (
         "the ping passage does not give the reap command for the second sighting"
     )
+
+
+def test_the_ping_passage_exempts_the_human_seat_from_ping_and_reap() -> None:
+    """The seat `stale_rows` keeps at `flag` and `reap` refuses must not be pinged either.
+
+    Named by the code's own set, so the carve-out cannot drift from the seats it covers.
+    """
+    assert ETA_HORIZON_EXEMPT, "ETA_HORIZON_EXEMPT is empty; this carve-out guards nothing"
+    assert "reap_exempt_seat" in RULES, "reap no longer refuses with reap_exempt_seat"
+    flat = " ".join(_ping_passage().split())
+    assert "`ETA_HORIZON_EXEMPT`" in flat, "the ping passage does not name ETA_HORIZON_EXEMPT"
+    assert re.search(r"\bno liveness ping\b", flat), (
+        "the ping passage does not say the exempt seat gets no liveness ping"
+    )
+    assert "away past its declared return" in flat, (
+        "the ping passage does not report the exempt seat as away past its declared return"
+    )
+    assert re.search(r"\bnot as a reap candidate\b", flat), (
+        "the ping passage does not say the exempt seat is not a reap candidate"
+    )
+    assert "prints as `flag` and stays `flag`" in flat, (
+        "the ping passage does not say the exempt seat's stale row stays at flag"
+    )
+    assert "`reap_exempt_seat`" in flat, "the ping passage does not name the reap_exempt_seat refusal"
+    assert len(_NOTE_CMD.findall(_ping_passage())) == 1, "the carve-out added a second note command"

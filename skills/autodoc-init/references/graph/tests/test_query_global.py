@@ -11,6 +11,7 @@ import time
 import pytest
 
 from autodoc_query.api import global_search
+from autodoc_query.cli import _render_pretty
 from autodoc_query.types import QueryError
 from tests.conftest import entity_row
 
@@ -300,3 +301,100 @@ def test_budget_is_enforced_between_scoring_waves(adapter):
     assert 0 < len(res.communities_scored) < 6
     # filter still ran over the partial scores — kept set is non-empty
     assert res.communities_kept
+
+
+# ---------------------------------------------------------------- staleness
+# gh#698: autodoc-update never re-summarizes community reports, so global mode
+# must say when an answer is drawn from one the code has moved past. Judged at
+# query time from stored timestamps (report summarized_at vs member updated_at)
+# with the predicate `graph reports-stale` uses — no schema change.
+FRESH = "2999-01-01T00:00:00+00:00"   # after every member write: fresh
+OLD = "2000-01-01T00:00:00+00:00"     # before every member write: stale
+
+
+def _stamped(summary: str, entities: list[str], at: str,
+             children: list[int] | None = None) -> str:
+    payload = {
+        "summary": summary,
+        "findings": [{"text": f"finding about {summary}", "entities": entities}],
+        "summarized_at": at,
+    }
+    if children is not None:
+        payload["children"] = children
+    return json.dumps(payload)
+
+
+@pytest.fixture
+def stamped_graph(adapter):
+    """Leaf 1 (fresh stamp), leaf 2 (stamp older than its members), and
+    parent 3 over both. Parent's own stamp is fresh."""
+    adapter.upsert_entities([
+        entity_row(S1, name="ingest_records", community_id=1),
+        entity_row(S2, name="validate_rows", community_id=1),
+        entity_row(S3, name="render_pages", community_id=2),
+        entity_row(S4, name="write_index", community_id=2),
+    ])
+    adapter.upsert_communities([
+        {"level": 0, "label": "ingest", "member_ids": [S1, S2],
+         "report": _stamped("ingest side", [S1], FRESH),
+         "summarized_at_sha": "sha1"},
+        {"level": 0, "label": "render", "member_ids": [S3, S4],
+         "report": _stamped("render side", [S3], OLD),
+         "summarized_at_sha": "sha1"},
+        {"level": 1, "label": "pipeline", "member_ids": [S1, S2, S3, S4],
+         "report": _stamped("whole pipeline", [S1, S3], FRESH, children=[1, 2]),
+         "summarized_at_sha": "sha1"},
+    ])
+    adapter.upsert_communities([
+        {"id": 1, "level": 0, "parent_id": 3},
+        {"id": 2, "level": 0, "parent_id": 3},
+    ])
+    return adapter
+
+
+def test_stale_leaf_report_is_flagged_and_fresh_one_is_not(stamped_graph):
+    # parent scores under the floor, so both leaves are kept
+    res = global_search("q", stamped_graph,
+                        scorer=StubScorer({3: 0.0, 1: 9.0, 2: 8.0}))
+    flags = {r["community_id"]: r["stale"] for r in res.reports}
+    assert flags == {1: False, 2: True}
+    # the flag rides on every item drawn from the report, too
+    by_comm = {i.community["community_id"]: i.community["stale"] for i in res.items
+               if i.community}
+    assert by_comm == {1: False, 2: True}
+
+
+def test_parent_report_inherits_staleness_from_a_stale_child(stamped_graph):
+    res = global_search("q", stamped_graph, scorer=StubScorer({3: 9.0}))
+    assert [(r["community_id"], r["stale"]) for r in res.reports] == [(3, True)]
+
+
+def test_parent_report_is_fresh_when_every_child_is(stamped_graph):
+    # control for the test above: same parent, child 2 re-stamped fresh
+    stamped_graph.upsert_communities([
+        {"id": 2, "level": 0,
+         "report": _stamped("render side", [S3], FRESH)},
+    ])
+    res = global_search("q", stamped_graph, scorer=StubScorer({3: 9.0}))
+    assert [(r["community_id"], r["stale"]) for r in res.reports] == [(3, False)]
+
+
+def test_pretty_output_marks_only_the_stale_report(stamped_graph):
+    res = global_search("q", stamped_graph,
+                        scorer=StubScorer({3: 0.0, 1: 9.0, 2: 8.0}))
+    lines = {line for line in _render_pretty(res).splitlines()
+             if "(community " in line}
+    stale_lines = [line for line in lines if "[STALE" in line]
+    assert len(lines) == 2 and len(stale_lines) == 1
+    assert "community 2," in stale_lines[0]
+
+
+def test_parent_report_is_stale_when_its_live_child_set_moved(stamped_graph):
+    # every report fresh by timestamp; only the child set differs: child 2 is
+    # dissolved, so the live children of 3 are [1] against a stamped [1, 2]
+    stamped_graph.upsert_communities([
+        {"id": 2, "level": 0, "report": _stamped("render side", [S3], FRESH),
+         "descriptor": {"dissolved": True}},
+    ])
+    res = global_search("q", stamped_graph, scorer=StubScorer({3: 9.0}))
+    assert [(r["community_id"], r["stale"]) for r in res.reports] == [(3, True)]

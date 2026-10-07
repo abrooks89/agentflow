@@ -12,6 +12,10 @@ Subcommands:
                     [--min-members N] [--pin PREFIX=NAME ...] [--emit OUT.json]
   graph records     --db graph.db --corpus ID --records R.json --sha S --date D
                     [--artifact COMM.json] [--join-floor F]
+  graph check-records --db graph.db --corpus ID --records R.json
+                    (read-only: one agent's records file, checked as it is written)
+  graph migrate-diagrams --db graph.db --corpus ID --validator validate_mermaid.py
+                    [--dry-run]
   graph render      --db graph.db --corpus ID --out DIR [--force]
   graph check       --db graph.db --corpus ID [--out REPORT.json]
   graph reports-stale --db graph.db --corpus ID --artifact COMM.json
@@ -48,9 +52,11 @@ from .communities import (
 )
 from .embedder import EmbedderError, OllamaEmbedder
 from .ingest import IngestError, ingest_graph
+from .migrate_diagrams import MigrateError, load_mermaid_validator, migrate_body_diagrams
 from .naming import NamingError, OllamaNamer, rename_labels
 from .records import (
     RecordsError,
+    check_records,
     collect_coverage,
     diagram_carried_note,
     duplicate_claim_warning,
@@ -68,7 +74,7 @@ from .store_check import check_store
 from .vocab import VocabError
 
 _ERRORS = (AdapterError, VocabError, IngestError, EmbedderError, CommunityError,
-           NamingError, RecordsError, RenderError, FileNotFoundError, OSError)
+           NamingError, RecordsError, RenderError, MigrateError, FileNotFoundError, OSError)
 
 
 def _artifact_community_ids(path: str) -> list[int]:
@@ -361,6 +367,45 @@ def _records(args: argparse.Namespace) -> int:
     return 0
 
 
+def _check_records(args: argparse.Namespace) -> int:
+    adapter = SqliteGraphAdapter(args.db)
+    adapter.open(args.corpus, create=False)
+    try:
+        with open(args.records, encoding="utf-8") as fh:
+            try:
+                records = json.load(fh)
+            except json.JSONDecodeError as e:
+                raise RecordsError(f"records file {args.records} is not valid JSON: {e}") from e
+        result = check_records(adapter, records)
+    finally:
+        adapter.close()
+    # stderr, one line per problem: stdout carries the JSON result
+    for problem in result["problems"]:
+        print(f"PROBLEM {problem}", file=sys.stderr)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if result["problems"] else 0
+
+
+def _migrate_diagrams(args: argparse.Namespace) -> int:
+    validate = load_mermaid_validator(args.validator)
+    adapter = SqliteGraphAdapter(args.db)
+    adapter.open(args.corpus, create=False)
+    try:
+        report = migrate_body_diagrams(adapter, validate, dry_run=args.dry_run)
+    finally:
+        adapter.close()
+    verb = "would move" if args.dry_run else "moved"
+    for m in report["migrated"]:
+        print(f"{verb} {m['file']} (diagram sha {m['diagram_sha'] or 'unknown'})",
+              file=sys.stderr)
+    for r in report["refused"]:
+        print(f"REFUSED {r['file']}: {r['reason']}", file=sys.stderr)
+    for r in report["left"]:
+        print(f"left {r['file']}: {r['reason']}", file=sys.stderr)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 1 if report["refused"] else 0
+
+
 def _render(args: argparse.Namespace) -> int:
     adapter = SqliteGraphAdapter(args.db)
     adapter.open(args.corpus, create=False)
@@ -521,6 +566,29 @@ def _parser() -> argparse.ArgumentParser:
                      help="fail when endpoint/component/data-model/job "
                           "symbol-join rate is under this floor (e.g. 0.8)")
     rec.set_defaults(fn=_records)
+
+    cr = sub.add_parser(
+        "check-records",
+        help="read-only: check one records file's page structure and documents "
+             "citations against the store's symbol index; nonzero exit on problems",
+    )
+    common(cr)
+    cr.add_argument("--records", required=True,
+                    help="ONE records JSON file (an agent's own output)")
+    cr.set_defaults(fn=_check_records)
+
+    md = sub.add_parser(
+        "migrate-diagrams",
+        help="one-time, idempotent: move body-stored '## Diagram' sections into "
+             "the reserved _diagram key (gh#465)",
+    )
+    common(md)
+    md.add_argument("--validator", required=True,
+                    help="the suite validator, $SUITE_ROOT/scripts/validate_mermaid.py; "
+                         "every diagram is validated before it moves")
+    md.add_argument("--dry-run", action="store_true",
+                    help="report what would move; write nothing")
+    md.set_defaults(fn=_migrate_diagrams)
 
     rd = sub.add_parser("render", help="deterministically render the concept "
                                        "tier to a markdown tree")

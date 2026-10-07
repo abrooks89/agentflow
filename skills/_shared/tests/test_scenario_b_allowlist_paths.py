@@ -569,3 +569,25 @@ def test_a_posix_root_is_NOT_case_folded(check) -> None:
     """
     assert check._rel_to_root("/Srv/wt/calc.py", "/srv/wt") is None
     assert check._rel_to_root("/srv/wt/calc.py", "/srv/wt") == "calc.py"
+
+
+# --- gh#769: evidence that parses but is not an object ------------------------
+#
+# B2/B3/B4/B8 read the evidence with `.get`, so a list-shaped wave-evidence.json
+# raised AttributeError instead of producing a finding. A crash is caught by
+# run_suite and reported, but as "assertion crashed" rather than as the malformed
+# recording it is; the shape is now refused where the file is loaded.
+
+
+@pytest.mark.parametrize("evidence", [[], [{"sha": "d00dfee", "files": ["calc.py"]}], "x", 3, None])
+@pytest.mark.parametrize(
+    "fn",
+    ["b1_record_present", "b2_worktree", "b3_commit_touches_calc",
+     "b4_diff_in_allowlist", "b8_independent_pytest"],
+)
+def test_non_object_evidence_is_a_named_fail_not_a_crash(check, ctx, tmp_path, evidence, fn) -> None:
+    result = _run_raw(check, ctx, tmp_path, evidence, fn=fn)
+    assert result.status == check.FAIL, f"{fn} accepted non-object evidence: {result.detail}"
+    if fn != "b2_worktree":  # B2 reports the worktree it could not find, not the file
+        assert "not a JSON object" in result.detail, result.detail
+    assert result.unrecorded is None, "a present-but-wrong record must not read as unrecorded"

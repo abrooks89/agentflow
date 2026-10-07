@@ -234,7 +234,71 @@ def _registered_branch(checkout: Path, worktree: Path) -> tuple[Optional[str], s
     for path, branch, _locked in entries:
         if _norm_wt_path(path) == want:
             return path, branch, ""
-    return None, "", f"{worktree} is not in `git -C {checkout} worktree list`"
+    note = f"{worktree} is not in `git -C {checkout} worktree list`"
+    if Path(worktree).is_dir():
+        note += _residue_hint(Path(worktree))
+    return None, "", note
+
+
+#: Entry names a non-empty leftover's refusal shows before eliding the rest.
+_RESIDUE_PREVIEW = 5
+
+
+def _residue_hint(worktree: Path) -> str:
+    """What the directory at an unregistered path measures as, appended to the refusal's detail.
+
+    `git worktree remove` deregisters the tree before it deletes the directory, so when a shell
+    or process still has its working directory inside (Windows refuses that delete) git reports
+    the failure but the tree is already gone from `worktree list`, and the directory stays. The
+    guard cannot see that history, so only what it measures here is stated as fact, and a
+    removal step is offered only for an EMPTY plain directory, in forms that refuse a non-empty
+    one in each shell. PowerShell's `rmdir` is `Remove-Item`, which prompts and, on a yes,
+    deletes the contents, so it is never what the PowerShell form names.
+    """
+    head = (
+        ", but a directory is at that path.\n  Git does not list it; if it was a worktree of "
+        "this checkout, git has deregistered it."
+    )
+    if _is_link(worktree):
+        # A recursive delete through a junction is how a target's contents get emptied.
+        return head + (
+            " The path is itself a symlink or junction, so this report gives no command for it; "
+            "a human decides what it points at before touching it."
+        )
+    try:
+        with os.scandir(worktree) as it:
+            names = sorted(e.name for e in it)
+    except OSError as exc:
+        return head + f" Its contents could not be listed ({exc}), so this report gives no command."
+    if names:
+        shown = ", ".join(repr(n) for n in names[:_RESIDUE_PREVIEW])
+        if len(names) > _RESIDUE_PREVIEW:
+            shown += ", ..."
+        what = (
+            " A `.git` entry is there, so it may be a working tree or clone of another repository."
+            if ".git" in names
+            else ""
+        )
+        return head + (
+            f" It is not empty: it holds {len(names)} "
+            f"{'entry' if len(names) == 1 else 'entries'} ({shown}).{what}\n  This report gives "
+            "no command for a directory that is not empty; a human checks what is inside before "
+            "deleting anything by hand."
+        )
+    abs_path = str(worktree.absolute())
+    if _bad_chars(abs_path):
+        p, quoting = "<path>", f", quoting {abs_path!r} for the shell"
+    else:
+        p, quoting = abs_path, ""
+    return head + (
+        " It is empty - typically what a `git worktree remove` leaves when its final delete "
+        "lost to a shell or process still using the directory.\n  A human clears it by closing "
+        "any shell or process whose working directory is inside it, then removing the empty "
+        f'directory{quoting}: `rmdir "{p}"` in bash, or `[IO.Directory]::Delete("{p}")` in '
+        "PowerShell (not PowerShell's `rmdir`, an alias that can delete contents). Both refuse "
+        "a directory that is not empty; if one does, re-run this report, which lists what is "
+        "inside."
+    )
 
 
 def _is_link(path: Path) -> bool:
@@ -412,7 +476,14 @@ def _schema_headers() -> dict[str, str]:
                 out[section] = line.strip()
                 break
         else:
-            raise _registry.RegistryError("file_damaged", f"template has no ## {section} header")
+            # The rule text no longer carries the remedy, so the detail does. It names the
+            # shipped template, not the live board: the registry's own advice ("re-add the
+            # heading, never `init`") would send a lane to hand-edit an intact live registry.
+            raise _registry.RegistryError(
+                "file_damaged",
+                f"templates/registry.md has no ## {section} header - restore that file from git "
+                "history; the live registry is not the damaged file",
+            )
     return out
 
 
@@ -858,18 +929,24 @@ def check(
     return v
 
 
+def _bad_chars(path: str) -> list[str]:
+    """What in *path* would end or expand it inside a double-quoted bash or PowerShell argument."""
+    bad = [repr(ch) for ch in sorted(set(path)) if ch in _UNQUOTABLE or not ch.isprintable()]
+    # Inside bash double quotes a backslash escapes a backslash or the closing quote, so a
+    # doubled one (a UNC path's leading pair) collapses and a trailing one (a drive root)
+    # swallows the quote. A single inner backslash, as in an ordinary Windows path, is kept.
+    if "\\\\" in path:
+        bad.append("a doubled backslash")
+    if path.endswith("\\"):
+        bad.append("a trailing backslash")
+    return bad
+
+
 def _unquotable(checkout: Path, registered: str) -> list[Refusal]:
     """A refusal for each path the printed command would wrap in double quotes unsafely."""
     out = []
     for label, path in (("checkout", str(checkout)), ("worktree", registered)):
-        bad = [repr(ch) for ch in sorted(set(path)) if ch in _UNQUOTABLE or not ch.isprintable()]
-        # Inside bash double quotes a backslash escapes a backslash or the closing quote, so a
-        # doubled one (a UNC path's leading pair) collapses and a trailing one (a drive root)
-        # swallows the quote. A single inner backslash, as in an ordinary Windows path, is kept.
-        if "\\\\" in path:
-            bad.append("a doubled backslash")
-        if path.endswith("\\"):
-            bad.append("a trailing backslash")
+        bad = _bad_chars(path)
         if bad:
             out.append(
                 Refusal(
@@ -879,6 +956,17 @@ def _unquotable(checkout: Path, registered: str) -> list[Refusal]:
                 )
             )
     return out
+
+
+#: Printed around the removal pair. Git deregisters the tree BEFORE it deletes the directory, so
+#: a delete that loses to a process still inside (Windows refuses it) leaves a directory git no
+#: longer lists: `worktree list` reads as success while the directory stays behind.
+REMOVAL_BEFORE = ("# first close any shell or process whose working directory is inside the tree",)
+REMOVAL_AFTER = (
+    "# then check the directory itself is gone, not just absent from `git worktree list`:",
+    "# git deregisters the tree even when deleting the directory fails. If it is still there,",
+    "# re-run this report, which says how to clear what is left.",
+)
 
 
 def removal_command(checkout: Path, v: Verdict) -> list[str]:
@@ -913,7 +1001,7 @@ def main(argv=None) -> int:
 
     utf8_stdio()
     ap = argparse.ArgumentParser(prog="python -m agentflow.worktree_remove", description=__doc__)
-    ap.add_argument("worktree", help="the tree to judge: <worktree_root>/<project>/<epic-slug>")
+    ap.add_argument("worktree", help="the tree to judge: <worktree_root>/<project>/<epic-branch>")
     ap.add_argument(
         "--project",
         help="project whose checkout, worktree root and registry to use (default: the resolved "
@@ -959,7 +1047,11 @@ def main(argv=None) -> int:
         return 1
     print("removable: every check passed at this instant. Nothing was removed (report-only,")
     print("Q-10093); re-run this report, then a human removes it with:")
+    for line in REMOVAL_BEFORE:
+        print(f"  {line}")
     for line in removal_command(checkout, v):
+        print(f"  {line}")
+    for line in REMOVAL_AFTER:
         print(f"  {line}")
     return 0
 

@@ -18,9 +18,13 @@ Three passes:
        record — pass 1 skipped that spec on mtime, or read and rejected it — the missing
        spec is consulted for its terminal state alone, so the terminal freeze engages as it
        would have — see the comment at that call site for why that is not a cutoff bypass.
-    3. status.md files     → ``done`` if ``status == done``; the status itself when it is
-       ``abandoned`` / ``failed`` / ``done_on_hold`` (see ``_ENDED_BOARD_STATUSES``); else
-       ``running`` — status.md ALWAYS wins (it is filesystem evidence the epic is/was in flight)
+    3. status.md files     → ``status`` normalised by ``_norm_state`` (gh#1072); ``done`` if it is
+       ``done``; the status itself when it is ``abandoned`` / ``failed`` / ``done_on_hold`` (see
+       ``_ENDED_BOARD_STATUSES``); ``running`` for any other ``BOARD_STATUSES`` value; and
+       ``UNRECOGNISED_BOARD_STATUS`` for a value outside that vocabulary, which is never guessed
+       at — status.md ALWAYS wins (it is filesystem evidence the epic is/was in flight). More
+       than one board for one slug is refused, not resolved: the record reads
+       ``DUPLICATE_STATUS_BOARDS`` and every board is named (see ``_status_boards_under``).
 
 Two fields are exposed separately so consumers can tell approval from progress:
     * ``current_state``  — raw frontmatter approval signal (e.g. ``approved-for-autonomous``)
@@ -71,11 +75,12 @@ from __future__ import annotations
 import codecs
 import logging
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Mapping, Optional, Union
+from typing import Literal, Mapping, Optional, Union, get_args
 
 import yaml
 
@@ -83,12 +88,13 @@ from agentflow.plan_parser import (
     DAGError,
     SpecFormatError,
     _SLUG_FILENAME_RE,
+    _read_frontmatter_text,
     _slug_from_filename,
     files_section,
     parse_plan,
     parse_spec_frontmatter,
 )
-from agentflow.status_writer import read_status, strip_bom
+from agentflow.status_writer import StatusEnum, read_status, strip_bom
 
 _LOG = logging.getLogger(__name__)
 
@@ -106,11 +112,11 @@ _LOG = logging.getLogger(__name__)
 #: gh#261's `_done_slugs` fix WORKS ONLY BECAUSE `superseded` and `shipped` really do reach this
 #: field, which the Literal said was impossible.
 #:
-#: THE CLOSED-VOCABULARY OPTION IS NOT TAKEN HERE AND IS NOT DEAD. Mapping arbitrary frontmatter
-#: into a fixed set with a default is a behaviour change over 175 records across 13 values, and it
-#: decides what `_LIFECYCLE_PRECEDENCE` should do with the values it does not name — the same gap
-#: `_merge_spec_record` records below. That is a product call with its own blast radius, filed
-#: rather than smuggled in behind a type annotation.
+#: DECIDED (gh#377): the field stays an OPEN passthrough of the normalised `current_state` - no
+#: closed vocabulary and no rename. A closed set would change the outcome of every unranked record
+#: to fix a comparison that produces no wrong merge, because the case that matters is already
+#: guarded by `_merge_spec_record`'s terminal check. How a value `_LIFECYCLE_PRECEDENCE` does not
+#: name is ranked is stated once, at `_UNRANKED_PRECEDENCE`.
 LifecycleState = str
 BlockedStatus = Literal["READY", "NEAR-READY", "CHAINED", "MISSING-DEP"]
 
@@ -127,6 +133,13 @@ _LIFECYCLE_PRECEDENCE: dict[str, int] = {
     "done": 3,
     "archived": -1,
 }
+
+#: The rank of a lifecycle value `_LIFECYCLE_PRECEDENCE` does not name (`drafted`, `superseded`,
+#: `approved-for-autonomous`, ...). It sits below every ranked value, `archived` included, so in
+#: `_promote` an unranked value never outranks a ranked one, and between two unranked values the
+#: prior wins (equal ranks never promote). Terminal ordering is not this constant's job:
+#: `_merge_spec_record` asks `_is_terminal` first (gh#377).
+_UNRANKED_PRECEDENCE: int = -999
 
 # `current_state` values that mean "this epic's story is over". They are TERMINAL in the
 # approval sense: no later edit to a sibling file should be able to reopen one. Grounded in
@@ -158,6 +171,45 @@ TERMINAL_NOT_DONE_BOARD_STATUSES: frozenset[str] = frozenset({"abandoned", "fail
 # so it satisfies nothing and warns nothing; it simply stops claiming to be in flight.
 _ENDED_BOARD_STATUSES: frozenset[str] = TERMINAL_NOT_DONE_BOARD_STATUSES | {"done_on_hold"}
 
+# Every `lifecycle_state` that says the epic's run is OVER, delivered or not: the terminal
+# vocabulary plus the ended board statuses. `selectable` drops these from its OUTPUT, because
+# approval (`current_state`) is not completion - a spec still approved after its board ended
+# would otherwise be offered to a builder again. Derived, never restated.
+ENDED_LIFECYCLE_STATES: frozenset[str] = TERMINAL_CURRENT_STATES | _ENDED_BOARD_STATUSES
+
+# The board `status:` vocabulary, derived from `status_writer.StatusEnum` rather than restated,
+# so a status the writer learns is one pass 3 recognises (gh#1072).
+BOARD_STATUSES: frozenset[str] = frozenset(get_args(StatusEnum))
+
+# The `lifecycle_state` pass 3 gives a board whose normalised `status:` is outside
+# `BOARD_STATUSES` (`completed`, `merged`, a YAML bool, null). NOT the raw value: passed
+# through, a board reading `archived` or `shipped` would become terminal and satisfy its
+# dependants, and one reading `speccing` would become a candidate - a guess either way. NOT
+# `running`, which is what it used to be: that kept an approved epic selectable on a board
+# nobody could read. This value is in no precedence, terminal, ended or candidate set, so it
+# satisfies no `depends_on` and is not offered by choose-next; `selectable` refuses it by name
+# (fail closed) and the survey names the board once when it reads it (visible).
+UNRECOGNISED_BOARD_STATUS: str = "unrecognised-board-status"
+
+# The `lifecycle_state` pass 3 gives a slug keyed by MORE THAN ONE signature-checked board. No
+# board is picked: not the newest (mtime says when a file was touched, not which run is
+# current - a lane re-saving an old board would win), not the one sorting last (the old rule,
+# under which an old `done` board could drop a reopened epic). Any pick is a guess about which
+# run is real, and the two guesses fail in opposite directions. So the epic is refused - neither
+# done nor selectable - until one board remains, and the survey names every board.
+DUPLICATE_STATUS_BOARDS: str = "duplicate-status-boards"
+
+# The two board states nobody can read a run out of. Neither satisfies a `depends_on`, and a
+# dependant buckets MISSING-DEP beside one (see `blocked_status`).
+_UNREADABLE_BOARD_STATES: frozenset[str] = frozenset({UNRECOGNISED_BOARD_STATUS, DUPLICATE_STATUS_BOARDS})
+
+# Every `lifecycle_state` a builder may NOT be offered, whatever approval its spec carries: a run
+# that is over (`ENDED_LIFECYCLE_STATES`) or a board nobody can read a run out of. THE ONE SET
+# both readers use - `selectable` (through `_drop_ended_runs`) and fleet_report's claimable
+# filter - so the builder's answer and the human's report cannot drift apart. Read it through
+# the module.
+UNSELECTABLE_LIFECYCLE_STATES: frozenset[str] = ENDED_LIFECYCLE_STATES | _UNREADABLE_BOARD_STATES
+
 # The subdirectories of a `design/` bucket that hold TERMINAL records. `reconcile` MOVES a
 # file into one of these the moment its `current_state` goes terminal, so this tuple is the
 # codomain of that pass and the reach the globs below must have.
@@ -172,6 +224,10 @@ _ENDED_BOARD_STATUSES: frozenset[str] = TERMINAL_NOT_DONE_BOARD_STATUSES | {"don
 # left the survey, and with it `_done_slugs`, so a FINISHED prerequisite read as unsatisfied
 # and stranded every dependent that named it (gh#122). On the live tree that was 440 records
 # across two projects waiting on the next `--apply`.
+#
+# Not `wiki.TERMINAL_PARTITIONS`: same spelling, different rule (here the directory is a view
+# of `current_state`; a wiki page has no state, so its directory IS its state). Widening one
+# does not widen the other (gh#233).
 TERMINAL_PARTITIONS: tuple[str, ...] = ("done", "archived")
 
 # The ONE `current_state` value that means a human has standing-approved this epic for
@@ -198,6 +254,22 @@ APPROVED_CURRENT_STATE: str = "approved-for-autonomous"
 # warning about it is premature, and a channel that warns about work nobody is promoting yet
 # is a channel the reader learns to skip.
 FILES_GATED_CURRENT_STATES: frozenset[str] = frozenset({"drafted", APPROVED_CURRENT_STATE})
+
+# The `lifecycle_state` values of an epic that is queued and not yet built: what choose-next
+# offers a human, and what `blocked_status` calls a candidate dep. The lifecycle runs
+# speccing -> drafted -> approved-for-autonomous -> planning, so a set that named only the two
+# ends skipped the middle two stages: choose-next never offered a drafted or approved epic and
+# could report inbox-zero over a full queue of them.
+#
+# Deliberately NOT "every non-terminal state". `pinned`, `parked` and `reference` are
+# placeholders nobody has decided to build, and offering them as picks would fill the three
+# slots with work that is not on the queue. Plain `approved` is not dev-manager vocabulary (the
+# approval state is `approved-for-autonomous`), so it is deliberately not a candidate either.
+# Read it through `is_candidate`, never restate it.
+#
+# Derived: the two middle stages are exactly `FILES_GATED_CURRENT_STATES` (`drafted` and
+# `approved-for-autonomous`), so a stage added to that gate joins the candidates with it.
+CANDIDATE_LIFECYCLE_STATES: frozenset[str] = FILES_GATED_CURRENT_STATES | {"speccing", "planning"}
 
 
 def _norm_state(state: object) -> Optional[str]:
@@ -412,7 +484,9 @@ def _promote(prior: Optional[str], new: str) -> LifecycleState:
     """Return whichever lifecycle state has higher precedence."""
     if prior is None:
         return new
-    if _LIFECYCLE_PRECEDENCE.get(new, -999) > _LIFECYCLE_PRECEDENCE.get(prior, -999):
+    new_rank = _LIFECYCLE_PRECEDENCE.get(new, _UNRANKED_PRECEDENCE)
+    prior_rank = _LIFECYCLE_PRECEDENCE.get(prior, _UNRANKED_PRECEDENCE)
+    if new_rank > prior_rank:
         return new
     return prior
 
@@ -516,7 +590,7 @@ def _read_sidecar(path: Path) -> tuple[float, Optional[str], Optional[str], Opti
     these two fields off disk).
     """
     try:
-        text = path.read_text(encoding="utf-8")
+        text = _read_frontmatter_text(path)
     except (OSError, UnicodeDecodeError):
         # UNDECODABLE BYTES ARE NOT AN `OSError`, AND THAT COST THE WHOLE SURVEY (issue #80).
         # `UnicodeDecodeError` subclasses `ValueError`, so a single UTF-16 spec - which is what
@@ -606,7 +680,7 @@ def _spec_declares_files(path: Path) -> Optional[Union[bool, str]]:
     report a missing heading against a file whose real problem is that it was not there.
     """
     try:
-        text = path.read_text(encoding="utf-8")
+        text = _read_frontmatter_text(path)
     except (OSError, UnicodeDecodeError):
         return None
     fs = files_section(text)
@@ -692,10 +766,9 @@ def is_orchestrator_status(path: Path) -> bool:
     # this strip, a perfectly readable BOM'd status board fails the signature test and is
     # dropped with NO line at all - the exact silent-stranding this function was just
     # rewritten to end, arriving through the likeliest shape on a Windows fleet whose
-    # default `Out-File` writes one. On the spec side only the BYTE gate
-    # (`_opens_a_frontmatter_block`) strips `BOM_UTF8` - `parse_spec_frontmatter` itself still
-    # raises on a BOM'd spec, which that gate turns into a named skip rather than a read. The
-    # status side had neither, and measured identically on master and on the first draft
+    # default `Out-File` writes one. On the spec side `parse_spec_frontmatter` and this
+    # module's spec readers decode `utf-8-sig`, so a BOM'd spec reads like any other. The
+    # status side had no such strip, and measured identically on master and on the first draft
     # of this fix: parent non-terminal, dependant never ready, zero warnings. THE SAME STRIP
     # `read_status` applies, not a copy of it: this gate stripping while the parser behind it
     # did not left the board named as malformed and its epic still stranded (gh#336).
@@ -766,8 +839,7 @@ def _stale_spec_state(path: Path) -> tuple[str, _StaleSpecState]:
 
     "NO FRONTMATTER" IS DECIDED ON THE BYTES, NOT ON THE EXCEPTION. ``SpecFormatError`` covers
     two unlike files: one that genuinely carries no `---` block, and one that opens with a
-    block the parser could not match - a UTF-8 BOM before the opening `---` is enough, and this
-    is a Windows fleet where the default `Out-File` / `Set-Content -Encoding utf8` writes one.
+    block the parser could not use - an unclosed fence or a non-mapping block is enough.
     Reading the second as "no frontmatter" hands back `current_state=None`, which is not
     terminal, so a `current_state: done` that any human can read in the file lets the plan
     promote and issue #42 reopens through a file that merely looks fine. So the head bytes
@@ -813,7 +885,7 @@ def _stale_swallowed_keys(path: Path) -> list[str]:
     can only mean the file changed between the two reads, and that raises rather than answering
     "nothing lost": the caller fails closed on it exactly as it would on any unreadable spec.
     """
-    text = path.read_text(encoding="utf-8")
+    text = _read_frontmatter_text(path)
     match = _FRONTMATTER_RE.match(text)
     if not match:
         raise SpecFormatError(f"frontmatter block vanished between reads: {path}")
@@ -828,10 +900,9 @@ def _opens_a_frontmatter_block(path: Path) -> bool:
 
     Bytes, and only the head of them: this runs on a file the parser has ALREADY refused, so it
     cannot go back through the parser, and an unreadable file must not turn a fail-closed
-    verdict into a crash. A leading BOM is stripped because that is the whole point - the BOM is
-    invisible in every editor and is exactly what makes a well-formed file look empty of
-    frontmatter. Anything unreadable here answers True, which fails closed, which is the same
-    answer the caller would have reached anyway.
+    verdict into a crash. A leading BOM is stripped because it is invisible in every editor and
+    must not hide a broken block behind it. Anything unreadable here answers True, which fails
+    closed, which is the same answer the caller would have reached anyway.
 
     A UTF-16 FILE IS BROKEN WHATEVER ITS CONTENT, and asking that question here is the whole of
     issue #239's first item. Stripping only ``BOM_UTF8`` answered False for a BOM-less UTF-16LE
@@ -971,9 +1042,9 @@ def _merge_spec_record(existing: EpicRecord, new: EpicRecord) -> EpicRecord:
     # A terminal spec outranks a non-terminal sibling regardless of lifecycle precedence.
     # Without this, the same reopening the plan pass now guards against survives here: both
     # `superseded` and `shipped` are missing from `_LIFECYCLE_PRECEDENCE`, so against another
-    # unlisted token (`approved-for-autonomous`) the comparison is -999 > -999 = False and the
-    # winner falls out of glob order -- i.e. filename. A later respec could silently reopen a
-    # superseded epic because it sorted second.
+    # unlisted token (`approved-for-autonomous`) both rank `_UNRANKED_PRECEDENCE`, the comparison
+    # is False and the winner falls out of glob order -- i.e. filename. A later respec could
+    # silently reopen a superseded epic because it sorted second.
     existing_terminal = _is_terminal(existing.current_state)
     new_terminal = _is_terminal(new.current_state)
     if existing_terminal != new_terminal:
@@ -1020,6 +1091,75 @@ def _merge_spec_record(existing: EpicRecord, new: EpicRecord) -> EpicRecord:
         current_phase=new.current_phase or existing.current_phase,
         paused=winner.paused or loser.paused,
     )
+
+
+def _status_boards_under(status_root: Path) -> dict[str, set[Path]]:
+    """Every signature-checked status board under *status_root*, keyed by the slug pass 3 reads.
+
+    Two filename conventions: an exact-name ``status.md`` is keyed by its parent directory, a
+    ``<slug>.status.md`` by its stem; both are gated on the ``epic:`` signature and walked
+    SKIP_DIRS-respecting. EVERY board per slug is kept - a slug with more than one is refused by
+    pass 3, never resolved. ``status_writer.find_duplicate_boards`` calls this too, so the boards
+    mark-done warns about are exactly the ones the survey counts.
+    """
+    boards: dict[str, set[Path]] = {}
+    for p in _rwalk_match(status_root, lambda n: n == "status.md"):
+        if not is_orchestrator_status(p):
+            continue
+        slug = _normalize_slug_stem(p.parent.name)
+        if slug:
+            boards.setdefault(slug, set()).add(p)
+    for p in _rwalk_match(status_root, lambda n: n.endswith(".status.md") and n != "status.md"):
+        if not is_orchestrator_status(p):
+            continue
+        slug = _normalize_slug_stem(p.name[: -len(".status.md")])
+        if slug:
+            boards.setdefault(slug, set()).add(p)
+    return boards
+
+
+def _stat_status_boards(paths: set[Path]) -> list[tuple[Path, os.stat_result]]:
+    """*paths* in sorted order with their stat, minus any that vanished since the walk.
+
+    A board deleted between listing and stat no longer counts: it is named once on the
+    ``, skipping:`` channel and dropped, so it can neither make a duplicate nor be read (gh#361's
+    walk-then-stat window). The stat is the one the caller uses for its cutoff.
+    """
+    stated: list[tuple[Path, os.stat_result]] = []
+    for p in sorted(paths):
+        try:
+            stated.append((p, p.stat()))
+        except OSError as exc:
+            _LOG.warning("vanished before stat, skipping: %s (%s)", p, exc)
+    return stated
+
+
+def _duplicate_board_advice(paths: list[Path]) -> str:
+    """What to do about duplicate boards: delete the stale one, unless they span projects.
+
+    Boards under DIFFERENT ``projects/<p>/`` may be two real epics that happen to share a slug,
+    so "delete the stale one" could send a lane to delete a live board.
+    """
+    projects = sorted({_board_project(p) or "?" for p in paths})
+    if len(projects) > 1:
+        return (
+            f"they sit under different projects ({', '.join(projects)}) and may be different "
+            "epics sharing a slug - check before deleting either"
+        )
+    return "delete or move the stale one"
+
+
+def _board_project(path: Path) -> Optional[str]:
+    """The ``<p>`` of a board under ``projects/<p>/status/``, or None when it is not under one.
+
+    Searched from the right, so a data root whose own path contains a ``projects`` directory
+    does not answer for the board.
+    """
+    parts = path.parts
+    for i in range(len(parts) - 3, -1, -1):
+        if parts[i] == "projects" and parts[i + 2] == "status":
+            return parts[i + 1]
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1156,9 +1296,8 @@ def survey_epics(
             except SpecFormatError as exc:
                 # TWO UNLIKE FILES ARRIVE HERE, and only the bytes tell them apart. A spec
                 # that genuinely carries no `---` block is an ordinary corpus shape and stays
-                # a `speccing` record. A spec that OPENS a block the parser then refused - a
-                # UTF-8 BOM ahead of the `---` is enough, and this is a Windows fleet whose
-                # default `Out-File` writes one - is broken, and reading it as "no
+                # a `speccing` record. A spec that OPENS a block the parser then refused - an
+                # unclosed fence or a non-mapping block is enough - is broken, and reading it as "no
                 # frontmatter" hands back `current_state=None`, which is not terminal, so a
                 # `current_state: done` that any human can read in the file lets the plan
                 # sidecar promote it (issue #42, reached without the cutoff being involved).
@@ -1278,6 +1417,18 @@ def survey_epics(
                 _LOG.warning("vanished before stat, skipping: %s (%s)", f, exc)
                 continue
             if mtime < cutoff:
+                continue
+            # A plan with NO frontmatter block is not an epic plan - it is a standalone
+            # writing-plans document, which refine's handoff now lands on this path (gh#1059).
+            # It carries no slug and no state, so it is skipped the way pass 3 skips a status.md
+            # without the `epic:` signature: below WARNING, because doctor turns every survey
+            # WARNING into a finding and this file would raise one on every run, for a file that
+            # is fine for what it is. `_opens_a_frontmatter_block` is the module's one owner of
+            # "broken or merely frontmatter-less": a block that opens and fails to parse, a
+            # UTF-16 file, or an unreadable one all answer True and still reach the
+            # `malformed plan` channel below.
+            if not _opens_a_frontmatter_block(f):
+                _LOG.debug("plan has no frontmatter block, not an epic plan: %s", f)
                 continue
             priority, domain, project, queue_class, build_approved_by = _read_sidecar(f)
             try:
@@ -1409,59 +1560,82 @@ def survey_epics(
             by_slug[slug] = merged
 
     # ------------------------------------------------------------------ #
-    # 3) status.md files → done / an ended status / running; status.md ALWAYS wins.
-    #    Two filename conventions, both gated on the `epic:` signature,
-    #    walked SKIP_DIRS-respecting.
+    # 3) status.md files → done / an ended status / running / unrecognised / duplicate;
+    #    status.md ALWAYS wins. Boards are gathered by `_status_boards_under` (two filename
+    #    conventions, `epic:`-gated); a slug keyed by more than one is REFUSED, never resolved
+    #    (gh#1072, see `DUPLICATE_STATUS_BOARDS`).
     # ------------------------------------------------------------------ #
-    status_paths: dict[str, Path] = {}
+    status_paths: dict[str, set[Path]] = {}
     for pattern in patterns.status_dir_globs:
         for status_root in sorted(root.glob(pattern)):
             if not status_root.is_dir():
                 continue
-            # Convention 1: exact-name `status.md` → slug from parent dir name.
-            for p in sorted(_rwalk_match(status_root, lambda n: n == "status.md")):
-                if not is_orchestrator_status(p):
-                    continue
-                slug = _normalize_slug_stem(p.parent.name)
-                if slug:
-                    status_paths[slug] = p
-            # Convention 2: `<slug>.status.md` → slug from filename stem.
-            for p in sorted(
-                _rwalk_match(status_root, lambda n: n.endswith(".status.md") and n != "status.md")
-            ):
-                if not is_orchestrator_status(p):
-                    continue
-                stem = p.name[: -len(".status.md")]
-                slug = _normalize_slug_stem(stem)
-                if slug:
-                    status_paths[slug] = p
+            for slug, boards in _status_boards_under(status_root).items():
+                status_paths.setdefault(slug, set()).update(boards)
 
     for slug in sorted(status_paths):
-        f = status_paths[slug]
         # Same walk-then-stat window as passes 1 and 2 (gh#361). A plain `continue` is right here
         # too: a status board that never becomes a record leaves the slug at whatever its spec
-        # and plan already said.
-        try:
-            mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
-        except OSError as exc:
-            _LOG.warning("vanished before stat, skipping: %s (%s)", f, exc)
+        # and plan already said. The stat taken here is the one the cutoff uses.
+        stated = _stat_status_boards(status_paths[slug])
+        if not stated:
             continue
+        # The NEWEST board decides staleness, so a fresh board beside a stale one is still a
+        # duplicate: `status_writer.find_duplicate_boards` has no cutoff, and the two must agree.
+        mtime = datetime.fromtimestamp(max(st.st_mtime for _, st in stated), tz=timezone.utc)
         if mtime < cutoff:
             continue
+        existing = by_slug.get(slug)
+        if len(stated) > 1:
+            boards = [p for p, _ in stated]
+            _LOG.warning(
+                "duplicate status boards for %r, not guessing which is current - it is neither "
+                "selectable nor done until one remains: %s - %s",
+                slug, ", ".join(str(p) for p in boards), _duplicate_board_advice(boards),
+            )
+            by_slug[slug] = EpicRecord(
+                slug=slug,
+                title=existing.title if existing else slug,
+                lifecycle_state=DUPLICATE_STATUS_BOARDS,
+                current_state=existing.current_state if existing else None,
+                depends_on=existing.depends_on if existing else [],
+                priority=existing.priority if existing else UNSET_PRIORITY,
+                domain=existing.domain if existing else None,
+                project=existing.project if existing else None,
+                queue_class=existing.queue_class if existing else None,
+                build_approved_by=existing.build_approved_by if existing else None,
+                last_modified=max(mtime.isoformat(), existing.last_modified if existing else ""),
+                # No board is authoritative, so the record keeps pointing at its spec or plan.
+                source_path=existing.source_path if existing else str(boards[0]),
+            )
+            continue
+        f = stated[0][0]
         try:
             state_obj = read_status(f)
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("malformed status, skipping: %s (%s)", f, exc)
             continue
 
-        existing = by_slug.get(slug)
+        # Normalised exactly as spec frontmatter is, so a hand-edited `Done` / `Abandoned` reads
+        # as the value it plainly is instead of falling through to `running` (gh#1072).
+        # Non-strings (a YAML bool from `status: yes`, null) skip `_norm_state`, whose type
+        # warning names `current_state`; the unrecognised-status line below names the board.
+        raw_status = state_obj.status
+        board_status = _norm_state(raw_status) if isinstance(raw_status, str) else None
         ls: LifecycleState
-        if state_obj.status == "done":
+        if board_status == "done":
             ls = "done"
-        elif state_obj.status in _ENDED_BOARD_STATUSES:
-            ls = state_obj.status
-        else:
+        elif board_status in _ENDED_BOARD_STATUSES:
+            ls = board_status
+        elif board_status in BOARD_STATUSES:
             ls = "running"
+        else:
+            ls = UNRECOGNISED_BOARD_STATUS
+            _LOG.warning(
+                "unrecognised board status %r, not guessing - %r is not selectable until its "
+                "board says one of %s: %s",
+                state_obj.status, slug, ", ".join(sorted(BOARD_STATUSES)), f,
+            )
         task_list = state_obj.tasks
         total = len(task_list) or 1
         done_count = sum(1 for t in task_list.values() if t.state == "done")
@@ -1853,7 +2027,8 @@ def warn_unresolved_done_spec_paths(
 
     NOT CALLED FROM `survey_epics`. Every lane surveys on every wake, and pass 1 deliberately does
     not open a terminal spec a second time (gh#358 pins that as a read count). This walks the
-    corpus on its own and costs one read per spec only when something asks.
+    corpus on its own and costs one read per spec only when something asks. What asks is
+    `doctor`'s `done-spec-pointers` check, which the steward runs every wake.
 
     A warning, never a raise, for `_warn_unknown_queue_classes`' reason - whatever the corpus
     holds. One line per pointer, uncapped, because each is a distinct edit.
@@ -1996,6 +2171,14 @@ def _resolves_after_normalization(dep: str, known: set[str]) -> Optional[str]:
         if normalized in known:
             return normalized
     return None
+
+
+def resolves_after_normalization(dep: str, known: set[str]) -> Optional[str]:
+    """Public name for `_resolves_after_normalization`, for skills that diagnose a missing dep.
+
+    choose-next calls it to tell a dep spelled as a file stem from one that is not surveyed.
+    """
+    return _resolves_after_normalization(dep, known)
 
 
 def _capped_examples(pairs: list[tuple[str, str]], cap: int) -> list[tuple[str, str]]:
@@ -2186,9 +2369,9 @@ def forbidden_cross_project_dependencies(records: list[EpicRecord]) -> list[tupl
     `_is_terminal` themselves; callers that want the truth get it by default.
 
     The log filter is deliberately keyed on ``current_state`` and not ``lifecycle_state``: a
-    record whose status.md says done but whose frontmatter still says approved IS still
-    selectable (see `selectable`'s stale-approval caveat), so it must stay spoken about. It is
-    equally deliberately NOT the sibling's ``dispatchable`` filter. `warn_unresolvable_
+    record whose status.md says done but whose frontmatter still says approved carries a stale
+    approval worth fixing (`selectable` drops it, but the spec is still wrong), so it must stay
+    spoken about. It is equally deliberately NOT the sibling's ``dispatchable`` filter. `warn_unresolvable_
     dependencies` restricts to dispatchable carriers because its claim is "this WOULD dispatch
     if the dep resolved". This one's claim is "this spec is illegal", which is true of a
     ``drafted`` or ``planning`` carrier too — and that is the cheapest moment to hear it, while
@@ -2304,6 +2487,11 @@ def warn_stranded_terminal_dependencies(records: list[EpicRecord]) -> list[tuple
         if dep not in done
         and dep in by_slug
         and not _is_foreign(by_slug[dep], r.project)
+        # A parent whose board is unreadable (unrecognised status, duplicate boards) is not
+        # stranded by its vocabulary: the fix is its board, which pass 3 already names, and
+        # `blocked_status` already buckets the dependant MISSING-DEP. Speaking here would
+        # prescribe reconciling a spec that is fine.
+        and by_slug[dep].lifecycle_state not in _UNREADABLE_BOARD_STATES
         and (
             _is_terminal(by_slug[dep].current_state)
             or by_slug[dep].lifecycle_state in TERMINAL_NOT_DONE_BOARD_STATUSES
@@ -2475,7 +2663,8 @@ def dispatchable(
 
     * It does not read status.md, so it knows nothing about completion. ``current_state`` is
       the approval signal only (see ``EpicRecord``); completion truth is ``lifecycle_state``
-      / the status board, and remains a SEPARATE cross-check the builder performs.
+      / the status board, which ``selectable()`` applies after this (dropping ended runs),
+      with the builder's status-board cross-check behind it for what the survey cannot see.
     * It does no dependency math. An unmet ``depends_on`` is ``ready_set()``'s job.
 
     DO NOT COMPOSE THIS BY HAND - call ``selectable()``. Ordering matters and the intuitive
@@ -2534,10 +2723,18 @@ def selectable(
     scar that moved selection into this module in the first place - and a two-call expression
     the skills transcribe is still prose. One call cannot be transcribed wrong.
 
-    Every caveat of the parts survives composition and none of them is fixed here: approval is
-    not completion (``dispatchable`` reads no status.md, so the builder still cross-checks
-    completion truth against the status board before dispatching), and a record whose spec
-    frontmatter was never reconciled after shipping stays selectable on its stale approval.
+    APPROVAL IS NOT COMPLETION, so this drops ended runs itself. ``dispatchable`` reads no
+    status.md; a record still approved in its frontmatter whose surveyed ``lifecycle_state`` is
+    in ``ENDED_LIFECYCLE_STATES`` (done / done_on_hold / abandoned / failed, or any terminal
+    value) is removed from the OUTPUT, with one warning per record naming it. Output only: the
+    done-set ``ready_set`` derives stays whole, so a finished prerequisite still satisfies its
+    dependants. What the survey cannot see - a board it could not read, a run in flight in
+    another checkout - still needs the builder's status-board cross-check. Retrying a failed or
+    abandoned epic therefore means clearing or rewriting its board first. The warning fires in
+    every caller of this function, not only builders (the backoff probe shows it too). A board
+    whose ``status:`` is outside the vocabulary (``UNRECOGNISED_BOARD_STATUS``), or a slug with
+    more than one board (``DUPLICATE_STATUS_BOARDS``), is dropped the same way, with its own
+    warning: it is not known to be live, so it fails closed (gh#1072).
 
     A CROSS-PROJECT ``depends_on`` IS FORBIDDEN, NOT MERELY UNRESOLVED (registry Q-10001,
     re-affirmed Q-10007). Builders survey with ``survey_epics(..., project=<name>)``, which is
@@ -2578,9 +2775,60 @@ def selectable(
     # delivered. Wired here and not merely defined - a channel nobody invokes is silent in the
     # way that reads as coverage.
     warn_dependencies_satisfied_by_a_superseded_parent(records)
-    return by_priority(dispatchable(
+    picked = dispatchable(
         ready_set(records), excluded_domains, project=project, warn_foreign=False,
-    ))
+    )
+    return by_priority(_drop_ended_runs(picked))
+
+
+def _drop_ended_runs(records: list[EpicRecord]) -> list[EpicRecord]:
+    """*records* minus those whose run has ended or whose board is unreadable.
+
+    Unreadable: a ``status:`` outside the vocabulary (``UNRECOGNISED_BOARD_STATUS``) or more
+    than one board for the slug (``DUPLICATE_STATUS_BOARDS``).
+
+    One warning per record dropped.
+
+    Called on ``selectable``'s already-approved candidates only, so the warning names exactly
+    the stale approvals a builder would otherwise have claimed - not every finished epic.
+    """
+    kept: list[EpicRecord] = []
+    for r in records:
+        if r.lifecycle_state not in UNSELECTABLE_LIFECYCLE_STATES:
+            kept.append(r)
+            continue
+        # Fail closed on a board nobody can read a run out of (gh#1072): it is not known to be
+        # live, so it is not offered. The survey already named the boards; this names the refusal.
+        if r.lifecycle_state == UNRECOGNISED_BOARD_STATUS:
+            _LOG.warning(
+                "approved but board status unrecognised, not selectable: %r (%s) - "
+                "set its board's status: to a known value",
+                r.slug, r.source_path or r.slug,
+            )
+        elif r.lifecycle_state == DUPLICATE_STATUS_BOARDS:
+            _LOG.warning(
+                "approved but has duplicate status boards, not selectable: %r (%s) - "
+                "leave exactly one board for it",
+                r.slug, r.source_path or r.slug,
+            )
+        else:
+            _LOG.warning(
+                "approved but run ended, not selectable: %r (lifecycle_state %r, %s) - "
+                "reconcile its current_state or reset its board",
+                r.slug, r.lifecycle_state, r.source_path or r.slug,
+            )
+    return kept
+
+
+def is_candidate(record: EpicRecord) -> bool:
+    """True when *record* is queued and not yet built (``CANDIDATE_LIFECYCLE_STATES``).
+
+    The one reading of "candidate": choose-next's candidate set and `blocked_status`'s CHAINED
+    test both call this, so the skill cannot offer a state the bucket math calls something else.
+    ``paused`` is not consulted; a paused epic is still a candidate dep, and choose-next skips
+    it as a pick on its own.
+    """
+    return record.lifecycle_state in CANDIDATE_LIFECYCLE_STATES
 
 
 def blocked_status(record: EpicRecord, records: list[EpicRecord]) -> BlockedStatus:
@@ -2591,9 +2839,13 @@ def blocked_status(record: EpicRecord, records: list[EpicRecord]) -> BlockedStat
       * every dep terminal (``_done_slugs``)    → ``READY``
       * any dep's board ended undelivered (``abandoned``/``failed``) → ``MISSING-DEP``
       * any dep is a running epic               → ``NEAR-READY``
-      * any dep is a candidate (speccing/planning) → ``CHAINED``
+      * any dep is a candidate (``is_candidate``) → ``CHAINED``
       * any dep is unknown (not surveyed)       → ``MISSING-DEP``
       * otherwise, e.g. a ``done_on_hold`` dep awaiting a human merge → ``CHAINED``
+
+    A dep whose board nobody can read a run out of (``UNRECOGNISED_BOARD_STATUS`` /
+    ``DUPLICATE_STATUS_BOARDS``) is checked beside the ended-undelivered one and reports
+    ``MISSING-DEP`` for the same reason: no later bucket's promise can be made about it.
 
     THE FORBIDDEN TEST RUNS FIRST, and it is not a fifth bucket. A cross-project dep is
     unsatisfiable by construction (`forbidden_cross_project_dependencies`), so no later bucket
@@ -2608,7 +2860,7 @@ def blocked_status(record: EpicRecord, records: list[EpicRecord]) -> BlockedStat
     by_slug = {r.slug: r for r in records}
     done = _done_slugs(records)
     running = {r.slug for r in records if r.lifecycle_state == "running"}
-    candidates = {r.slug for r in records if r.lifecycle_state in ("speccing", "planning")}
+    candidates = {r.slug for r in records if is_candidate(r)}
     deps = record.depends_on
 
     if any(d in by_slug and _is_foreign(by_slug[d], record.project) for d in deps):
@@ -2617,9 +2869,16 @@ def blocked_status(record: EpicRecord, records: list[EpicRecord]) -> BlockedStat
         return "READY"
     # An abandoned or failed parent will never land, so NEAR-READY / CHAINED would make the
     # same false promise the forbidden test above refuses; it reports in the same bucket for the
-    # same reason, and `warn_stranded_terminal_dependencies` names the edge.
+    # same reason, and `warn_stranded_terminal_dependencies` names the edge. A parent whose
+    # board is unreadable (unrecognised status, or duplicate boards) is the same answer for a
+    # different reason: nothing can say whether or when it lands, so neither bucket's promise
+    # can be made; the survey names it.
     if any(
-        d in by_slug and by_slug[d].lifecycle_state in TERMINAL_NOT_DONE_BOARD_STATUSES
+        d in by_slug
+        and (
+            by_slug[d].lifecycle_state in TERMINAL_NOT_DONE_BOARD_STATUSES
+            or by_slug[d].lifecycle_state in _UNREADABLE_BOARD_STATES
+        )
         for d in deps
     ):
         return "MISSING-DEP"
@@ -2639,12 +2898,81 @@ def blocked_status(record: EpicRecord, records: list[EpicRecord]) -> BlockedStat
 
 
 def blocks_count(record: EpicRecord, records: list[EpicRecord]) -> int:
-    """How many OTHER surveyed epics list *record*'s slug in their ``depends_on``.
+    """How many OTHER surveyed epics that are still to run list *record*'s slug in ``depends_on``.
 
     The ``depends_on`` inversion — the strategic-value signal choose-next Step 3
     computed inline (the phantom server ``blocks`` field was never stored).
+
+    A dependent whose run is over (``ENDED_LIFECYCLE_STATES``: terminal, or an ended board) is
+    not counted. Building *record* unblocks nothing for it, and counting it let an epic whose
+    only downstream had already shipped take choose-next's strategic slot.
     """
-    return sum(1 for r in records if r.slug != record.slug and record.slug in r.depends_on)
+    return sum(
+        1 for r in records
+        if r.slug != record.slug
+        and record.slug in r.depends_on
+        and r.lifecycle_state not in ENDED_LIFECYCLE_STATES
+    )
+
+
+def handoff_path(record: EpicRecord, data_root: Path | str) -> Optional[Path]:
+    """The spec or plan file choose-next hands to ``/project`` for *record*, or None.
+
+    ``record.source_path`` first: the survey just read it, it may be a spec or a plan, and
+    ``/project`` routes either. Rebuilding the path from ``project`` and ``slug`` missed most
+    records: a plan-only record has no spec to find, a record with no ``project:`` built a
+    ``projects/None`` path, and a ``-design``-suffixed filename did not match the slug.
+
+    Every path it returns resolves inside *data_root*. ``project:`` and ``source_path`` come
+    from frontmatter a human or an agent typed, and the result goes to ``/project`` as the file
+    to build from, so a path that escapes the tree (``..``, a symlink or junction) is refused.
+
+    The fallback, for a source file moved since the survey, searches ONLY the record's own
+    project, and only when ``project:`` is a plain directory name: no unset project (that would
+    search every fleet's tree), no ``..``, no glob characters. It looks in specs, then plans,
+    for a file whose stem normalizes to the slug, and returns it only when exactly one matches
+    in that bucket. Two matches is an ambiguity a human resolves, not one a sort order picks.
+    """
+    root = Path(data_root).resolve()
+
+    def _inside(p: Path) -> Optional[Path]:
+        try:
+            resolved = p.resolve()
+        except ValueError:  # e.g. an embedded NUL: not a path any file can have, so no file
+            return None
+        except RecursionError:  # a RuntimeError subclass, but a fault, not a loop: surface it
+            raise
+        except RuntimeError:
+            # A symlink loop: below Python 3.13 non-strict resolve() raises this, while 3.13+
+            # returns the path and is_file() says False. Either way there is no file to hand over.
+            return None
+        return resolved if resolved.is_file() and resolved.is_relative_to(root) else None
+
+    if record.source_path:
+        found = _inside(Path(record.source_path))
+        if found is not None:
+            return found
+    # Raw, not `_norm_project`'d: the value names a directory, and lower-casing it would miss
+    # a project directory spelled with capitals.
+    project = record.project if isinstance(record.project, str) else ""
+    if not _PROJECT_DIR_RE.fullmatch(project):
+        return None
+    for bucket in ("specs", "plans"):
+        matches = [
+            p for p in (root / "projects" / project / "design" / bucket).glob("*.md")
+            if _normalize_slug_stem(p.stem) == record.slug
+        ]
+        if len(matches) > 1:
+            return None
+        if matches:
+            return _inside(matches[0])
+    return None
+
+
+# A `project:` value `handoff_path` will use as a directory name: one plain path segment.
+# Starting with an alphanumeric rules out `.` and `..`; the class rules out separators and the
+# glob characters `*?[]`.
+_PROJECT_DIR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def by_priority(records: list[EpicRecord]) -> list[EpicRecord]:

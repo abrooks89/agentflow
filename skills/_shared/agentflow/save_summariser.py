@@ -46,8 +46,9 @@ THE FIVE GUARDRAILS, and where each is enforced:
    and would then need a stale-breaking regime of its own, which is a lot of machinery to protect
    a step that is allowed to be skipped.
 
-3. **NON-FATAL.** Every failure path — the runner raising, a non-zero exit, a timeout, empty
-   output, output that will not parse, a body the writer refuses — returns a
+3. **NON-FATAL.** Every failure path — the runner raising, a non-zero exit with no reply that
+   parses, a timeout, empty output, output that will not parse, a body the writer refuses (after
+   the one ``<slug>-2`` retry on a taken slug) — returns a
    :class:`SaveOutcome` with ``status="failed"`` and a REASON. Nothing here raises into the
    caller's firing. But it fails LOUDLY in the sense the skill demands: the caller is handed the
    reason and :meth:`SaveOutcome.render` prints it. An empty or wrong page written silently is
@@ -55,8 +56,8 @@ THE FIVE GUARDRAILS, and where each is enforced:
    ``write_page`` accepted.
 
 4. **AUDITABLE.** :class:`SaveOutcome` carries the trigger, the UTC start, the duration, the exit
-   code, whether it wrote, and the slug if it did. **It is a return value and one rendered line,
-   not a new store** — deliberately. A JSONL under ``wiki/`` would be a new file kind in a pillar
+   code, whether it wrote, whether a process started (``spawned``), and the slug if it did.
+   **It is a return value and one rendered line, not a new store** — deliberately. A JSONL under ``wiki/`` would be a new file kind in a pillar
    whose whole design is *pages plus pure projections*, and the projection sweep would have to
    learn to leave it alone; a registry row would put per-save churn on a lock-protected
    coordination file no other lane reads, and guardrail 3 says this step must never touch the
@@ -89,7 +90,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -98,8 +101,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
-from agentflow.stream_report import describe_streams
+from agentflow.stream_report import STREAM_CHARS, clip_stream, describe_streams
 from agentflow.wiki import (
+    PageExistsError,
+    PageResidueError,
     check_new_lane,
     missing_pillar_markers,
     refresh_projection,
@@ -145,6 +150,21 @@ MAX_CONTEXT_CHARS = 12000
 #: rendered as an empty save.
 NOTHING_DURABLE = "NOTHING DURABLE"
 
+#: What a model wraps a bare token in. The prompt itself shows the token in backticks, so a
+#: backticked reply is the prompt's own spelling echoed back, not a different answer (gh#971).
+_TOKEN_WRAPPING = "`'\"*_.!;: \t\r\n‘’“”"
+
+#: The slug shape the prompt asks for. The pages store is create-only, so a slug that is not this
+#: shape is refused before the writer rather than written permanently (gh#971).
+_KEBAB_SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+#: The exit code the default runner reports when the child process NEVER STARTED: the OS could
+#: not find or could not execute ``argv[0]``. It is kept apart from the timeout's ``-1`` so the
+#: audit record can tell "nothing ran" from "something ran and failed" (gh#437) without a retry.
+#: The value cannot collide with a real exit code: POSIX reports 0..255 or a negative signal
+#: number no lower than -64, and Windows reports an unsigned 32-bit value, never negative.
+NEVER_STARTED = -1000
+
 #: The four phase boundaries, as decided (Q-10042). Kept here so the audit record's ``trigger``
 #: is a checked value and not free text: a mistyped trigger in an audit line is a record nobody
 #: can group by.
@@ -176,6 +196,10 @@ class SaveSpawnError(Exception):
     """
 
 
+#: How :meth:`SaveOutcome.render` prints the three values of ``spawned``.
+_SPAWNED_TEXT = {None: "-", False: "no", True: "yes"}
+
+
 @dataclass(frozen=True)
 class SaveOutcome:
     """What one save attempt did. The audit record of guardrail 4.
@@ -196,6 +220,10 @@ class SaveOutcome:
     #: Words in the written body. The Directive's compliance evidence: a target nothing
     #: measures is a target nobody can tell you missed.
     word_count: Optional[int] = None
+    #: Whether a summariser process started (gh#437). ``None``: no spawn was attempted, or an
+    #: injected runner raised. ``False``: the runner reported :data:`NEVER_STARTED`. ``True``: a
+    #: process started and returned, a timeout or any non-zero exit included.
+    spawned: Optional[bool] = None
 
     @property
     def wrote(self) -> bool:
@@ -214,6 +242,7 @@ class SaveOutcome:
             f"duration={self.duration_s:.2f}s",
             f"exit={self.exit_code if self.exit_code is not None else '-'}",
             f"wrote={'yes' if self.wrote else 'no'}",
+            f"spawned={_SPAWNED_TEXT[self.spawned]}",
         ]
         if self.slug:
             parts.append(f"slug={self.slug}")
@@ -231,9 +260,11 @@ class SaveOutcome:
             "duration_s": round(self.duration_s, 3),
             "exit_code": self.exit_code,
             "wrote": self.wrote,
+            "spawned": self.spawned,
             "slug": self.slug,
             "path": self.path,
             "reason": self.reason,
+            "word_count": self.word_count,
         }
 
 
@@ -354,7 +385,9 @@ def _subprocess_runner(argv: list, *, env: dict, timeout: float, stdin: str) -> 
 
     A timeout is a NON-ZERO EXIT here, not an exception, because every caller above treats a
     non-zero exit as "nothing written, and here is why" and a timeout means exactly that. The
-    ``-1`` code and the stderr text keep the two distinguishable in the audit record.
+    ``-1`` code and the stderr text keep the two distinguishable in the audit record. A child
+    the OS could not start at all returns :data:`NEVER_STARTED` instead, so a missing or
+    unexecutable binary never reads as a process that ran.
 
     ``argv[0]`` IS RESOLVED HERE, and resolution belongs at the spawn rather than in
     :func:`build_argv`, for two independent reasons. On Windows the agent CLI installs as a
@@ -369,26 +402,101 @@ def _subprocess_runner(argv: list, *, env: dict, timeout: float, stdin: str) -> 
     The fallback is the bare name, deliberately. When ``which`` finds nothing the spawn should
     still be attempted and still fail with the "agent CLI not found" reason below, naming what
     was looked for — swallowing it here would turn a missing CLI into a silent no-op.
+
+    THE TIMEOUT KILLS THE WHOLE TREE (gh#969). On Windows the CLI is a batch shim, so the model
+    session is a GRANDCHILD that inherits the output pipes. ``subprocess.run`` kills only the
+    direct child on timeout and then reads to EOF, which the grandchild holds open: measured, a
+    3s timeout returned after the grandchild's own 15s. So the timeout kills the whole tree
+    (``killpg`` on the child's own session on POSIX; ``taskkill /T`` by parent pid on Windows,
+    where the new process group only detaches the child from the console's Ctrl+C), and the
+    drain after it is bounded too. Because the child no longer hears the parent's interrupt,
+    any exception escaping ``communicate`` kills the tree before it propagates. A timeout
+    returns EMPTY stdout even when the child had printed something: a reply cut off mid-page
+    must not be handed to a parser that would write whatever survived the cut.
     """
     resolved = shutil.which(argv[0]) or argv[0]
     argv = [resolved, *argv[1:]]
+    if os.name == "nt":
+        group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        group = {"start_new_session": True}
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            input=stdin,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             encoding="utf-8",
             env=env,
+            **group,
         )
-    except subprocess.TimeoutExpired:
-        return -1, "", f"timed out after {timeout:g}s"
     except FileNotFoundError as e:
-        return -1, "", f"agent CLI not found: {argv[0]!r} ({e})"
-    except (OSError, subprocess.SubprocessError) as e:
+        return NEVER_STARTED, "", f"agent CLI not found: {argv[0]!r} ({e})"
+    except OSError as e:
+        return NEVER_STARTED, "", f"agent CLI failed to start: {type(e).__name__}: {e}"
+    except subprocess.SubprocessError as e:
+        # Not a never-started cause: nothing ``Popen`` raises here says the OS refused the
+        # spawn, so this keeps the generic ``-1`` rather than claim ``spawned=no``.
         return -1, "", f"agent CLI failed to run: {type(e).__name__}: {e}"
-    return proc.returncode, proc.stdout, proc.stderr
+    try:
+        stdout, stderr = proc.communicate(input=stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        return -1, "", f"timed out after {timeout:g}s"
+    except UnicodeDecodeError as e:
+        # The child ran and wrote bytes that are not UTF-8; on POSIX the decode raises here, after
+        # the spawn, so it is a started process and must not read as ``spawned=-``.
+        _kill_tree(proc)
+        return -1, "", f"agent CLI output is not UTF-8: {e}"
+    except (OSError, subprocess.SubprocessError) as e:
+        _kill_tree(proc)
+        return -1, "", f"agent CLI failed to run: {type(e).__name__}: {e}"
+    except BaseException:
+        # Ctrl+C, SystemExit and the like: the child is in its own group, so the interrupt never
+        # reached it. Kill the tree before propagating, or the model session runs on unowned.
+        _kill_tree(proc)
+        raise
+    return proc.returncode, stdout, stderr
+
+
+#: Seconds the timeout path waits for the killed tree to release its pipes and be reaped. The
+#: call's wall time is bounded by ``timeout`` plus this plus the tree kill's own bound.
+_KILL_DRAIN_S = 5.0
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill ``proc`` AND everything it started, then reap it within a bound. Never raises.
+
+    Windows: ``taskkill /T /F`` walks the tree by parent pid, which still resolves because the
+    direct child is alive until this kills it. POSIX: the child leads its own session, so its
+    process group is the tree. Either way the direct child is also killed by handle, so a
+    failed tree kill still ends the process this module started.
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=_KILL_DRAIN_S,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # the handle kill below still ends the direct child
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass  # the group is already gone, or not ours to signal
+    try:
+        proc.kill()
+    except OSError:
+        pass  # already exited
+    try:
+        # Drains the pipes so the reader threads and file handles are released; once the tree
+        # is dead they reach EOF at once. The bound covers a survivor the kill could not reach.
+        proc.communicate(timeout=_KILL_DRAIN_S)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass  # bounded by design: a survivor holding a pipe must not hold the boundary open
 
 
 def build_prompt(trigger: str, context: str) -> str:
@@ -419,6 +527,7 @@ def build_prompt(trigger: str, context: str) -> str:
         "serve the one job you chose.\n\n"
         "A rerun command, a transient CI colour, or a restatement of what the board already "
         "says is NOT durable.\n\n"
+        "Refer to people by role, never by personal name.\n\n"
         f"If this firing learned nothing durable, reply with exactly `{NOTHING_DURABLE}` and "
         "nothing else. That is the expected outcome of most firings and it is not a failure.\n\n"
         "Otherwise reply in exactly this shape, with no preamble and no code fence:\n"
@@ -503,6 +612,30 @@ def build_argv() -> list:
     return [AGENT_CLI, *NO_TOOLS_FLAGS, *SUMMARISER_ROLE_FLAGS, "-p"]
 
 
+def _strip_wrapping_fence(text: str) -> str:
+    """``text`` without a code fence that wraps the WHOLE reply, else ``text`` unchanged.
+
+    Only a wrapping pair is removed: a lone closing fence may be the end of a code block the
+    body legitimately carries, and removing it would unbalance that block instead.
+    """
+    lines = text.strip().splitlines()
+    for fence in ("```", "~~~"):
+        if len(lines) >= 2 and lines[0].strip().startswith(fence) and lines[-1].strip() == fence:
+            return "\n".join(lines[1:-1]).strip()
+    return text.strip()
+
+
+def is_nothing_durable(text: Optional[str]) -> bool:
+    """True when the reply is :data:`NOTHING_DURABLE`, however it was wrapped or cased.
+
+    Backticks, quotes, a code fence, trailing punctuation and case are all tolerated: each is
+    the same answer, and reading it as a malformed page records the fleet's most common
+    outcome as a failed save (gh#971).
+    """
+    token = _strip_wrapping_fence(text or "").strip(_TOKEN_WRAPPING)
+    return " ".join(token.split()).casefold() == NOTHING_DURABLE.casefold()
+
+
 def parse_summary(text: str) -> tuple:
     """``(slug, title, body)`` from the child's reply, or a loud refusal.
 
@@ -512,10 +645,10 @@ def parse_summary(text: str) -> tuple:
     that — it refuses an empty body only incidentally, for carrying no ``[[wikilink]]`` — so the
     check lives here, where the reply is read.
     """
-    raw = (text or "").strip()
+    raw = _strip_wrapping_fence(text or "")
     if not raw:
         raise ValueError("the summariser returned nothing")
-    if raw == NOTHING_DURABLE:
+    if is_nothing_durable(raw):
         raise ValueError(f"{NOTHING_DURABLE} is not a page; the caller handles it before parsing")
 
     slug = title = None
@@ -545,6 +678,16 @@ def parse_summary(text: str) -> tuple:
     body = "\n".join(body_lines).strip()
     if not body:
         raise ValueError("the summariser's reply has a BODY: header and no body under it")
+    if slug.lower().endswith(".md"):
+        # The writer appends the extension; keeping this one yields `<slug>.md.md`.
+        slug = slug[: -len(".md")]
+    if not _KEBAB_SLUG_RE.fullmatch(slug):
+        # Refused, not normalised: a create-only store should not hold a name the model did not
+        # choose. The slug is not echoed, since the residue guard has not seen it yet.
+        raise ValueError(
+            "the summariser's SLUG is not kebab-case (lowercase letters, digits and single "
+            "hyphens only)"
+        )
     return slug, title, body + "\n"
 
 
@@ -645,66 +788,110 @@ def compose_and_save(
         except Exception as e:  # noqa: BLE001 — guardrail 3: a save never fails the firing
             return done("failed", reason=f"the summariser runner raised {type(e).__name__}: {e}")
 
-        if returncode != 0:
-            # BOTH streams, labelled, budgeted separately (gh#478). This line used to read
-            # `(stderr or stdout or "")[:200]`, which reported the advisory this CLI prints on
-            # stderr during SUCCESSFUL runs and could not show the cause that arrived on
-            # stdout at all. Do not "fix" it to `stdout or stderr`: the runner above
-            # synthesises its timeout and missing-CLI causes ON STDERR with an empty stdout,
-            # so that ordering hides those instead. Neither stream is reliably the cause --
-            # see `agentflow.stream_report` for the measurement and the cost.
-            return done(
-                "failed",
-                exit_code=returncode,
-                reason=f"the summariser exited {returncode}; {describe_streams(stdout, stderr)}",
-            )
+        # Every outcome from here on reached a runner that returned. One flag, set once, so no
+        # later branch can forget it.
+        spawned = returncode != NEVER_STARTED
 
-        if (stdout or "").strip() == NOTHING_DURABLE:
-            return done(
-                "nothing-durable",
-                exit_code=returncode,
-                reason="the summariser judged this firing learned nothing durable",
-            )
+        # BOTH streams, labelled, budgeted separately (gh#478). This line used to read
+        # `(stderr or stdout or "")[:200]`, which reported the advisory this CLI prints on
+        # stderr during SUCCESSFUL runs and could not show the cause that arrived on
+        # stdout at all. Do not "fix" it to `stdout or stderr`: the runner above
+        # synthesises its timeout and missing-CLI causes ON STDERR with an empty stdout,
+        # so that ordering hides those instead. Neither stream is reliably the cause --
+        # see `agentflow.stream_report` for the measurement and the cost.
+        exited = f"the summariser exited {returncode}; {describe_streams(stdout, stderr)}"
+
+        # The reply decides, not the exit code (gh#747). A non-zero exit with a complete reply
+        # on stdout is a page; the CLI exits 1 over a harness advisory on stderr while its
+        # answer is whole. An EMPTY stdout is no reply at all -- the runner's own timeout,
+        # missing-CLI and spawn-error causes look exactly like that -- so it keeps the
+        # original line with nothing appended.
+        if returncode != 0 and not (stdout or "").strip():
+            return done("failed", exit_code=returncode, spawned=spawned, reason=exited)
+
+        def refused(why: str, **kw) -> SaveOutcome:
+            """A gate refused the reply. After a non-zero exit the streams lead the reason."""
+            if isinstance(kw.pop("residue", None), PageResidueError):
+                # The streams and the slug ARE the reply, and the reply carries the term the
+                # writer refused. The writer's message names class and line only; keep it so.
+                kw.pop("slug", None)
+                return done("failed", exit_code=returncode, spawned=spawned, reason=why, **kw)
+            if returncode != 0:
+                # clip_stream keeps the appended refusal registry-writable, like the streams.
+                why = f"{exited}; {clip_stream(why, 2 * STREAM_CHARS)}"
+            return done("failed", exit_code=returncode, spawned=spawned, reason=why, **kw)
+
+        if is_nothing_durable(stdout):
+            reason = "the summariser judged this firing learned nothing durable"
+            if returncode != 0:
+                reason = (
+                    f"the summariser exited {returncode} but judged this firing learned nothing "
+                    f"durable; {describe_streams(stdout, stderr)}"
+                )
+            return done("nothing-durable", exit_code=returncode, spawned=spawned, reason=reason)
 
         try:
             slug, title, body = parse_summary(stdout)
         except ValueError as e:
-            return done("failed", exit_code=returncode, reason=str(e))
+            return refused(str(e))
 
-        try:
-            path = write_page(
+        notes: list = []
+        if returncode != 0:
+            notes.append(
+                f"summariser exited {returncode} but its reply parsed; "
+                f"{describe_streams(stdout, stderr)}"
+            )
+
+        def write(page_slug: str, page_body: str) -> Path:
+            return write_page(
                 Path(wiki_root),
-                slug=slug,
+                slug=page_slug,
                 title=title,
-                body=body,
+                body=page_body,
                 created=computed_created(),
                 lane=lane,
             )
+
+        try:
+            path = write(slug, body)
+        except PageExistsError:
+            # The create-only rule's own remedy -- a NEW page linking to the taken one -- applied
+            # here because only here does the draft still exist (gh#658). ONE retry, no counter.
+            taken, slug = slug, f"{slug}-2"
+            body = f"{body.rstrip()}\n\nEarlier page under the same name: [[{taken}]]\n"
+            try:
+                path = write(slug, body)
+            except Exception as e:  # noqa: BLE001 — every writer refusal is a reason, never a raise
+                also = "is taken too" if isinstance(e, PageExistsError) else "was refused"
+                return refused(
+                    f"slug {taken} was taken and {slug} {also}; write_page refused the page: "
+                    f"{type(e).__name__}: {e}",
+                    slug=taken,
+                    residue=e,
+                )
+            notes.append(f"slug {taken} was taken; wrote {slug}")
         except Exception as e:  # noqa: BLE001 — every writer refusal is a reason, never a raise
-            return done(
-                "failed",
-                exit_code=returncode,
-                slug=slug,
-                reason=f"write_page refused the page: {type(e).__name__}: {e}",
+            return refused(
+                f"write_page refused the page: {type(e).__name__}: {e}", slug=slug, residue=e
             )
 
-        note = ""
         try:
             refresh_projection(Path(wiki_root))
         except Exception as e:  # noqa: BLE001 — the page is on disk; say so, and say what failed
             # `wrote` STAYS true. The page exists; reporting otherwise would be a second lie on
             # top of the first failure, and the recovery (`python -m agentflow.wiki refresh`) is
             # a projection rebuild, not a rewrite of the page.
-            note = (
+            notes.append(
                 f"page written but refresh_projection failed ({type(e).__name__}: {e}); "
                 "the page is on disk and invisible to the hot tier until a refresh succeeds"
             )
         return done(
             "wrote",
             exit_code=returncode,
+            spawned=spawned,
             slug=slug,
             path=str(path),
-            reason=note,
+            reason="; ".join(notes),
             word_count=len(body.split()),
         )
     finally:

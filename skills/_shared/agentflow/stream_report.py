@@ -23,7 +23,7 @@ advisory line has been present since 2026-05-10, through every successful save.
 WHY NOT `stdout or stderr`. **That inverts the bug rather than fixing it, and the inversion is
 not a smaller bug.** The callers' own default runners SYNTHESISE causes on stderr with an
 empty stdout -- `save_summariser._subprocess_runner` returns `(-1, "", "timed out after ...")`
-for a timeout and `(-1, "", "agent CLI not found: ...")` for a missing binary. A stdout-first
+for a timeout and `(NEVER_STARTED, "", "agent CLI not found: ...")` for a missing binary. A stdout-first
 precedence would hide those exactly as today's precedence hides a model limit. NO PRECEDENCE
 IS CORRECT, because neither stream is reliably the cause and nothing in the triple says which
 one spoke. The only shape that cannot be wrong is to print both, labelled, and let the reader
@@ -53,7 +53,7 @@ EMPTY = "<empty>"
 #: constraint rather than a taste.** These reasons are written into the fleet's registry --
 #: `registry._INLINE_FIELDS` lists `reason` and `text`, and `_require_inline` REFUSES the whole
 #: write on a `|`, because the registry is a markdown table and a pipe inside a cell opens a
-#: new column for all six loops. A separator chosen for looks would have made the one string
+#: new column for every loop. A separator chosen for looks would have made the one string
 #: this epic exists to deliver the one string that cannot travel the path it was written for.
 #: A semicolon also matches the joiner the call sites already use between the exit code and
 #: this text, so the whole reason reads as one delimited list instead of two syntaxes.
